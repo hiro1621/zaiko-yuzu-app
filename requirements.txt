@@ -1,0 +1,8 @@
+# 在庫融通アプリ（Streamlit Cloud）が必要とするライブラリ
+# ※ Streamlit Cloud はこのファイルを見て自動でインストールします。
+# ※ pandas は streamlit に同梱されるため、ここには書きません（画面の表で使用）。
+streamlit
+gspread>=6.0.0
+google-auth>=2.0.0
+openpyxl>=3.1.0
+xlrd==2.0.1
