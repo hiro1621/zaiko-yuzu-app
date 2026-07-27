@@ -107,6 +107,7 @@ def build_view_b(result, store_name):
     ビューB：自店が不足している薬を、デッド／期限切迫で持っている店。
       不足品目一覧（result['shortage_rows']）のうち、店が自店の行を取り出す。
       供給元は「デッドまたは期限切迫で持つ他店」に統一（A案。旧・過剰保有基準は廃止）。
+    ※2026-07-27 に画面表示からは外した。Excel／Gシートには従来どおり出力している。
     """
     out = []
     for r in result['shortage_rows']:

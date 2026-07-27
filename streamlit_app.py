@@ -178,15 +178,17 @@ _NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数']
 
 def _style_expiry(df):
     """ 表を見やすく整えた pandas Styler を返す。
-          ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00）
-          ・「期限切迫区分」が非空の行は【薄赤の背景】で行ごと目立たせる
-            （デッド一覧の中で"期限が近いデッド"が一目で分かるように。文字は黒のまま）
+          ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00・カンマ区切り）
+          ・「期限切迫区分」が非空の行は【薄赤の背景＋黒文字】で行ごと目立たせる
+            （デッド一覧の中で"期限が近いデッド"が一目で分かるように）
+        ★文字色を黒（#000000）で明示するのは、ダークテーマだと白文字×薄赤で読めなくなるため。
+          ライトテーマでは元から黒文字なので見た目は変わらない。
         Styler が使えない環境では素の DataFrame をそのまま返す。 """
     if df is None or df.empty:
         return df
 
-    # 薄赤背景のみ（文字色は既定の黒）。行全体を塗るので有効期限も一緒に目立つ。
-    HIT_STYLE = 'background-color: #FFC7CE'
+    # 薄赤背景＋黒文字。行全体を塗るので有効期限も一緒に目立つ。
+    HIT_STYLE = 'background-color: #FFC7CE; color: #000000'
 
     def _paint(row):
         hit = str(row.get('期限切迫区分', '') or '').strip() != ''
@@ -213,51 +215,49 @@ def _exclusion_set(exclusions):
     return {(r['店名'], r['除外キー']) for r in exclusions}
 
 
-def supply_editor(rows, my_store, backend, exclusions, table_key, mark_expiry):
+def _selected_rows(event):
+    """ st.dataframe(on_select='rerun') の戻りから、選択された行の位置（0始まりの整数リスト）を安全に取り出す。 """
+    try:
+        return list(event.selection.rows)
+    except Exception:
+        try:
+            return list(event['selection']['rows'])
+        except Exception:
+            return []
+
+
+def supply_editor(rows, my_store, backend, exclusions, table_key):
     """
-    ②デッド品・③期限切迫品の表を「除外チェック欄つき」で描く。
+    ②デッド品・③期限切迫品の表を「行選択方式」で描く。
       rows        … app_logic.build_view_a / build_view_expiry の戻り
       table_key   … 画面部品を区別するための名前（'dead' / 'expiry'）
-      mark_expiry … True なら、期限切迫を兼ねる品の薬品名の頭に ⚠ を付ける
-                    （チェック欄つきの表では行の色を付けられないため、記号で示す）
-    チェックを入れて「除外を保存」を押すと、その品目は融通提案から完全に消える
-    （自店の表・全店一覧・他店の参考ビュー・Excel・Gシートのすべてから）。
+    表示は8列（薬品名／単位／在庫数／在庫金額／有効期限／期限切迫区分／区分／引取候補店）。
+    ・期限切迫を兼ねる行は pandas Styler で薄赤（背景 #FFC7CE・黒文字）に塗る。
+      チェック欄つきの旧方式では行の色を付けられず ⚠ 記号で代替していたが、
+      行選択方式なら Styler の背景色と左端の選択チェックが両立するので色を戻した。
+    ・数値（在庫数・在庫金額）はカンマ区切り＋小数第2位で表示する。
+    ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える
+      （自店の表・全店一覧・他店の参考ビュー・Excel・Gシートのすべてから）。
     """
     if not rows:
         st.info('該当する品目はありません。')
         return
 
-    disp = []
-    for r in rows:
-        name = r['薬品名']
-        if mark_expiry and str(r.get('期限切迫区分') or '').strip():
-            name = '⚠ ' + name
-        disp.append({
-            '除外': False, '薬品名': name, '単位': r['単位'],
-            '在庫数': r['在庫数'], '在庫金額': r['在庫金額'],
-            '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
-            '区分': r['区分'], '引取候補店': r['引取候補店'],
-            '_key': r['_key'], '_name': r['薬品名'],
-        })
-    df = pd.DataFrame(disp)
+    disp_cols = ['薬品名', '単位', '在庫数', '在庫金額',
+                 '有効期限', '期限切迫区分', '区分', '引取候補店']
+    df = pd.DataFrame([{c: r[c] for c in disp_cols} for r in rows])
 
-    edited = st.data_editor(
-        df,
+    event = st.dataframe(
+        _style_expiry(df),
         hide_index=True,
         use_container_width=True,
-        key='editor_%s' % table_key,
-        disabled=[c for c in df.columns if c != '除外'],   # 除外欄だけ編集できる
-        column_config={
-            '_key': None,      # 内部用（画面には出さない）
-            '_name': None,
-            '除外': st.column_config.CheckboxColumn(
-                '除外', help='融通に出さない品にチェックを入れて、下の「除外を保存」を押してください。'),
-            '在庫数': st.column_config.NumberColumn('在庫数', format='%.2f'),
-            '在庫金額': st.column_config.NumberColumn('在庫金額', format='%.2f'),
-        })
+        on_select='rerun',
+        selection_mode='multi-row',
+        key='table_%s' % table_key)
 
-    # チェックが付いた行を「行の位置」で拾う（隠し列の値に頼らない確実な方法）
-    checked = [disp[i] for i, on in enumerate(list(edited['除外'])) if bool(on)]
+    # 選択された行を「行の位置」で拾い、位置で元の rows から引く（隠し列の値に頼らない確実な方法）
+    picked = _selected_rows(event)
+    checked = [rows[i] for i in picked if 0 <= i < len(rows)]
     n = len(checked)
     if st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0)):
         now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
@@ -269,7 +269,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, mark_expiry):
             if pair in have:
                 continue
             keep.append({'店名': my_store, '除外キー': d['_key'],
-                         '薬品名': d['_name'], '除外日時': now})
+                         '薬品名': d['薬品名'], '除外日時': now})
             have.add(pair)
             added += 1
         backend.save_exclusions(keep)
@@ -278,21 +278,21 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, mark_expiry):
 
 
 def excluded_section(my_store, backend, exclusions):
-    """ 「除外中の品目」を折りたたみで出し、選んで元に戻せるようにする。 """
+    """ 「除外中の品目」を折りたたみで出し、選んで元に戻せるようにする（②③と同じ行選択方式）。
+        操作方法が画面内で2種類あると迷うため、②③のチェックと同じ「左端の□で選ぶ」に統一している。 """
     mine = [r for r in exclusions if r['店名'] == my_store]
     with st.expander('除外中の品目（%d件）＝融通の対象から外している薬' % len(mine)):
         if not mine:
             st.write('いまは1件もありません。')
             return
-        df = pd.DataFrame([{'戻す': False, '薬品名': r['薬品名'], '除外日時': r['除外日時']}
-                           for r in mine])
-        edited = st.data_editor(
-            df, hide_index=True, use_container_width=True, key='editor_undo',
-            disabled=['薬品名', '除外日時'],
-            column_config={'戻す': st.column_config.CheckboxColumn(
-                '戻す', help='融通の対象に戻したい品にチェックを入れてください。')})
-        # チェックが付いた行を「行の位置」で拾う
-        checked = [mine[i] for i, on in enumerate(list(edited['戻す'])) if bool(on)]
+        st.caption('融通の対象に戻したい品を左端の□で選び、下のボタンを押してください。')
+        df = pd.DataFrame([{'薬品名': r['薬品名'], '除外日時': r['除外日時']} for r in mine])
+        event = st.dataframe(
+            df, hide_index=True, use_container_width=True,
+            on_select='rerun', selection_mode='multi-row', key='table_undo')
+        # 選んだ行を「行の位置」で拾い、位置で元の mine から引く
+        picked = _selected_rows(event)
+        checked = [mine[i] for i in picked if 0 <= i < len(mine)]
         n = len(checked)
         if st.button('選んだ品目を戻す（%d件）' % n, key='btn_undo', disabled=(n == 0)):
             back = {r['除外キー'] for r in checked}
@@ -396,7 +396,9 @@ def upload_section(backend):
 
 
 # ============================================================================
-# 結果表示（②自店のデッド品／③自店の期限切迫品／参考ビューB／全店一覧＋Excel）
+# 結果表示（②自店のデッド品／③自店の期限切迫品＋Excel）
+#   ※2026-07-27：画面から「参考ビューB（自店の不足を持つ店）」と「④全店一覧」を外した。
+#     どちらも Excel（4シート）・Gシートには従来どおり出力している（画面が長すぎる対策）。
 # ============================================================================
 def results_section(backend):
     stores, latest, index = backend.load_current_month_stores()
@@ -458,57 +460,37 @@ def results_section(backend):
         else:
             view_a = app_logic.build_view_a(result, my_store)       # 種別＝デッド
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
-            view_b = app_logic.build_view_b(result, my_store)
 
-            st.caption('⚠ が付いた品は期限切迫を兼ねています。'
-                       '融通に出さない品は「除外」にチェックを入れて保存してください。')
-            supply_editor(view_a, my_store, backend, exclusions,
-                          table_key='dead', mark_expiry=True)
+            # ②の注記：少額カット（在庫金額しきい値未満で非表示）の件数・金額は「自店分」で出す。
+            #   全店合計ではなく small_by_store の自店分を使う。0件なら少額の注記は出さない。
+            #   しきい値（1,500円）は result['min_supply_amount'] から取る（ベタ書きしない）。
+            min_amt = result.get('min_supply_amount', 0)
+            sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
+            cap = ('行が薄赤の品は期限切迫を兼ねています。'
+                   '融通に出さない品は左端の□にチェックを入れて「除外を保存」を押してください。'
+                   '／在庫金額%s円以上のものだけを載せています。'
+                   % '{:,}'.format(min_amt))
+            if sbs.get('count'):
+                cap += '（少額のため非表示：%d件・計%s円）' % (
+                    sbs['count'], '{:,.0f}'.format(sbs.get('amt', 0.0)))
+            st.caption(cap)
+            supply_editor(view_a, my_store, backend, exclusions, table_key='dead')
 
             # ---- ③（自店）の期限切迫品 ----
             st.subheader('③（%s）の期限切迫品' % my_store)
             st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
                        '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。')
-            supply_editor(view_expiry, my_store, backend, exclusions,
-                          table_key='expiry', mark_expiry=False)
+            supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry')
 
             # ---- 除外中の品目（戻せる） ----
             excluded_section(my_store, backend, exclusions)
 
-            # ---- （参考）自店の不足を、デッド／期限切迫で持っている店 ----
-            st.markdown('#### （参考）自店が《不足》している薬を、デッド／期限切迫で持っている店')
-            st.dataframe(_df(view_b, [
-                '薬品名', '在庫数', '安全在庫数', '不足数', 'デッド/期限切迫で持つ他店', '医薬品CD']),
-                use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.subheader('④ 全店の融通提案一覧（デッド＋期限切迫・金額の大きい順）')
-    all_rows = [{
-        '出し手店': r['出し手店'], '種別': r['種別'], '薬品名': r['薬品名'], '単位': r['単位'],
-        'メーカ名': r['メーカ名'], '在庫数': r['在庫数'], '在庫金額': r['在庫金額'],
-        '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
-        '区分': r['区分'], '引取候補店': r['引取候補店'],
-    } for r in result['proposal_rows']]
-    note = ('全 %d 件（種別＝デッド／期限切迫・在庫金額 %s円以上）'
-            % (len(all_rows), '{:,}'.format(result.get('min_supply_amount', 0))))
-    if result.get('small_excluded_count'):
-        note += '　※少額のため非表示：%d件（計 %s円）' % (
-            result['small_excluded_count'],
-            '{:,.0f}'.format(result.get('small_excluded_amt', 0)))
-    if result.get('user_excluded_count'):
-        note += '　※店が除外：%d件' % result['user_excluded_count']
-    st.caption(note)
-    st.dataframe(_style_expiry(_df(all_rows, [
-        '出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額', '有効期限',
-        '期限切迫区分', '区分', '引取候補店'])),
-        use_container_width=True, hide_index=True)
-
-    # Excelダウンロード
+    # ---- ④ Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()
     try:
         xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
         st.download_button(
-            '⑤ この結果をExcel（4シート）でダウンロード',
+            '④ この結果をExcel（4シート）でダウンロード',
             data=xls,
             file_name='在庫融通リスト_%s-%s.xlsx' % (latest[:4], latest[4:6]) if latest else '在庫融通リスト.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

@@ -729,6 +729,10 @@ def compute_matching(stores, excluded=None):
     user_excluded_count = 0
     small_excluded_count = 0
     small_excluded_amt = 0.0
+    # 少額カットの店別内訳（{店名: {'count': 件数, 'amt': 金額}}）。
+    #   画面（②③）で「自店の少額非表示は何件・いくらか」を出すために足す。
+    #   全店合計の small_excluded_count / small_excluded_amt は従来どおり別に持つ（変更しない）。
+    small_by_store = {}
     for s in stores:
         for row in s['rows']:
             if not is_supplier(row):
@@ -741,6 +745,10 @@ def compute_matching(stores, excluded=None):
                 # 少額（既定1,500円未満）で載せない品
                 small_excluded_count += 1
                 small_excluded_amt += stock_amount(row)
+                # 店別内訳にも同じ品を足す（全店合計は上の2変数のまま・二重管理しない）
+                sb = small_by_store.setdefault(s['name'], {'count': 0, 'amt': 0.0})
+                sb['count'] += 1
+                sb['amt'] += stock_amount(row)
                 continue
             if is_legal_excluded(row):
                 legal_excluded_count += 1
@@ -880,6 +888,7 @@ def compute_matching(stores, excluded=None):
         'user_excluded_count': user_excluded_count,
         'small_excluded_count': small_excluded_count,
         'small_excluded_amt': small_excluded_amt,
+        'small_by_store': small_by_store,
         'min_supply_amount': CONFIG['min_supply_amount'],
         'checkA': checkA,
         'checkB': checkB,
