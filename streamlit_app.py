@@ -32,6 +32,11 @@
   2) 店が「除外」にチェックを入れた品（保管庫の _除外 タブに保存。いつでも戻せる）
   どちらも自店の表だけでなく、全店一覧・他店の参考ビュー・Excel・Gシートから同時に消えます。
 
+★誤アップロード防止（2026-07-27 本間部長確定・追加）★
+  アップロード前に、ファイル名の店名部分（例「さと和光_202607」の「さと和光」）と、画面で選んだ
+  店名を「完全一致」で突き合わせ、別店のファイルや店名不明のファイルはアップロードボタンを止めます
+  （認証が無く全店が同じURLを使うため、店を取り違えると別店のデータを丸ごと上書きしてしまう対策）。
+
 【必要なライブラリのインストール（コマンドプロンプトで実行）】
     pip install streamlit gspread google-auth openpyxl xlrd==2.0.1
     ローカルで起動：  streamlit run streamlit_app.py
@@ -326,6 +331,54 @@ def show_upload_status(status, latest):
 
 
 # ============================================================================
+# 誤アップロード防止（ファイル名の店名 × 選んだ店名の突き合わせ）
+#   全店が同じURL・同じ共有パスワードを使い、認証が無いため、A店の担当者が誤ってB店を
+#   選んで上げると、保管庫が ws.clear() → 書き込みの順で B店のデータを丸ごと上書きしてしまう
+#   （誰も気づかない）。その最小限の防波堤として、ここでファイル名と選択店名を突き合わせる。
+# ============================================================================
+def _normalize_store(name):
+    """ 店名を突き合わせ用にそろえる。前後の空白を除去し、全角スペースを取り除くだけ。
+        ※表記ゆれの吸収まではしない（完全一致で弾くのが目的なので、余計な変換はしない）。 """
+    if name is None:
+        return ''
+    # 　 ＝ 全角スペース。前後の空白を落としてから全角スペースを除去し、もう一度前後を落とす。
+    return str(name).strip().replace('　', '').strip()
+
+
+def evaluate_upload_guard(filename, selected_store, store_names):
+    """ ファイル名の店名部分と、いま選んでいる店名を突き合わせる純関数（画面部品に依存しない＝テスト可能）。
+
+        戻り値は辞書：
+          status  … 'match'    … ファイル名の店名が選択店と完全一致（そのまま進めてよい）
+                    'mismatch' … ファイル名の店名は別の登録店（＝別店のデータを上書きしかねない）
+                    'unknown'  … ファイル名から登録店を読み取れない（確認チェックを求める）
+          file_store     … 表示用。'match'/'mismatch' は一致した登録店名、
+                            'unknown' はファイル名から拾った文字列
+          selected_store … いま選んでいる店名（そのまま）
+
+        ★突き合わせは必ず完全一致（==）で行う。部分一致（in／startswith）は絶対に使わない。
+          理由：「和光」（ソユーズ和光）は「さと和光」（内観堂さと和光・別会社）に文字列として
+          含まれるため、部分一致にすると別会社のファイルが通ってしまい、このガードの意味が消える。 """
+    # ファイル名から店名部分を取り出す（末尾が _YYYYMM でなければ全体が店名扱いで返る）
+    raw_store, _ym = yuzu_core.parse_filename(filename)
+    file_norm = _normalize_store(raw_store)
+
+    # 登録店（STORE_NAMES）を正規化した名前をキーにした辞書にしておく。
+    #   下の「file_norm in known」は辞書キーの“完全一致”判定であり、部分一致（含む）ではない。
+    known = {}
+    for s in store_names:
+        known[_normalize_store(s)] = s
+
+    if file_norm in known:            # ← 辞書キーの完全一致（部分一致ではない）
+        matched = known[file_norm]    # 実際の登録表記（例：'さと和光'）
+        if matched == selected_store:
+            return {'status': 'match', 'file_store': matched, 'selected_store': selected_store}
+        return {'status': 'mismatch', 'file_store': matched, 'selected_store': selected_store}
+    # どの登録店とも完全一致しない＝店名を読み取れない
+    return {'status': 'unknown', 'file_store': raw_store, 'selected_store': selected_store}
+
+
+# ============================================================================
 # アップロード欄
 # ============================================================================
 def upload_section(backend):
@@ -371,7 +424,40 @@ def upload_section(backend):
     ym = st.text_input('対象年月（YYYYMM の6桁）', value=default_ym,
                        help='薬VANを出力した月。ファイル名が「店名_202607」ならその6桁が入ります。')
 
-    can_upload = (up is not None) and (my_store is not None)
+    # ------------------------------------------------------------------
+    # 誤アップロード防止：ファイル名の店名と、選んでいる店名を突き合わせる
+    #   ・ファイルと店の両方がそろって初めて判定できる（どちらか未選択なら素通り）
+    #   ・完全一致（==）のみ。「和光」と「さと和光」を取り違えないため部分一致は使わない
+    # ------------------------------------------------------------------
+    guard_ok = True  # 突き合わせに問題が無ければアップロードを許可する
+    if up is not None and my_store is not None:
+        guard = evaluate_upload_guard(up.name, my_store, STORE_NAMES)
+        if guard['status'] == 'match':
+            # ファイル名の店名が、選んでいる店とぴったり一致した
+            st.caption('ファイル名の店名（%s）と一致しました。' % guard['file_store'])
+        elif guard['status'] == 'mismatch':
+            # ファイル名は別の登録店のもの＝このまま上げると別店のデータを上書きしてしまう
+            guard_ok = False
+            st.error('  \n'.join([
+                'このファイルは『%s』のファイルに見えます（ファイル名：%s）。' % (guard['file_store'], up.name),
+                'いま選んでいる店は『%s』です。' % my_store,
+                'このまま進めると%sのデータが上書きされてしまいます。' % guard['file_store'],
+                '店舗名を選び直すか、ファイルを確認してください。',
+            ]))
+        else:
+            # 'unknown'：ファイル名から店名を読み取れない＝確認チェックを入れてもらってから許可する
+            st.warning('  \n'.join([
+                'ファイル名から店名を確認できませんでした（ファイル名：%s）。' % up.name,
+                '『店名_%s』の形にしておくと、店の取り違えを自動で止められます。'
+                % (ym if (len(ym) == 6 and ym.isdigit()) else '202607'),
+            ]))
+            # チェックが入るまでアップロードボタンを無効にする。
+            #   キーにファイル名を含めて、別のファイルに差し替えたら確認をやり直させる。
+            guard_ok = st.checkbox(
+                'このファイルは確かに『%s』のものです' % my_store,
+                key='confirm_unknown_store_%s' % up.name)
+
+    can_upload = (up is not None) and (my_store is not None) and guard_ok
     if st.button('② この内容でアップロードする', type='primary', disabled=not can_upload):
         if my_store is None:
             st.warning('先に店舗名を選んでください。')
@@ -528,4 +614,7 @@ def main():
     results_section(backend)
 
 
-main()
+if __name__ == '__main__':
+    # streamlit run で起動したときは、この入口スクリプトが __main__ として実行されるため
+    # ここが走ってアプリが表示される。テスト目的で import しただけのときは main() は動かない。
+    main()
