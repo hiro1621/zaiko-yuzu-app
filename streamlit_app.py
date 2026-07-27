@@ -27,6 +27,11 @@
   旧仕様の「過剰数／過剰数金額」（＝安全在庫を超えた分だけ）は使いません。デッド品は
   在庫まるごとが動かす対象で、過剰数だと0になってしまう品が実在するためです。
 
+★載せない品（本間部長判断 2026-07-27）★
+  1) 在庫金額が 1,500円未満の少額品（yuzu_core.CONFIG['min_supply_amount'] で変更可）
+  2) 店が「除外」にチェックを入れた品（保管庫の _除外 タブに保存。いつでも戻せる）
+  どちらも自店の表だけでなく、全店一覧・他店の参考ビュー・Excel・Gシートから同時に消えます。
+
 【必要なライブラリのインストール（コマンドプロンプトで実行）】
     pip install streamlit gspread google-auth openpyxl xlrd==2.0.1
     ローカルで起動：  streamlit run streamlit_app.py
@@ -97,6 +102,12 @@ class _GSheetAdapter:
 
     def write_results(self, payload):
         gsheet_store.write_results(self.sh, payload)
+
+    def load_exclusions(self):
+        return gsheet_store.read_exclusions(self.sh)
+
+    def save_exclusions(self, rows):
+        gsheet_store.write_exclusions(self.sh, rows)
 
 
 @st.cache_resource(show_spinner='Googleシートに接続しています…')
@@ -192,6 +203,104 @@ def _style_expiry(df):
     except Exception:
         # 万一 Styler が使えない環境でも、表示自体は素のDataFrameで続行する
         return df
+
+
+# ============================================================================
+# 除外（この品は融通に出さない）の表示と保存
+# ============================================================================
+def _exclusion_set(exclusions):
+    """ 保存されている除外リスト → {(店名, 除外キー), ...} の集合（エンジンに渡す形）。 """
+    return {(r['店名'], r['除外キー']) for r in exclusions}
+
+
+def supply_editor(rows, my_store, backend, exclusions, table_key, mark_expiry):
+    """
+    ②デッド品・③期限切迫品の表を「除外チェック欄つき」で描く。
+      rows        … app_logic.build_view_a / build_view_expiry の戻り
+      table_key   … 画面部品を区別するための名前（'dead' / 'expiry'）
+      mark_expiry … True なら、期限切迫を兼ねる品の薬品名の頭に ⚠ を付ける
+                    （チェック欄つきの表では行の色を付けられないため、記号で示す）
+    チェックを入れて「除外を保存」を押すと、その品目は融通提案から完全に消える
+    （自店の表・全店一覧・他店の参考ビュー・Excel・Gシートのすべてから）。
+    """
+    if not rows:
+        st.info('該当する品目はありません。')
+        return
+
+    disp = []
+    for r in rows:
+        name = r['薬品名']
+        if mark_expiry and str(r.get('期限切迫区分') or '').strip():
+            name = '⚠ ' + name
+        disp.append({
+            '除外': False, '薬品名': name, '単位': r['単位'],
+            '在庫数': r['在庫数'], '在庫金額': r['在庫金額'],
+            '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
+            '区分': r['区分'], '引取候補店': r['引取候補店'],
+            '_key': r['_key'], '_name': r['薬品名'],
+        })
+    df = pd.DataFrame(disp)
+
+    edited = st.data_editor(
+        df,
+        hide_index=True,
+        use_container_width=True,
+        key='editor_%s' % table_key,
+        disabled=[c for c in df.columns if c != '除外'],   # 除外欄だけ編集できる
+        column_config={
+            '_key': None,      # 内部用（画面には出さない）
+            '_name': None,
+            '除外': st.column_config.CheckboxColumn(
+                '除外', help='融通に出さない品にチェックを入れて、下の「除外を保存」を押してください。'),
+            '在庫数': st.column_config.NumberColumn('在庫数', format='%.2f'),
+            '在庫金額': st.column_config.NumberColumn('在庫金額', format='%.2f'),
+        })
+
+    # チェックが付いた行を「行の位置」で拾う（隠し列の値に頼らない確実な方法）
+    checked = [disp[i] for i, on in enumerate(list(edited['除外'])) if bool(on)]
+    n = len(checked)
+    if st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0)):
+        now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+        keep = list(exclusions)
+        have = {(r['店名'], r['除外キー']) for r in keep}
+        added = 0
+        for d in checked:
+            pair = (my_store, d['_key'])
+            if pair in have:
+                continue
+            keep.append({'店名': my_store, '除外キー': d['_key'],
+                         '薬品名': d['_name'], '除外日時': now})
+            have.add(pair)
+            added += 1
+        backend.save_exclusions(keep)
+        st.success('%d件を融通の対象から外しました。' % added)
+        st.rerun()
+
+
+def excluded_section(my_store, backend, exclusions):
+    """ 「除外中の品目」を折りたたみで出し、選んで元に戻せるようにする。 """
+    mine = [r for r in exclusions if r['店名'] == my_store]
+    with st.expander('除外中の品目（%d件）＝融通の対象から外している薬' % len(mine)):
+        if not mine:
+            st.write('いまは1件もありません。')
+            return
+        df = pd.DataFrame([{'戻す': False, '薬品名': r['薬品名'], '除外日時': r['除外日時']}
+                           for r in mine])
+        edited = st.data_editor(
+            df, hide_index=True, use_container_width=True, key='editor_undo',
+            disabled=['薬品名', '除外日時'],
+            column_config={'戻す': st.column_config.CheckboxColumn(
+                '戻す', help='融通の対象に戻したい品にチェックを入れてください。')})
+        # チェックが付いた行を「行の位置」で拾う
+        checked = [mine[i] for i, on in enumerate(list(edited['戻す'])) if bool(on)]
+        n = len(checked)
+        if st.button('選んだ品目を戻す（%d件）' % n, key='btn_undo', disabled=(n == 0)):
+            back = {r['除外キー'] for r in checked}
+            keep = [r for r in exclusions
+                    if not (r['店名'] == my_store and r['除外キー'] in back)]
+            backend.save_exclusions(keep)
+            st.success('%d件を融通の対象に戻しました。' % n)
+            st.rerun()
 
 
 def show_upload_status(status, latest):
@@ -310,8 +419,15 @@ def results_section(backend):
         st.warning('次の店のデータは旧形式で保管されているため、在庫金額が0円で表示されます。'
                    'お手数ですが、もう一度アップロードしてください：' + '、'.join(old_format))
 
+    # 除外リスト（店が「この品は出さない」と外した品目）を読み、計算から外す
+    try:
+        exclusions = backend.load_exclusions()
+    except Exception as e:
+        st.warning('除外リストを読めませんでした（除外なしで表示します）：%s' % e)
+        exclusions = []
+
     # 全店ぶんを毎回まとめて再計算
-    result = yuzu_core.compute_matching(stores)
+    result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions))
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
     csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
 
@@ -326,10 +442,6 @@ def results_section(backend):
         st.warning('結果の保管庫への書き戻しに失敗しました（画面表示は続行します）：%s' % e)
 
     my_store = st.session_state.get('my_store')
-
-    # 自店視点の表で使う列（②デッド品・③期限切迫品で共通）
-    supply_cols = ['薬品名', '単位', '在庫数', '在庫金額', '有効期限', '期限切迫区分',
-                   '区分', '引取候補店']
 
     st.divider()
     if not my_store:
@@ -348,16 +460,20 @@ def results_section(backend):
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
             view_b = app_logic.build_view_b(result, my_store)
 
-            st.caption('期限切迫を兼ねる品は薄赤で表示します。')
-            st.dataframe(_style_expiry(_df(view_a, supply_cols)),
-                         use_container_width=True, hide_index=True)
+            st.caption('⚠ が付いた品は期限切迫を兼ねています。'
+                       '融通に出さない品は「除外」にチェックを入れて保存してください。')
+            supply_editor(view_a, my_store, backend, exclusions,
+                          table_key='dead', mark_expiry=True)
 
             # ---- ③（自店）の期限切迫品 ----
             st.subheader('③（%s）の期限切迫品' % my_store)
             st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
                        '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。')
-            st.dataframe(_style_expiry(_df(view_expiry, supply_cols)),
-                         use_container_width=True, hide_index=True)
+            supply_editor(view_expiry, my_store, backend, exclusions,
+                          table_key='expiry', mark_expiry=False)
+
+            # ---- 除外中の品目（戻せる） ----
+            excluded_section(my_store, backend, exclusions)
 
             # ---- （参考）自店の不足を、デッド／期限切迫で持っている店 ----
             st.markdown('#### （参考）自店が《不足》している薬を、デッド／期限切迫で持っている店')
@@ -373,7 +489,15 @@ def results_section(backend):
         '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
         '区分': r['区分'], '引取候補店': r['引取候補店'],
     } for r in result['proposal_rows']]
-    st.caption('全 %d 件（種別＝デッド／期限切迫）' % len(all_rows))
+    note = ('全 %d 件（種別＝デッド／期限切迫・在庫金額 %s円以上）'
+            % (len(all_rows), '{:,}'.format(result.get('min_supply_amount', 0))))
+    if result.get('small_excluded_count'):
+        note += '　※少額のため非表示：%d件（計 %s円）' % (
+            result['small_excluded_count'],
+            '{:,.0f}'.format(result.get('small_excluded_amt', 0)))
+    if result.get('user_excluded_count'):
+        note += '　※店が除外：%d件' % result['user_excluded_count']
+    st.caption(note)
     st.dataframe(_style_expiry(_df(all_rows, [
         '出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額', '有効期限',
         '期限切迫区分', '区分', '引取候補店'])),

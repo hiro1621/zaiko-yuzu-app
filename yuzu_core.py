@@ -91,6 +91,10 @@ CONFIG = {
     # 除外はしないが「要記録」警告を出す法規制列（列名 → 表示ラベル）
     'legal_warn_cols': {'向精神薬区分': '向精神薬', '毒薬区分': '毒薬', '劇薬区分': '劇薬'},
 
+    # 融通提案に載せる最低の在庫金額（円）。これ未満の少額品は載せない。
+    #   （本間部長判断 2026-07-27：少額品まで並ぶと本当に動かすべき品が埋もれるため）
+    'min_supply_amount': 1500,
+
     # 引取候補店の最大表示数（あふれた分は「他N店」と表示）
     'max_candidates': 5,
     # 有効期限「1年以内」を黄色でハイライトする閾値（月）
@@ -239,6 +243,21 @@ def supplier_category(row):
     if is_expiry(row):
         return '期限切迫'
     return ''
+
+
+def is_below_min_amount(row):
+    """ 在庫金額が少額（既定 1,500円未満）で、融通提案に載せない品か。
+        少額品まで並ぶと、本当に動かすべき品が埋もれてしまうため。
+        しきい値は CONFIG['min_supply_amount'] で変えられる。 """
+    return stock_amount(row) < CONFIG['min_supply_amount']
+
+
+def exclusion_key(row):
+    """ 除外リスト（店が「この品は出さない」と外した品目）で1品を特定するキー。
+        個別医薬品CDが取れればそれを使い、取れない品だけ『名:薬品名』で代用する。
+        ※ 保存側（画面）と判定側（ここ）で必ず同じ関数を使うこと。 """
+    key, _ = row_key(row)
+    return key or ('名:' + g(row, '薬品名'))
 
 
 def stock_qty(row):
@@ -630,7 +649,16 @@ def build_candidates(by_key, key, source_store, supply_qty, exp_date, base_date)
 #   ※ 現在 create_yuzu_list.main() にベタ書きされていた計算を、そのまま関数化したものです。
 #     計算内容は一切変えていません（回帰で1円も変わらないことを保証する目的）。
 # ============================================================================
-def compute_matching(stores):
+def compute_matching(stores, excluded=None):
+    """ excluded … 店が「融通に出さない」と外した品目の集合。
+        {(店名, exclusion_key(row)), ...} の形。ここで出し手から完全に取り除くので、
+        自店の②③だけでなく全店一覧・マトリクス・受け手の供給元・Excel・サマリ・
+        自己検算のすべてから同時に消える（どこかに残って他店から問い合わせが来る事故を防ぐ）。 """
+    excluded = set(excluded or ())
+
+    def is_excluded(store_name, row):
+        return bool(excluded) and (store_name, exclusion_key(row)) in excluded
+
     # --- 区分値の分布（ログ用・全店合算）---
     dist = {}
     for col in DIST_COLS:
@@ -650,10 +678,12 @@ def compute_matching(stores):
                 nokey_rows += 1
                 continue
             kk = (s['name'], key)
+            # 出し手から外す2条件：店が「出さない」と外した品／少額（1,500円未満）の品
+            ex = is_excluded(s['name'], row) or is_below_min_amount(row)
             sh = is_shortage(row)
-            dead = is_dead(row)          # デッド（不動区分が非空）
-            expf = is_expiry(row)        # 期限切迫（期限切迫区分が非空）
-            supp = dead or expf          # 出し手（デッド or 期限切迫）
+            dead = is_dead(row) and not ex     # デッド（不動区分が非空）
+            expf = is_expiry(row) and not ex   # 期限切迫（期限切迫区分が非空）
+            supp = dead or expf                # 出し手（デッド or 期限切迫）
             he = holds_excess(row)   # 受け取り側の「過剰保有」（tier②適正/③参考の分かれ目）
             uq = usage_qty6(row)
             uc = usage_cnt6(row)
@@ -696,9 +726,21 @@ def compute_matching(stores):
     legal_excluded_count = 0
     legal_excluded_amt = 0.0
     nokey_overstock = 0
+    user_excluded_count = 0
+    small_excluded_count = 0
+    small_excluded_amt = 0.0
     for s in stores:
         for row in s['rows']:
             if not is_supplier(row):
+                continue
+            if is_excluded(s['name'], row):
+                # 店が「この品は出さない」と外したもの
+                user_excluded_count += 1
+                continue
+            if is_below_min_amount(row):
+                # 少額（既定1,500円未満）で載せない品
+                small_excluded_count += 1
+                small_excluded_amt += stock_amount(row)
                 continue
             if is_legal_excluded(row):
                 legal_excluded_count += 1
@@ -724,6 +766,7 @@ def compute_matching(stores):
                 '区分': warn_labels(row),
                 '引取候補店': cand_main, '参考:過剰だが使用中の店': cand_ref,
                 '6ヶ月出庫回数': round(usage_cnt6(row), 2), '医薬品CD': key or '',
+                '_ex_key': exclusion_key(row),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
                 '_remain': remain, '_amt_raw': over_amt})
     proposal_rows.sort(key=lambda r: -r['在庫金額'])
@@ -793,7 +836,9 @@ def compute_matching(stores):
         exp_amt = 0.0
         short_cnt = 0
         for row in s['rows']:
-            if is_supplier(row) and not is_legal_excluded(row):
+            if (is_supplier(row) and not is_legal_excluded(row)
+                    and not is_excluded(s['name'], row)
+                    and not is_below_min_amount(row)):
                 amt = stock_amount(row)
                 if supplier_category(row) == 'デッド':
                     dead_cnt += 1
@@ -812,7 +857,9 @@ def compute_matching(stores):
     checkA = 0.0
     for s in stores:
         for row in s['rows']:
-            if is_supplier(row) and not is_legal_excluded(row):
+            if (is_supplier(row) and not is_legal_excluded(row)
+                    and not is_excluded(s['name'], row)
+                    and not is_below_min_amount(row)):
                 checkA += stock_amount(row)
     checkB = sum(r['_amt_raw'] for r in proposal_rows)
     diff = abs(checkA - checkB)
@@ -830,6 +877,10 @@ def compute_matching(stores):
         'nokey_overstock': nokey_overstock,
         'legal_excluded_count': legal_excluded_count,
         'legal_excluded_amt': legal_excluded_amt,
+        'user_excluded_count': user_excluded_count,
+        'small_excluded_count': small_excluded_count,
+        'small_excluded_amt': small_excluded_amt,
+        'min_supply_amount': CONFIG['min_supply_amount'],
         'checkA': checkA,
         'checkB': checkB,
         'diff': diff,

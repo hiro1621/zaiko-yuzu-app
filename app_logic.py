@@ -78,6 +78,8 @@ def _view_supply(result, store_name, category):
             '在庫金額': r['在庫金額'], '有効期限': r['有効期限'],
             '期限切迫区分': r['期限切迫区分'], '区分': r['区分'],
             '引取候補店': r['引取候補店'],
+            # 除外チェック欄で使う内部キー（画面には出さない）
+            '_key': r['_ex_key'],
         })
     return out
 
@@ -171,6 +173,7 @@ class LocalBackend:
         state.setdefault('raw', {})
         state.setdefault('prev', {})
         state.setdefault('results', None)
+        state.setdefault('exclusions', [])   # 店が「出さない」と外した品目
         self.state = state
 
     # --- gsheet_store と同じメソッド名・戻り値でそろえる ---
@@ -221,3 +224,11 @@ class LocalBackend:
     def save_results(self, payload):
         """ 結果を保持（次の月替わりで prev へ退避できるように）。 """
         self.state['results'] = payload
+
+    def load_exclusions(self):
+        """ 店が「融通に出さない」と外した品目の一覧を返す（Gシート版と同じ形）。 """
+        return list(self.state['exclusions'])
+
+    def save_exclusions(self, rows):
+        """ 除外リストを丸ごと入れ替える（Gシート版と同じ挙動）。 """
+        self.state['exclusions'] = list(rows)

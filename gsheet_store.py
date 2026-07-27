@@ -51,9 +51,13 @@ TAB_SHORTAGE = '不足品目一覧'
 TAB_MATRIX = '品目×店舗マトリクス'
 TAB_SUMMARY = '店舗別サマリ'
 PREV_PREFIX = '前月_'   # 前月_YYYYMM
+EXCLUDE_TAB = '_除外'   # 店が「この品は融通に出さない」と外した品目
 
 # _index の見出し（列順）
 INDEX_HEADERS = ['店名', '対象年月', 'アップ日時', '行数', '様式', 'ファイル名']
+
+# _除外 の見出し（列順）
+EXCLUDE_HEADERS = ['店名', '除外キー', '薬品名', '除外日時']
 
 
 # ============================================================================
@@ -137,6 +141,48 @@ def _write_index(sh, index):
         e = index[name]
         body.append([name, e.get('ym', ''), e.get('uploaded_at', ''),
                      e.get('rows', ''), e.get('format', ''), e.get('filename', '')])
+    _update(ws, body)
+
+
+# ============================================================================
+# _除外（店が「融通に出さない」と外した品目）の読み書き
+#   ・1行＝1品目。店名＋除外キー（＝個別医薬品CD、無い品は「名:薬品名」）で特定する。
+#   ・件数が知れているので、読むときは全部読み、書くときは全部書き直す（丸ごと上書き）。
+# ============================================================================
+def read_exclusions(sh):
+    """ _除外 タブを読んで [{'店名','除外キー','薬品名','除外日時'}, ...] を返す。
+        タブがまだ無ければ空リスト。 """
+    try:
+        ws = sh.worksheet(EXCLUDE_TAB)
+    except Exception:
+        return []
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        if not cell('店名') or not cell('除外キー'):
+            continue
+        out.append({'店名': cell('店名'), '除外キー': cell('除外キー'),
+                    '薬品名': cell('薬品名'), '除外日時': cell('除外日時')})
+    return out
+
+
+def write_exclusions(sh, rows):
+    """ 除外リストを丸ごと書き直す（rows は read_exclusions と同じ形の辞書リスト）。 """
+    ws = _get_or_create_ws(sh, EXCLUDE_TAB, rows=max(2000, len(rows) + 10), cols=8)
+    ws.clear()
+    body = [list(EXCLUDE_HEADERS)]
+    for r in rows:
+        body.append([r.get('店名', ''), r.get('除外キー', ''),
+                     r.get('薬品名', ''), r.get('除外日時', '')])
     _update(ws, body)
 
 
