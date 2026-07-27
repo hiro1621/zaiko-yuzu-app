@@ -7,7 +7,7 @@ Streamlit画面（streamlit_app.py）から切り離した“純粋な処理”�
 Streamlit を import しないので、そのまま単体テストできます（品質管理部の検証もしやすい）。
   ・アップロードされたバイトを読み、様式チェック→前処理→約35列へスリム化
   ・保管庫（Gシート or ローカル）から当月データを集めて compute_matching に渡す
-  ・自店視点の2ビュー（A：自店の過剰を欲しがる店／B：自店の不足を過剰に持つ店）を作る
+  ・自店視点のビュー（デッド品／期限切迫品／自店の不足をデッド・期限切迫で持つ店）を作る
   ・「○/15店」の集計、Excelダウンロード用のバイト生成
   ・鍵が無いローカル検証用の「ローカル保管庫（LocalBackend）」（Gシートと同じ月替わり挙動）
 
@@ -57,17 +57,21 @@ def process_upload_bytes(filename, data):
 
 
 # ============================================================================
-# 自店視点の2ビューを作る
+# 自店視点のビューを作る
+#   ・build_view_a       … 自店の「デッド品」（種別＝デッド）を欲しがる店
+#   ・build_view_expiry  … 自店の「期限切迫品」（種別＝期限切迫）を欲しがる店
+#   ・build_view_b       … 自店が不足している薬を、デッド／期限切迫で持っている店
 # ============================================================================
-def build_view_a(result, store_name):
+def _view_supply(result, store_name, category):
     """
-    ビューA：自店の過剰・デッドを、欲しがっている（＝引き取ってくれそうな）店。
-      融通提案（result['proposal_rows']）のうち、出し手店が自店の行を取り出す。
-      本命候補（①不足中→②使用中）＝『引取候補店』列、参考（③過剰だが使用中）は別枠。
+    融通提案（result['proposal_rows']）のうち、出し手店＝自店 かつ 種別＝category の行を、
+    自店視点の表（引取候補店つき）に整えて返す。build_view_a / build_view_expiry の共通処理。
     """
     out = []
     for r in result['proposal_rows']:
         if r['出し手店'] != store_name:
+            continue
+        if r.get('種別') != category:
             continue
         out.append({
             '薬品名': r['薬品名'], '単位': r['単位'], '過剰数': r['過剰数'],
@@ -80,10 +84,29 @@ def build_view_a(result, store_name):
     return out
 
 
+def build_view_a(result, store_name):
+    """
+    ②デッド品ビュー：自店の《デッド（不動）》在庫を、欲しがっている店。
+      融通提案のうち、出し手店＝自店 かつ 種別＝デッド の行を取り出す。
+      本命候補（①不足中→②使用中）＝『引取候補店（本命）』列、参考（③過剰だが使用中）は別枠。
+      ※ デッドかつ期限切迫の品もここ（デッド側）に入り、期限切迫区分の値は列で表示する。
+    """
+    return _view_supply(result, store_name, 'デッド')
+
+
+def build_view_expiry(result, store_name):
+    """
+    ③期限切迫品ビュー：自店の《期限切迫》在庫（＝デッドではない純粋な期限切迫）を、欲しがっている店。
+      融通提案のうち、出し手店＝自店 かつ 種別＝期限切迫 の行を取り出す。列構成は build_view_a と同じ。
+    """
+    return _view_supply(result, store_name, '期限切迫')
+
+
 def build_view_b(result, store_name):
     """
-    ビューB：自店が不足している薬を、過剰に持っている店。
+    ビューB：自店が不足している薬を、デッド／期限切迫で持っている店。
       不足品目一覧（result['shortage_rows']）のうち、店が自店の行を取り出す。
+      供給元は「デッドまたは期限切迫で持つ他店」に統一（A案。旧・過剰保有基準は廃止）。
     """
     out = []
     for r in result['shortage_rows']:
@@ -91,7 +114,7 @@ def build_view_b(result, store_name):
             continue
         out.append({
             '薬品名': r['薬品名'], '在庫数': r['在庫数'], '安全在庫数': r['安全在庫数'],
-            '不足数': r['不足数'], '過剰に持つ他店': r['過剰に持つ他店'],
+            '不足数': r['不足数'], 'デッド/期限切迫で持つ他店': r['デッド/期限切迫で持つ他店'],
             '医薬品CD': r['医薬品CD'],
         })
     return out

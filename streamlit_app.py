@@ -5,17 +5,22 @@
 【何をするアプリか】
 各店がブラウザから薬VANの在庫ファイル（.xls / .csv / .xlsx）をアップロードすると、
 共通エンジン（yuzu_core）が全店ぶんを毎回まとめて再計算し、
-  ・自店視点の2ビュー（A：自店の過剰を欲しがる店／B：自店の不足を過剰に持つ店）
-  ・全店の融通提案一覧（金額の大きい順）
+  ・自店（②）のデッド品／（③）の期限切迫品（それぞれ欲しがる店つき）
+  ・（参考）自店が不足している薬を、デッド／期限切迫で持っている店
+  ・全店の融通提案一覧（デッド＋期限切迫・金額の大きい順／「種別」列つき）
   ・「現在 N/15店 アップ済み」
 を返します。裏側の保管庫はGoogleスプレッドシート（サービスアカウント経由のみ）。
 店舗はGシートを直接触らず、必ずこのアプリ経由で読み書きします。
+
+★出し手（融通候補）の定義（A案・本間部長承認 2026-07-27）★
+  純粋な過剰（デッドでも期限切迫でもない、ただ多いだけの品）は提案から外し、
+  「デッド（不動）」と「期限切迫」だけを出し手にします。
 
 【使い方（店舗）】
   1. 共有パスワードを入れる（1回だけ）。
   2. 自分の店をドロップダウンで選ぶ。
   3. 薬VANの在庫ファイルを選んでアップロードする。
-  4. 結果（自店視点の2ビュー・全店一覧・○/15）が表示される。
+  4. 結果（自店のデッド品・期限切迫品／全店一覧／○/15）が表示される。
 
 【必要なライブラリのインストール（コマンドプロンプトで実行）】
     pip install streamlit gspread google-auth openpyxl xlrd==2.0.1
@@ -151,6 +156,28 @@ def _df(rows, columns=None):
     return df
 
 
+def _style_expiry(df):
+    """ 「期限切迫区分」が非空の行を、有効期限もろとも【薄赤の背景】で目立たせた
+        pandas Styler を返す（デッド一覧の中で"期限が近いデッド"が一目で分かるように）。
+        文字は黒のまま（背景ハイライトだけで区別できるため）。
+        列に「期限切迫区分」が無い／空の表なら、素の DataFrame をそのまま返す。 """
+    if df is None or df.empty or '期限切迫区分' not in df.columns:
+        return df
+
+    # 薄赤背景のみ（文字色は既定の黒）。行全体を塗るので有効期限も一緒に目立つ。
+    HIT_STYLE = 'background-color: #FFC7CE'
+
+    def _paint(row):
+        hit = str(row.get('期限切迫区分', '') or '').strip() != ''
+        return [HIT_STYLE if hit else '' for _ in row]
+
+    try:
+        return df.style.apply(_paint, axis=1)
+    except Exception:
+        # 万一 Styler が使えない環境でも、表示自体は素のDataFrameで続行する
+        return df
+
+
 def show_upload_status(status, latest):
     """ 画面上部に『現在 N/15店 アップ済み』と未アップ店を出す。 """
     n = status['n']
@@ -244,7 +271,7 @@ def upload_section(backend):
 
 
 # ============================================================================
-# 結果表示（自店視点2ビュー＋全店一覧）
+# 結果表示（②自店のデッド品／③自店の期限切迫品／参考ビューB／全店一覧＋Excel）
 # ============================================================================
 def results_section(backend):
     stores, latest, index = backend.load_current_month_stores()
@@ -273,46 +300,60 @@ def results_section(backend):
 
     my_store = st.session_state.get('my_store')
 
+    # 自店視点の表で使う列（②デッド品・③期限切迫品で共通）
+    supply_cols = ['薬品名', '単位', '過剰数', '過剰数金額', '有効期限', '期限切迫区分',
+                   '要記録警告', '引取候補店（本命）', '参考:過剰だが使用中の店', '医薬品CD']
+
     st.divider()
     if not my_store:
-        st.subheader('② 自店から見た融通')
-        st.info('上で自店の店舗名を選ぶと、自店視点の融通提案'
-                '（自店の過剰を欲しがる店／自店の不足を過剰に持つ店）が表示されます。')
+        st.subheader('②（自店）のデッド品')
+        st.info('上で自店の店舗名を選ぶと、自店のデッド品（②）・期限切迫品（③）と、'
+                'それぞれを欲しがっている店が表示されます。')
     else:
         my_uploaded = (my_store in status['uploaded'])
-        st.subheader('② 自店（%s）から見た融通' % my_store)
+        # ---- ②（自店）のデッド品 ----
+        st.subheader('②（%s）のデッド品' % my_store)
         if not my_uploaded:
             st.warning('まず自店（%s）の在庫ファイルをアップロードしてください。'
-                       '自店の過剰・不足が入って初めて、自店視点の提案が出ます。' % my_store)
+                       '自店のデッド・期限切迫が入って初めて、自店視点の提案が出ます。' % my_store)
         else:
-            view_a = app_logic.build_view_a(result, my_store)
+            view_a = app_logic.build_view_a(result, my_store)       # 種別＝デッド
+            view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
             view_b = app_logic.build_view_b(result, my_store)
 
-            st.markdown('#### ビューA：自店の《過剰・デッド》を欲しがっている店')
-            st.caption('引取候補店（本命）＝ ①不足中 → ②使用中 の順。「参考:過剰だが使用中の店」は別枠（送っても余りが増えがち）。')
-            st.dataframe(_df(view_a, [
-                '薬品名', '単位', '過剰数', '過剰数金額', '有効期限', '期限切迫区分',
-                '要記録警告', '引取候補店（本命）', '参考:過剰だが使用中の店', '医薬品CD']),
-                use_container_width=True, hide_index=True)
+            st.caption('自店のデッド（不動）在庫と、その引取候補店。'
+                       '引取候補店（本命）＝ ①不足中 → ②使用中 の順。'
+                       '「参考:過剰だが使用中の店」は別枠（送っても余りが増えがち）。'
+                       '期限切迫を兼ねる品は薄赤で表示します。')
+            st.dataframe(_style_expiry(_df(view_a, supply_cols)),
+                         use_container_width=True, hide_index=True)
 
-            st.markdown('#### ビューB：自店が《不足》している薬を、過剰に持っている店')
+            # ---- ③（自店）の期限切迫品 ----
+            st.subheader('③（%s）の期限切迫品' % my_store)
+            st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
+                       '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。')
+            st.dataframe(_style_expiry(_df(view_expiry, supply_cols)),
+                         use_container_width=True, hide_index=True)
+
+            # ---- （参考）自店の不足を、デッド／期限切迫で持っている店 ----
+            st.markdown('#### （参考）自店が《不足》している薬を、デッド／期限切迫で持っている店')
             st.dataframe(_df(view_b, [
-                '薬品名', '在庫数', '安全在庫数', '不足数', '過剰に持つ他店', '医薬品CD']),
+                '薬品名', '在庫数', '安全在庫数', '不足数', 'デッド/期限切迫で持つ他店', '医薬品CD']),
                 use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader('③ 全店の融通提案一覧（金額の大きい順）')
+    st.subheader('④ 全店の融通提案一覧（デッド＋期限切迫・金額の大きい順）')
     all_rows = [{
-        '出し手店': r['出し手店'], '薬品名': r['薬品名'], '単位': r['単位'],
+        '出し手店': r['出し手店'], '種別': r['種別'], '薬品名': r['薬品名'], '単位': r['単位'],
         'メーカ名': r['メーカ名'], '過剰数': r['過剰数'], '過剰数金額': r['過剰数金額'],
         '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
         '要記録警告': r['要記録警告'], '引取候補店': r['引取候補店'],
         '参考:過剰だが使用中の店': r['参考:過剰だが使用中の店'], '医薬品CD': r['医薬品CD'],
     } for r in result['proposal_rows']]
-    st.caption('全 %d 件' % len(all_rows))
-    st.dataframe(_df(all_rows, [
-        '出し手店', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額', '有効期限',
-        '期限切迫区分', '要記録警告', '引取候補店', '参考:過剰だが使用中の店', '医薬品CD']),
+    st.caption('全 %d 件（種別＝デッド／期限切迫）' % len(all_rows))
+    st.dataframe(_style_expiry(_df(all_rows, [
+        '出し手店', '種別', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額', '有効期限',
+        '期限切迫区分', '要記録警告', '引取候補店', '参考:過剰だが使用中の店', '医薬品CD'])),
         use_container_width=True, hide_index=True)
 
     # Excelダウンロード
@@ -320,7 +361,7 @@ def results_section(backend):
     try:
         xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
         st.download_button(
-            '④ この結果をExcel（4シート）でダウンロード',
+            '⑤ この結果をExcel（4シート）でダウンロード',
             data=xls,
             file_name='在庫融通リスト_%s-%s.xlsx' % (latest[:4], latest[4:6]) if latest else '在庫融通リスト.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

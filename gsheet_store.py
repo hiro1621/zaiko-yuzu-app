@@ -309,25 +309,25 @@ def build_results_payload(result, base_ym_disp, csv_base_disp):
     yuzu_core.compute_matching(...) の戻り値 result を、結果4タブ書き戻し用の
     「文字列2次元配列」に整える。Excel出力（write_excel）と同じ列・同じ並び。
     """
-    proposal_headers = ['出し手店', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額',
+    proposal_headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額',
                         '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                         '最終出庫日', '要記録警告', '引取候補店', '参考:過剰だが使用中の店',
                         '6ヶ月出庫回数', '医薬品CD']
-    proposal_rows = [[r['出し手店'], r['薬品名'], r['単位'], r['メーカ名'], r['過剰数'],
+    proposal_rows = [[r['出し手店'], r['種別'], r['薬品名'], r['単位'], r['メーカ名'], r['過剰数'],
                       r['過剰数金額'], r['過剰在庫区分'], r['不動区分'], r['期限切迫区分'],
                       r['有効期限'], r['ロットNO'], r['最終出庫日'], r['要記録警告'],
                       r['引取候補店'], r['参考:過剰だが使用中の店'],
                       r['6ヶ月出庫回数'], r['医薬品CD']] for r in result['proposal_rows']]
 
-    shortage_headers = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', '過剰に持つ他店']
+    shortage_headers = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', 'デッド/期限切迫で持つ他店']
     shortage_rows = [[r['店'], r['薬品名'], r['在庫数'], r['安全在庫数'], r['不足数'],
-                      r['医薬品CD'], r['過剰に持つ他店']] for r in result['shortage_rows']]
+                      r['医薬品CD'], r['デッド/期限切迫で持つ他店']] for r in result['shortage_rows']]
 
     matrix_headers = ['薬品名', '医薬品CD'] + result['store_names']
     matrix_rows = result['matrix_rows']
 
-    summary_headers = ['店', '過剰品目数', '過剰金額計', '期限切迫品目数', '期限切迫金額計', '不足品目数']
-    summary_rows = [[r['店'], r['過剰品目数'], r['過剰金額計'], r['期限切迫品目数'],
+    summary_headers = ['店', 'デッド品目数', 'デッド金額計', '期限切迫品目数', '期限切迫金額計', '不足品目数']
+    summary_rows = [[r['店'], r['デッド品目数'], r['デッド金額計'], r['期限切迫品目数'],
                      r['期限切迫金額計'], r['不足品目数']] for r in result['summary_rows']]
 
     return {

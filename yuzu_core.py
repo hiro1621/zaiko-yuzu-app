@@ -73,7 +73,8 @@ CONFIG = {
     # 「過剰保有（holds_excess）」の定義 ＝ 受け取り側がすでにその品目を余らせているか：
     #   過剰在庫区分が非空 または 不動区分が非空 または 過剰数>0
     #   ※ 期限切迫は「使えば消える」ので過剰保有には含めない
-    #     （出し手判定 is_overstock は期限切迫も見るが、それとは別定義であることに注意）
+    #     （出し手判定 is_supplier＝デッド／期限切迫 とは別定義であることに注意。
+    #       holds_excess は“受け取り側が余らせているか”の判定なので、A案でも変更しない）
     'holds_excess_flag_cols': ['過剰在庫区分', '不動区分'],  # このどれかが非空なら過剰保有
     'holds_excess_qty_col':   '過剰数',                     # この数量が >0 なら過剰保有
     # tierごとの表示ラベル
@@ -203,14 +204,41 @@ def g(row, col):
 # ============================================================================
 # 行レベルの判定
 # ============================================================================
-def is_overstock(row):
-    """ 出し手（融通候補）か：過剰/不動/期限切迫のいずれか非空、または過剰数>0 """
-    for c in ['過剰在庫区分', '不動区分', '期限切迫区分']:
-        if is_text_flag(g(row, c)):
-            return True
-    if parse_num(g(row, '過剰数')) > 0:
-        return True
-    return False
+# ★出し手（融通候補）の定義（A案・本間部長承認 2026-07-27）★
+#   従来は「過剰在庫区分/不動区分/期限切迫区分のいずれか非空、または過剰数>0」（＝is_overstock）
+#   でしたが、純粋な過剰（デッドでも期限切迫でもない、ただ在庫が多いだけの品）を提案から外し、
+#   本当に動かすべき「デッド（不動）」と「期限切迫」だけを出し手とすることにしました。
+#     ・is_dead(row)   … 不動区分が非空（＝デッド在庫）
+#     ・is_expiry(row) … 期限切迫区分が非空
+#     ・is_supplier(row)＝ is_dead または is_expiry （＝新しい出し手）
+#   カテゴリは排他・デッド優先：デッドなら「デッド」、デッドでなく期限切迫なら「期限切迫」。
+#   （デッドかつ期限切迫の品は「デッド」に入れる。ただし期限切迫区分の値は各行に残し、
+#     Excelでは赤ハイライトを維持する。）
+def is_dead(row):
+    """ デッド（不動）在庫か：不動区分が非空なら True """
+    return is_text_flag(g(row, '不動区分'))
+
+
+def is_expiry(row):
+    """ 期限切迫か：期限切迫区分が非空なら True """
+    return is_text_flag(g(row, '期限切迫区分'))
+
+
+def is_supplier(row):
+    """ 出し手（融通候補）か：デッド または 期限切迫 なら True。
+        ※ 純粋な過剰（過剰在庫区分だけ／過剰数>0だけで、不動でも期限切迫でもない品）は
+          出し手に含めない（A案）。 """
+    return is_dead(row) or is_expiry(row)
+
+
+def supplier_category(row):
+    """ 出し手のカテゴリを返す（排他・デッド優先）：
+        デッドなら 'デッド'、デッドでなく期限切迫なら '期限切迫'、どちらでもなければ ''（＝出し手でない）。 """
+    if is_dead(row):
+        return 'デッド'
+    if is_expiry(row):
+        return '期限切迫'
+    return ''
 
 
 def is_shortage(row):
@@ -223,7 +251,7 @@ def is_shortage(row):
 def holds_excess(row):
     """ 受け取り側が『すでに過剰保有』か（引取候補 tier②適正 と tier③参考 の分かれ目）。
         過剰在庫区分が非空 または 不動区分が非空 または 過剰数>0 なら True。
-        ※ 期限切迫は「使えば消える」ため、ここでは過剰保有に含めない（is_overstock とは別定義）。 """
+        ※ 期限切迫は「使えば消える」ため、ここでは過剰保有に含めない（出し手判定 is_supplier とは別定義）。 """
     for c in CONFIG['holds_excess_flag_cols']:
         if is_text_flag(g(row, c)):
             return True
@@ -602,7 +630,9 @@ def compute_matching(stores):
                 continue
             kk = (s['name'], key)
             sh = is_shortage(row)
-            ov = is_overstock(row)
+            dead = is_dead(row)          # デッド（不動区分が非空）
+            expf = is_expiry(row)        # 期限切迫（期限切迫区分が非空）
+            supp = dead or expf          # 出し手（デッド or 期限切迫）
             he = holds_excess(row)   # 受け取り側の「過剰保有」（tier②適正/③参考の分かれ目）
             uq = usage_qty6(row)
             uc = usage_cnt6(row)
@@ -615,14 +645,17 @@ def compute_matching(stores):
             e = store_key_info.get(kk)
             if e is None:
                 store_key_info[kk] = {
-                    'store': s['name'], 'shortage': sh, 'overstock': ov,
+                    'store': s['name'], 'shortage': sh,
+                    'dead': dead, 'expiry': expf, 'supplier': supp,
                     'holds_excess': he,
                     'usage_qty6': uq, 'usage_cnt6': uc, 'over_qty': over_qty,
                     'over_amt': over_amt, 'exp': exp, 'name': name,
                     'zaiko': zaiko, 'safe': safe}
             else:
                 e['shortage'] = e['shortage'] or sh
-                e['overstock'] = e['overstock'] or ov
+                e['dead'] = e['dead'] or dead
+                e['expiry'] = e['expiry'] or expf
+                e['supplier'] = e['supplier'] or supp
                 e['holds_excess'] = e['holds_excess'] or he
                 e['usage_qty6'] += uq
                 e['usage_cnt6'] += uc
@@ -636,13 +669,15 @@ def compute_matching(stores):
         by_key[key].append(e)
 
     # --- 出し手（融通提案）を1行ずつ作る ---
+    #   出し手＝デッド または 期限切迫（A案）。純粋な過剰は提案に載せない。
+    #   各行に「種別」（デッド／期限切迫・排他デッド優先）を持たせる。
     proposal_rows = []
     legal_excluded_count = 0
     legal_excluded_amt = 0.0
     nokey_overstock = 0
     for s in stores:
         for row in s['rows']:
-            if not is_overstock(row):
+            if not is_supplier(row):
                 continue
             if is_legal_excluded(row):
                 legal_excluded_count += 1
@@ -658,7 +693,8 @@ def compute_matching(stores):
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
             remain = month_diff(s['base_date'], exp) if exp else None
             proposal_rows.append({
-                '出し手店': s['name'], '薬品名': g(row, '薬品名'), '単位': g(row, '単位'),
+                '出し手店': s['name'], '種別': supplier_category(row),
+                '薬品名': g(row, '薬品名'), '単位': g(row, '単位'),
                 'メーカ名': g(row, 'メーカ名'), '過剰数': round(over_qty, 2),
                 '過剰数金額': round(over_amt, 2),
                 '過剰在庫区分': g(row, '過剰在庫区分'), '不動区分': g(row, '不動区分'),
@@ -680,25 +716,29 @@ def compute_matching(stores):
             key, _ = row_key(row)
             safe = parse_num(g(row, '安全在庫数'))
             zaiko = parse_num(g(row, '在庫数'))
+            # 供給元は「デッドまたは期限切迫で持つ他店」に統一（A案。旧・過剰保有基準は廃止）
             holders = []
             if key:
                 for e in by_key.get(key, []):
                     if e['store'] == s['name']:
                         continue
-                    if e['overstock']:
-                        holders.append('%s（過剰%s・期限%s）'
-                                       % (e['store'], fmt_qty(e['over_qty']), fmt_ym(e['exp'])))
+                    if e['supplier']:
+                        cat = 'デッド' if e['dead'] else '期限切迫'
+                        holders.append('%s（%s・数量%s・期限%s）'
+                                       % (e['store'], cat, fmt_qty(e['over_qty']), fmt_ym(e['exp'])))
             shortage_rows.append({
                 '店': s['name'], '薬品名': g(row, '薬品名'), '在庫数': round(zaiko, 2),
                 '安全在庫数': round(safe, 2), '不足数': round(safe - zaiko, 2),
                 '医薬品CD': key or '',
-                '過剰に持つ他店': ' / '.join(holders) if holders else '（なし）'})
+                'デッド/期限切迫で持つ他店': ' / '.join(holders) if holders else '（なし）'})
     shortage_rows.sort(key=lambda r: (r['店'], -r['不足数']))
 
     # --- 品目×店舗マトリクス ---
+    #   行に出す品目＝出し手（デッド／期限切迫）がある品目。セルは：
+    #     デX＝デッドで数量X ／ 限X＝期限切迫で数量X ／ 不＝安全在庫割れ ／ 使＝直近6ヶ月出庫あり
     over_keys = {}
     for (store, key), e in store_key_info.items():
-        if e['overstock']:
+        if e['supplier']:
             over_keys.setdefault(key, e['name'])
     matrix_keys = sorted(over_keys.keys(), key=lambda k: over_keys[k])
     store_names = [s['name'] for s in stores]
@@ -709,8 +749,10 @@ def compute_matching(stores):
             e = store_key_info.get((sn, key))
             if e is None:
                 cells.append('')
-            elif e['overstock']:
-                cells.append('過%s' % fmt_qty(e['over_qty']))
+            elif e['supplier']:
+                # デッド優先（デッドかつ期限切迫なら「デ」）。純粋な期限切迫だけ「限」。
+                mark = 'デ' if e['dead'] else '限'
+                cells.append('%s%s' % (mark, fmt_qty(e['over_qty'])))
             elif e['shortage']:
                 cells.append('不')
             elif e['usage_cnt6'] > 0:
@@ -720,32 +762,36 @@ def compute_matching(stores):
         matrix_rows.append(cells)
 
     # --- 店舗別サマリ ---
+    #   出し手（デッド／期限切迫）を、排他・デッド優先で数える（proposal と同じ数え方）。
+    #   金額は現行どおり「過剰数金額」を使う。麻薬・覚醒剤（法規制除外）は数えない。
     summary_rows = []
     for s in stores:
-        over_cnt = 0
-        over_amt = 0.0
+        dead_cnt = 0
+        dead_amt = 0.0
         exp_cnt = 0
         exp_amt = 0.0
         short_cnt = 0
         for row in s['rows']:
-            if is_overstock(row) and not is_legal_excluded(row):
-                over_cnt += 1
-                over_amt += parse_num(g(row, '過剰数金額'))
-                if is_text_flag(g(row, '期限切迫区分')):
+            if is_supplier(row) and not is_legal_excluded(row):
+                amt = parse_num(g(row, '過剰数金額'))
+                if supplier_category(row) == 'デッド':
+                    dead_cnt += 1
+                    dead_amt += amt
+                else:  # 期限切迫（デッドでない）
                     exp_cnt += 1
-                    exp_amt += parse_num(g(row, '過剰数金額'))
+                    exp_amt += amt
             if is_shortage(row):
                 short_cnt += 1
         summary_rows.append({
-            '店': s['name'], '過剰品目数': over_cnt, '過剰金額計': round(over_amt, 2),
+            '店': s['name'], 'デッド品目数': dead_cnt, 'デッド金額計': round(dead_amt, 2),
             '期限切迫品目数': exp_cnt, '期限切迫金額計': round(exp_amt, 2),
             '不足品目数': short_cnt})
 
-    # --- 自己検算：抽出条件適用後の過剰数金額合計 と 融通提案シートの合計 ---
+    # --- 自己検算：出し手（デッド＋期限切迫・法規制除外後）の過剰数金額合計 と 融通提案シートの合計 ---
     checkA = 0.0
     for s in stores:
         for row in s['rows']:
-            if is_overstock(row) and not is_legal_excluded(row):
+            if is_supplier(row) and not is_legal_excluded(row):
                 checkA += parse_num(g(row, '過剰数金額'))
     checkB = sum(r['_amt_raw'] for r in proposal_rows)
     diff = abs(checkA - checkB)
@@ -774,6 +820,7 @@ def compute_matching(stores):
 # Excel出力（コマンド版のExcelダウンロードと、アプリ版のExcelダウンロードで共用）
 # ============================================================================
 RED_FILL = PatternFill('solid', fgColor='FFC7CE')     # 期限切迫（赤系）
+DEAD_FILL = PatternFill('solid', fgColor='FCE4D6')    # デッド（薄オレンジ系）※マトリクスの「デX」用
 YELLOW_FILL = PatternFill('solid', fgColor='FFEB9C')  # 期限1年以内（黄系）
 HEADER_FILL = PatternFill('solid', fgColor='D9E1F2')   # 見出し
 NOTE_FILL = PatternFill('solid', fgColor='FFF2CC')     # 注記
@@ -813,7 +860,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     ws.cell(row=1, column=1, value=note).fill = NOTE_FILL
     ws.cell(row=1, column=1).font = Font(bold=True, color='7F6000')
 
-    headers = ['出し手店', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額',
+    headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額',
                '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                '最終出庫日', '要記録警告', '引取候補店', '参考:過剰だが使用中の店',
                '6ヶ月出庫回数', '医薬品CD']
@@ -827,7 +874,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
         c.border = BORDER
     r = hr + 1
     for pr in proposal_rows:
-        vals = [pr['出し手店'], pr['薬品名'], pr['単位'], pr['メーカ名'], pr['過剰数'],
+        vals = [pr['出し手店'], pr['種別'], pr['薬品名'], pr['単位'], pr['メーカ名'], pr['過剰数'],
                 pr['過剰数金額'], pr['過剰在庫区分'], pr['不動区分'], pr['期限切迫区分'],
                 pr['有効期限'], pr['ロットNO'], pr['最終出庫日'], pr['要記録警告'],
                 pr['引取候補店'], pr['参考:過剰だが使用中の店'],
@@ -854,7 +901,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
 
     # ---------- シート2：不足品目一覧 ----------
     ws2 = wb.create_sheet('不足品目一覧')
-    headers2 = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', '過剰に持つ他店']
+    headers2 = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', 'デッド/期限切迫で持つ他店']
     for ci, h in enumerate(headers2, start=1):
         c = ws2.cell(row=1, column=ci, value=h)
         c.fill = HEADER_FILL
@@ -863,7 +910,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     r = 2
     for sr in shortage_rows:
         vals = [sr['店'], sr['薬品名'], sr['在庫数'], sr['安全在庫数'], sr['不足数'],
-                sr['医薬品CD'], sr['過剰に持つ他店']]
+                sr['医薬品CD'], sr['デッド/期限切迫で持つ他店']]
         for ci, v in enumerate(vals, start=1):
             ws2.cell(row=r, column=ci, value=v).border = BORDER
         r += 1
@@ -885,21 +932,24 @@ def write_excel(path, base_ym_disp, csv_base_disp,
             cell = ws3.cell(row=r, column=ci, value=v)
             cell.border = BORDER
             if ci >= 3 and isinstance(v, str):
-                if v.startswith('過'):
-                    cell.fill = RED_FILL
+                if v.startswith('限'):
+                    cell.fill = RED_FILL       # 期限切迫（赤）
+                elif v.startswith('デ'):
+                    cell.fill = DEAD_FILL      # デッド（薄オレンジ）
                 elif v == '不':
                     cell.fill = YELLOW_FILL
         r += 1
     # 凡例
     ws3.cell(row=r + 1, column=1,
-             value='凡例：過X=過剰（数量X） ／ 不=安全在庫割れ ／ 使=直近6ヶ月に出庫実績あり ／ 空欄=在庫なし')
+             value='凡例：デX=デッド（不動・数量X） ／ 限X=期限切迫（数量X） ／ '
+                   '不=安全在庫割れ ／ 使=直近6ヶ月に出庫実績あり ／ 空欄=在庫なし')
     ws3.freeze_panes = 'C2'
     _auto_width(ws3, headers3, max_width=14)
     ws3.column_dimensions['A'].width = 32
 
     # ---------- シート4：店舗別サマリ ----------
     ws4 = wb.create_sheet('店舗別サマリ')
-    headers4 = ['店', '過剰品目数', '過剰金額計', '期限切迫品目数', '期限切迫金額計', '不足品目数']
+    headers4 = ['店', 'デッド品目数', 'デッド金額計', '期限切迫品目数', '期限切迫金額計', '不足品目数']
     for ci, h in enumerate(headers4, start=1):
         c = ws4.cell(row=1, column=ci, value=h)
         c.fill = HEADER_FILL
@@ -907,7 +957,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
         c.border = BORDER
     r = 2
     for su in summary_rows:
-        vals = [su['店'], su['過剰品目数'], su['過剰金額計'], su['期限切迫品目数'],
+        vals = [su['店'], su['デッド品目数'], su['デッド金額計'], su['期限切迫品目数'],
                 su['期限切迫金額計'], su['不足品目数']]
         for ci, v in enumerate(vals, start=1):
             ws4.cell(row=r, column=ci, value=v).border = BORDER
