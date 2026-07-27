@@ -6,6 +6,8 @@
 各店がブラウザから薬VANの在庫ファイル（.xls / .csv / .xlsx）をアップロードすると、
 共通エンジン（yuzu_core）が全店ぶんを毎回まとめて再計算し、
   ・自店（②）のデッド品／（③）の期限切迫品（それぞれ欲しがる店つき）
+  ・自店（④）が引き取れる薬（他店のデッド・期限切迫のうち、引取候補店＝自店の品）＝見るだけの一覧
+    （2026-07-27 追加。ボタン・申込みは無し。連絡は従来どおり電話・デスクネッツ）
   ・（参考）自店が不足している薬を、デッド／期限切迫で持っている店
   ・全店の融通提案一覧（デッド＋期限切迫・在庫金額の大きい順／「種別」列つき）
   ・「現在 N/14店 アップ済み」（店数は stores_config.py の STORE_COUNT）
@@ -285,6 +287,28 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
         backend.save_exclusions(keep)
         st.success('%d件を融通の対象から外しました。' % added)
         st.rerun()
+
+
+def receive_section(view_receive, my_store):
+    """
+    ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧を描く。
+      ・見るだけの一覧。ボタン・申込みの仕組みは付けない（連絡は従来どおり電話・デスクネッツ）。
+      ・★st.dataframe に on_select を渡さない＝行選択・チェックボックスなしの「読むだけ」の表にする。
+      ・_style_expiry(df, paint=False) を通すことで、在庫数・在庫金額がカンマ区切り＋小数第2位で
+        表示される（②③と同じ体裁）。paint=False なので背景は塗らない。
+    """
+    st.subheader('④（%s）が引き取れる薬（他店のデッド・期限切迫）' % my_store)
+    st.caption('他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品です。'
+               '『区分』に表示がある薬（向精神薬・毒薬・劇薬）は、受け取る側でも記録が必要です。'
+               '連絡は従来どおり電話・デスクネッツでお願いします。')
+    if not view_receive:
+        st.info('いま他店から引き取れる品はありません。')
+        return
+    df = pd.DataFrame(view_receive)
+    st.dataframe(
+        _style_expiry(df, paint=False),
+        hide_index=True,
+        use_container_width=True)
 
 
 def excluded_section(my_store, backend, exclusions):
@@ -578,12 +602,16 @@ def results_section(backend):
             # ---- 除外中の品目（戻せる） ----
             excluded_section(my_store, backend, exclusions)
 
-    # ---- ④ Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
+            # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
+            view_receive = app_logic.build_view_receive(result, my_store)
+            receive_section(view_receive, my_store)
+
+    # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()
     try:
         xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
         st.download_button(
-            '④ この結果をExcel（4シート）でダウンロード',
+            'この結果をExcel（4シート）でダウンロード',
             data=xls,
             file_name='在庫融通リスト_%s-%s.xlsx' % (latest[:4], latest[4:6]) if latest else '在庫融通リスト.xlsx',
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')

@@ -10,6 +10,10 @@
   ・Excel出力 write_excel()
 を提供します。
 
+  【2026-07-27 追加】④受け手ビュー用に、引取候補店を「1件1行」で持つ丸め無しの構造化データを追加しました。
+    build_candidate_entries()（丸めを通さず候補を全件返す）＋ compute_matching の戻り値 'candidate_rows'。
+    既存キー・Excel4シート・Gシート出力は一切変えていません（増やすだけ）。
+
 このファイルは「単一の真実」です。次の2つが必ず同じ計算をするよう、両者ともここを呼びます。
   ・コマンド版：create_yuzu_list.py（input フォルダのファイルをパスから読む）
   ・アプリ版　：streamlit_app.py（店がアップロードしたファイルのバイトをそのまま読む）
@@ -641,6 +645,81 @@ def build_candidates(by_key, key, source_store, supply_qty, exp_date, base_date)
     return main_str, ref_str
 
 
+def build_candidate_entries(by_key, key, source_store, supply_qty, exp_date, base_date):
+    """ 出し手（デッド／期限切迫）1件について、引取候補店を「候補ごとに1件の辞書」で返す。
+        ④受け手ビュー（他店が出そうとしていて、自店が引き取れば活かせる品の一覧）の土台です。
+
+        ★build_candidates（表示用の文字列を作る関数）と選別ロジックは同じですが、
+          この関数は _join_with_overflow を通しません＝上位5店（CONFIG['max_candidates']）で
+          丸めず、拾った候補を丸め無しで全件返します。
+          （build_candidates の文字列は6店目以降を「他N店」に丸めるため、その文字列を
+            解析して④を作ると候補漏れが起き、しかも画面には「該当なし」と出て漏れに気づけません。
+            そのため、丸めを通さない構造化データをここで別に作ります。）
+
+        拾うのは ①不足中（short）と ②使用中(適正)（use_ok）の2つだけです。
+          ③参考（過剰だが使用中／use_ref）は含めません
+          （本間部長確定：④の「なぜ候補か」は 不足中／使用中 の2値）。
+
+        返す辞書は「候補ごとに違う情報」だけに絞ります（薬品名・在庫数などの品目情報は持たせません）。
+          理由：同じ値を2箇所で作ると、将来どちらかを直したときに静かにズレます。
+                品目情報は呼び出し側（compute_matching）が提案行から借りて付け足します（値の出どころを1つに保つ）。
+
+        戻り値は辞書のリスト（候補が無ければ空リスト）：
+          {'引取候補店': 店名, 'なぜ候補か': '不足中' or '使用中',
+           '_tier_order': 0(不足中) or 1(使用中), '消化目安': 目安文字列}
+        ※ key が空（医薬品コード無し・突合対象外）のときは空リストを返します
+          （build_candidates が '（医薬品コード無し・突合対象外）' を返すのと同じケース）。 """
+    if not key:
+        return []
+    entries = by_key.get(key, [])
+    short = []    # ① 不足中
+    use_ok = []   # ② 使用中(適正)：使っていて、かつ受け取り側が過剰保有していない＝本命
+    for e in entries:
+        if e['store'] == source_store:
+            # 自店は引取候補にしない（build_candidates と同じガード）
+            continue
+        if e['shortage']:
+            short.append(e)
+        elif e['usage_cnt6'] > 0:
+            # 使用中：直近6ヶ月に出庫回数がある店。受け取り側が過剰保有していない品だけを②使用中に入れる。
+            #   （過剰保有している品＝③参考は build_candidates 側で扱う。ここでは拾わない）
+            if not e['holds_excess']:
+                use_ok.append(e)
+
+    def pace(e):
+        # 月あたり消化量。薬VANの出庫数はマイナス＝出庫なので、絶対値をとってから6で割る。
+        return abs(e['usage_qty6']) / 6.0
+
+    def detail_for(e):
+        # ★build_candidates 内の detail_for と一字一句同じ計算式（消化目安の二重管理を避ける）。
+        p = pace(e)
+        if p <= 0:
+            # 出庫回数はあるが出庫数の正味がゼロ（返品と相殺等）＝消化量が読めないケース
+            return '消化ペース不明'
+        # 消化目安＝渡す数量（在庫数）÷ 相手の月あたり消化量
+        months = supply_qty / p
+        if exp_date and base_date:
+            remain = month_diff(base_date, exp_date)
+            if months <= remain:
+                return '約%sヶ月で消化可' % fmt_months(months)
+            return '約%sヶ月・期限内消化不可' % fmt_months(months)
+        return '約%sヶ月' % fmt_months(months)
+
+    short.sort(key=lambda e: -pace(e))
+    use_ok.sort(key=lambda e: -pace(e))
+
+    L = CONFIG['tier_labels']
+    out = []
+    # ①不足中（_tier_order=0）を先に、②使用中（_tier_order=1）を後に並べる（既存の本命順と同じ）
+    for e in short:
+        out.append({'引取候補店': e['store'], 'なぜ候補か': L['short'],
+                    '_tier_order': 0, '消化目安': detail_for(e)})
+    for e in use_ok:
+        out.append({'引取候補店': e['store'], 'なぜ候補か': L['use_ok'],
+                    '_tier_order': 1, '消化目安': detail_for(e)})
+    return out
+
+
 # ============================================================================
 # 全店一括計算 compute_matching(stores)
 #   入力 stores = [{'name': 店名, 'ym': 'YYYYMM'|None, 'base_date': date, 'rows': [dict,...]}, ...]
@@ -723,6 +802,8 @@ def compute_matching(stores, excluded=None):
     #   出し手＝デッド または 期限切迫（A案）。純粋な過剰は提案に載せない。
     #   各行に「種別」（デッド／期限切迫・排他デッド優先）を持たせる。
     proposal_rows = []
+    # ④受け手ビューの土台：引取候補店を「候補ごとに1件」で貯めるリスト（丸め無し・下のループで足す）
+    candidate_rows = []
     legal_excluded_count = 0
     legal_excluded_amt = 0.0
     nokey_overstock = 0
@@ -763,7 +844,7 @@ def compute_matching(stores, excluded=None):
             cand_main, cand_ref = build_candidates(
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
             remain = month_diff(s['base_date'], exp) if exp else None
-            proposal_rows.append({
+            pr = {
                 '出し手店': s['name'], '種別': supplier_category(row),
                 '薬品名': g(row, '薬品名'), '単位': g(row, '単位'),
                 'メーカ名': g(row, 'メーカ名'), '在庫数': round(over_qty, 2),
@@ -776,7 +857,21 @@ def compute_matching(stores, excluded=None):
                 '6ヶ月出庫回数': round(usage_cnt6(row), 2), '医薬品CD': key or '',
                 '_ex_key': exclusion_key(row),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
-                '_remain': remain, '_amt_raw': over_amt})
+                '_remain': remain, '_amt_raw': over_amt}
+            proposal_rows.append(pr)
+            # ④受け手ビューの土台：この出し手行の引取候補店を「候補ごとに1件」で作り（丸め無し）、
+            #   品目情報（薬品名・在庫数など）は上で作った提案行 pr から借りてマージして貯める。
+            #   ★ここは少額カット（1,500円未満）・除外・法規制除外を全部くぐり抜けた行だけが到達するので、
+            #     それらの除外は候補にも自動で反映される（この地点に置いているのがミソ）。
+            for ce in build_candidate_entries(by_key, key, s['name'], over_qty, exp, s['base_date']):
+                candidate_rows.append({
+                    '引取候補店': ce['引取候補店'], 'なぜ候補か': ce['なぜ候補か'],
+                    '消化目安':   ce['消化目安'],   '_tier_order': ce['_tier_order'],
+                    '出し手店': pr['出し手店'], '薬品名': pr['薬品名'], '単位': pr['単位'],
+                    '在庫数':   pr['在庫数'],   '在庫金額': pr['在庫金額'],
+                    '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
+                    '_remain':  remain,
+                })
     proposal_rows.sort(key=lambda r: -r['在庫金額'])
 
     # --- 受け手（不足品目一覧）を作る ---
@@ -875,6 +970,8 @@ def compute_matching(stores, excluded=None):
 
     return {
         'proposal_rows': proposal_rows,
+        # ④受け手ビュー用：引取候補店を「1件1行」で持つ丸め無しの構造化データ（既存キーは一切変えず、増やすだけ）
+        'candidate_rows': candidate_rows,
         'shortage_rows': shortage_rows,
         'store_names': store_names,
         'matrix_keys': matrix_keys,
