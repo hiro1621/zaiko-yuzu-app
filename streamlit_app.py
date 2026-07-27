@@ -176,11 +176,13 @@ def _df(rows, columns=None):
 _NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数']
 
 
-def _style_expiry(df):
+def _style_expiry(df, paint=True):
     """ 表を見やすく整えた pandas Styler を返す。
           ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00・カンマ区切り）
-          ・「期限切迫区分」が非空の行は【薄赤の背景＋黒文字】で行ごと目立たせる
-            （デッド一覧の中で"期限が近いデッド"が一目で分かるように）
+          ・paint=True のとき、「期限切迫区分」が非空の行を【薄赤の背景＋黒文字】で行ごと目立たせる
+            （②デッド一覧の中で"期限が近いデッド"が一目で分かるように）
+          ・paint=False のときは背景を塗らない（③期限切迫品は全行が期限切迫で、
+            塗ると表全体が赤くなるだけで情報量がゼロのため。数値フォーマットは②③とも効かせる）。
         ★文字色を黒（#000000）で明示するのは、ダークテーマだと白文字×薄赤で読めなくなるため。
           ライトテーマでは元から黒文字なので見た目は変わらない。
         Styler が使えない環境では素の DataFrame をそのまま返す。 """
@@ -188,7 +190,8 @@ def _style_expiry(df):
         return df
 
     # 薄赤背景＋黒文字。行全体を塗るので有効期限も一緒に目立つ。
-    HIT_STYLE = 'background-color: #FFC7CE; color: #000000'
+    # 色は #FFE3E6（旧 #FFC7CE より薄いピンク＝現行色と白のちょうど中間）。
+    HIT_STYLE = 'background-color: #FFE3E6; color: #000000'
 
     def _paint(row):
         hit = str(row.get('期限切迫区分', '') or '').strip() != ''
@@ -199,7 +202,7 @@ def _style_expiry(df):
         fmt = {c: '{:,.2f}' for c in _NUM2_COLS if c in df.columns}
         if fmt:
             sty = sty.format(fmt)
-        if '期限切迫区分' in df.columns:
+        if paint and '期限切迫区分' in df.columns:
             sty = sty.apply(_paint, axis=1)
         return sty
     except Exception:
@@ -226,16 +229,18 @@ def _selected_rows(event):
             return []
 
 
-def supply_editor(rows, my_store, backend, exclusions, table_key):
+def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=True):
     """
     ②デッド品・③期限切迫品の表を「行選択方式」で描く。
-      rows        … app_logic.build_view_a / build_view_expiry の戻り
-      table_key   … 画面部品を区別するための名前（'dead' / 'expiry'）
+      rows          … app_logic.build_view_a / build_view_expiry の戻り
+      table_key     … 画面部品を区別するための名前（'dead' / 'expiry'）
+      paint_expiry  … 期限切迫を兼ねる行を薄赤に塗るか（②=True／③=False）。
+                      ③は全行が期限切迫なので塗ると真っ赤になるだけ＝Falseで白のままにする。
     表示は8列（薬品名／単位／在庫数／在庫金額／有効期限／期限切迫区分／区分／引取候補店）。
-    ・期限切迫を兼ねる行は pandas Styler で薄赤（背景 #FFC7CE・黒文字）に塗る。
+    ・②では期限切迫を兼ねる行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
       チェック欄つきの旧方式では行の色を付けられず ⚠ 記号で代替していたが、
       行選択方式なら Styler の背景色と左端の選択チェックが両立するので色を戻した。
-    ・数値（在庫数・在庫金額）はカンマ区切り＋小数第2位で表示する。
+    ・数値（在庫数・在庫金額）はカンマ区切り＋小数第2位で表示する（②③とも共通）。
     ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える
       （自店の表・全店一覧・他店の参考ビュー・Excel・Gシートのすべてから）。
     """
@@ -248,7 +253,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key):
     df = pd.DataFrame([{c: r[c] for c in disp_cols} for r in rows])
 
     event = st.dataframe(
-        _style_expiry(df),
+        _style_expiry(df, paint=paint_expiry),
         hide_index=True,
         use_container_width=True,
         on_select='rerun',
@@ -479,8 +484,10 @@ def results_section(backend):
             # ---- ③（自店）の期限切迫品 ----
             st.subheader('③（%s）の期限切迫品' % my_store)
             st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
-                       '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。')
-            supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry')
+                       '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
+                       '（③は全行が期限切迫のため、背景は白のままにしています）')
+            supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
+                          paint_expiry=False)
 
             # ---- 除外中の品目（戻せる） ----
             excluded_section(my_store, backend, exclusions)
