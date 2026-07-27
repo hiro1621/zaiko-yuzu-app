@@ -7,8 +7,8 @@
 共通エンジン（yuzu_core）が全店ぶんを毎回まとめて再計算し、
   ・自店（②）のデッド品／（③）の期限切迫品（それぞれ欲しがる店つき）
   ・（参考）自店が不足している薬を、デッド／期限切迫で持っている店
-  ・全店の融通提案一覧（デッド＋期限切迫・金額の大きい順／「種別」列つき）
-  ・「現在 N/15店 アップ済み」
+  ・全店の融通提案一覧（デッド＋期限切迫・在庫金額の大きい順／「種別」列つき）
+  ・「現在 N/14店 アップ済み」（店数は stores_config.py の STORE_COUNT）
 を返します。裏側の保管庫はGoogleスプレッドシート（サービスアカウント経由のみ）。
 店舗はGシートを直接触らず、必ずこのアプリ経由で読み書きします。
 
@@ -20,7 +20,12 @@
   1. 共有パスワードを入れる（1回だけ）。
   2. 自分の店をドロップダウンで選ぶ。
   3. 薬VANの在庫ファイルを選んでアップロードする。
-  4. 結果（自店のデッド品・期限切迫品／全店一覧／○/15）が表示される。
+  4. 結果（自店のデッド品・期限切迫品／全店一覧／○/14）が表示される。
+
+★数量・金額の定義（本間部長判断 2026-07-27）★
+  「在庫数」＝その店がいま持っている全量、「在庫金額」＝在庫数×薬価（薬VANの薬価金額列）。
+  旧仕様の「過剰数／過剰数金額」（＝安全在庫を超えた分だけ）は使いません。デッド品は
+  在庫まるごとが動かす対象で、過剰数だと0になってしまう品が実在するためです。
 
 【必要なライブラリのインストール（コマンドプロンプトで実行）】
     pip install streamlit gspread google-auth openpyxl xlrd==2.0.1
@@ -156,12 +161,17 @@ def _df(rows, columns=None):
     return df
 
 
+# 小数第2位まで表示する数値列（在庫数・在庫金額など）
+_NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数']
+
+
 def _style_expiry(df):
-    """ 「期限切迫区分」が非空の行を、有効期限もろとも【薄赤の背景】で目立たせた
-        pandas Styler を返す（デッド一覧の中で"期限が近いデッド"が一目で分かるように）。
-        文字は黒のまま（背景ハイライトだけで区別できるため）。
-        列に「期限切迫区分」が無い／空の表なら、素の DataFrame をそのまま返す。 """
-    if df is None or df.empty or '期限切迫区分' not in df.columns:
+    """ 表を見やすく整えた pandas Styler を返す。
+          ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00）
+          ・「期限切迫区分」が非空の行は【薄赤の背景】で行ごと目立たせる
+            （デッド一覧の中で"期限が近いデッド"が一目で分かるように。文字は黒のまま）
+        Styler が使えない環境では素の DataFrame をそのまま返す。 """
+    if df is None or df.empty:
         return df
 
     # 薄赤背景のみ（文字色は既定の黒）。行全体を塗るので有効期限も一緒に目立つ。
@@ -172,7 +182,13 @@ def _style_expiry(df):
         return [HIT_STYLE if hit else '' for _ in row]
 
     try:
-        return df.style.apply(_paint, axis=1)
+        sty = df.style
+        fmt = {c: '{:,.2f}' for c in _NUM2_COLS if c in df.columns}
+        if fmt:
+            sty = sty.format(fmt)
+        if '期限切迫区分' in df.columns:
+            sty = sty.apply(_paint, axis=1)
+        return sty
     except Exception:
         # 万一 Styler が使えない環境でも、表示自体は素のDataFrameで続行する
         return df
@@ -283,6 +299,17 @@ def results_section(backend):
     if not stores:
         st.stop()
 
+    # 旧形式で保管された店の検出
+    #   在庫金額は「薬価金額」列から出すが、この列を保管庫に残すようにしたのは2026-07-27から。
+    #   それ以前にアップされた店のデータには入っていないため、在庫金額が0円になってしまう。
+    #   黙って0円を出すと誤解のもとなので、その店だけ再アップロードを促す。
+    old_format = [s['name'] for s in stores
+                  if not any(str(r.get('薬価金額', '') or '').strip()
+                             or str(r.get('薬価', '') or '').strip() for r in s['rows'])]
+    if old_format:
+        st.warning('次の店のデータは旧形式で保管されているため、在庫金額が0円で表示されます。'
+                   'お手数ですが、もう一度アップロードしてください：' + '、'.join(old_format))
+
     # 全店ぶんを毎回まとめて再計算
     result = yuzu_core.compute_matching(stores)
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
@@ -301,8 +328,8 @@ def results_section(backend):
     my_store = st.session_state.get('my_store')
 
     # 自店視点の表で使う列（②デッド品・③期限切迫品で共通）
-    supply_cols = ['薬品名', '単位', '過剰数', '過剰数金額', '有効期限', '期限切迫区分',
-                   '要記録警告', '引取候補店（本命）', '参考:過剰だが使用中の店', '医薬品CD']
+    supply_cols = ['薬品名', '単位', '在庫数', '在庫金額', '有効期限', '期限切迫区分',
+                   '区分', '引取候補店']
 
     st.divider()
     if not my_store:
@@ -321,10 +348,7 @@ def results_section(backend):
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
             view_b = app_logic.build_view_b(result, my_store)
 
-            st.caption('自店のデッド（不動）在庫と、その引取候補店。'
-                       '引取候補店（本命）＝ ①不足中 → ②使用中 の順。'
-                       '「参考:過剰だが使用中の店」は別枠（送っても余りが増えがち）。'
-                       '期限切迫を兼ねる品は薄赤で表示します。')
+            st.caption('期限切迫を兼ねる品は薄赤で表示します。')
             st.dataframe(_style_expiry(_df(view_a, supply_cols)),
                          use_container_width=True, hide_index=True)
 
@@ -345,15 +369,14 @@ def results_section(backend):
     st.subheader('④ 全店の融通提案一覧（デッド＋期限切迫・金額の大きい順）')
     all_rows = [{
         '出し手店': r['出し手店'], '種別': r['種別'], '薬品名': r['薬品名'], '単位': r['単位'],
-        'メーカ名': r['メーカ名'], '過剰数': r['過剰数'], '過剰数金額': r['過剰数金額'],
+        'メーカ名': r['メーカ名'], '在庫数': r['在庫数'], '在庫金額': r['在庫金額'],
         '有効期限': r['有効期限'], '期限切迫区分': r['期限切迫区分'],
-        '要記録警告': r['要記録警告'], '引取候補店': r['引取候補店'],
-        '参考:過剰だが使用中の店': r['参考:過剰だが使用中の店'], '医薬品CD': r['医薬品CD'],
+        '区分': r['区分'], '引取候補店': r['引取候補店'],
     } for r in result['proposal_rows']]
     st.caption('全 %d 件（種別＝デッド／期限切迫）' % len(all_rows))
     st.dataframe(_style_expiry(_df(all_rows, [
-        '出し手店', '種別', '薬品名', '単位', 'メーカ名', '過剰数', '過剰数金額', '有効期限',
-        '期限切迫区分', '要記録警告', '引取候補店', '参考:過剰だが使用中の店', '医薬品CD'])),
+        '出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額', '有効期限',
+        '期限切迫区分', '区分', '引取候補店'])),
         use_container_width=True, hide_index=True)
 
     # Excelダウンロード
