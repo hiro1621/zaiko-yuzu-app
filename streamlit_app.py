@@ -42,6 +42,9 @@ import app_logic
 import gsheet_store
 from stores_config import STORE_NAMES, STORE_COUNT, COMPANY_OF
 
+# ドロップダウンの先頭に置く「未選択」の選択肢
+SENTINEL_STORE = '選択してください'
+
 
 # ============================================================================
 # 画面の基本設定
@@ -171,14 +174,32 @@ def show_upload_status(status, latest):
 def upload_section(backend):
     st.subheader('① 自分の店を選んで、在庫ファイルをアップロード')
 
-    my_store = st.selectbox(
-        '自分の店（必ず選んでください）',
-        STORE_NAMES,
-        index=STORE_NAMES.index(st.session_state.get('my_store', STORE_NAMES[0]))
-        if st.session_state.get('my_store') in STORE_NAMES else 0,
-        format_func=lambda n: '%s（%s）' % (n, COMPANY_OF.get(n, '')))
-    st.session_state['my_store'] = my_store
-    st.caption('→ **%s** で提出します。' % my_store)
+    # 店舗名の選択（先頭は「選択してください」。会社名（ソユーズ/内観堂）の付記は無し）
+    options = [SENTINEL_STORE] + STORE_NAMES
+    prev = st.session_state.get('my_store')
+    default_index = options.index(prev) if prev in STORE_NAMES else 0
+
+    # ラベルはこの位置に後から入れる（選択状態に応じて色を変えるため）
+    label_ph = st.empty()
+    choice = st.selectbox(
+        '店舗名（必須）',
+        options,
+        index=default_index,
+        format_func=lambda n: n,
+        label_visibility='collapsed')
+
+    if choice in STORE_NAMES:
+        # 選択済み → ラベルは通常色
+        label_ph.markdown('店舗名（必須）')
+        my_store = choice
+        st.session_state['my_store'] = my_store
+        st.caption('→ **%s** で提出します。' % my_store)
+    else:
+        # 未選択 → ラベルを赤の太字で強調
+        label_ph.markdown(':red[**店舗名（必須）**]')
+        my_store = None
+        st.session_state['my_store'] = None
+        st.caption('※ まず店舗名を選んでください。')
 
     up = st.file_uploader(
         '薬VANの在庫ファイル（.xls / .csv / .xlsx）',
@@ -193,7 +214,11 @@ def upload_section(backend):
     ym = st.text_input('対象年月（YYYYMM の6桁）', value=default_ym,
                        help='薬VANを出力した月。ファイル名が「店名_202607」ならその6桁が入ります。')
 
-    if st.button('② この内容でアップロードする', type='primary', disabled=(up is None)):
+    can_upload = (up is not None) and (my_store is not None)
+    if st.button('② この内容でアップロードする', type='primary', disabled=not can_upload):
+        if my_store is None:
+            st.warning('先に店舗名を選んでください。')
+            return
         if up is None:
             st.warning('先にファイルを選んでください。')
             return
@@ -246,29 +271,34 @@ def results_section(backend):
     except Exception as e:
         st.warning('結果の保管庫への書き戻しに失敗しました（画面表示は続行します）：%s' % e)
 
-    my_store = st.session_state.get('my_store', STORE_NAMES[0])
-    my_uploaded = (my_store in status['uploaded'])
+    my_store = st.session_state.get('my_store')
 
     st.divider()
-    st.subheader('② 自店（%s）から見た融通' % my_store)
-    if not my_uploaded:
-        st.warning('まず自店（%s）の在庫ファイルをアップロードしてください。'
-                   '自店の過剰・不足が入って初めて、自店視点の提案が出ます。' % my_store)
+    if not my_store:
+        st.subheader('② 自店から見た融通')
+        st.info('上で自店の店舗名を選ぶと、自店視点の融通提案'
+                '（自店の過剰を欲しがる店／自店の不足を過剰に持つ店）が表示されます。')
     else:
-        view_a = app_logic.build_view_a(result, my_store)
-        view_b = app_logic.build_view_b(result, my_store)
+        my_uploaded = (my_store in status['uploaded'])
+        st.subheader('② 自店（%s）から見た融通' % my_store)
+        if not my_uploaded:
+            st.warning('まず自店（%s）の在庫ファイルをアップロードしてください。'
+                       '自店の過剰・不足が入って初めて、自店視点の提案が出ます。' % my_store)
+        else:
+            view_a = app_logic.build_view_a(result, my_store)
+            view_b = app_logic.build_view_b(result, my_store)
 
-        st.markdown('#### ビューA：自店の《過剰・デッド》を欲しがっている店')
-        st.caption('引取候補店（本命）＝ ①不足中 → ②使用中 の順。「参考:過剰だが使用中の店」は別枠（送っても余りが増えがち）。')
-        st.dataframe(_df(view_a, [
-            '薬品名', '単位', '過剰数', '過剰数金額', '有効期限', '期限切迫区分',
-            '要記録警告', '引取候補店（本命）', '参考:過剰だが使用中の店', '医薬品CD']),
-            use_container_width=True, hide_index=True)
+            st.markdown('#### ビューA：自店の《過剰・デッド》を欲しがっている店')
+            st.caption('引取候補店（本命）＝ ①不足中 → ②使用中 の順。「参考:過剰だが使用中の店」は別枠（送っても余りが増えがち）。')
+            st.dataframe(_df(view_a, [
+                '薬品名', '単位', '過剰数', '過剰数金額', '有効期限', '期限切迫区分',
+                '要記録警告', '引取候補店（本命）', '参考:過剰だが使用中の店', '医薬品CD']),
+                use_container_width=True, hide_index=True)
 
-        st.markdown('#### ビューB：自店が《不足》している薬を、過剰に持っている店')
-        st.dataframe(_df(view_b, [
-            '薬品名', '在庫数', '安全在庫数', '不足数', '過剰に持つ他店', '医薬品CD']),
-            use_container_width=True, hide_index=True)
+            st.markdown('#### ビューB：自店が《不足》している薬を、過剰に持っている店')
+            st.dataframe(_df(view_b, [
+                '薬品名', '在庫数', '安全在庫数', '不足数', '過剰に持つ他店', '医薬品CD']),
+                use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader('③ 全店の融通提案一覧（金額の大きい順）')
