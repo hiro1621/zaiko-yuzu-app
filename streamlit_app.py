@@ -21,7 +21,11 @@
 【使い方（店舗）】
   1. 共有パスワードを入れる（1回だけ）。
   2. 自分の店をドロップダウンで選ぶ。
-  3. 薬VANの在庫ファイルを選んでアップロードする。
+     （URLに ?store=店名 が付くので、そのURLをブックマークすれば次回から選ばずに済む）
+  3. その月ぶんをまだ出していなければ、薬VANの在庫ファイルをアップロードする。
+     ★アップロードは月に1回でよい。データは保管庫（Gシート）に残るので、2回目以降は
+       店を選ぶだけで表が見られる。当月ぶんが済んでいればアップロード欄は折りたたまれ、
+       「アップ済みです／このまま下の表を見られます」と表示される（2026-07-28）。
   4. 結果が表示される。②③④は切替ボタンで1つずつ表示する（2026-07-28。3つを縦に
      並べると④まで延々スクロールが要るため。Excelボタンは切替の外＝常に一番下にある）。
 
@@ -445,14 +449,69 @@ def evaluate_upload_guard(filename, selected_store, store_names):
 
 
 # ============================================================================
-# アップロード欄
+# 選んだ店をURLに覚えさせる（2026-07-28）
+#   店の選択はブラウザのセッションにしか残らないため、タブを閉じたり、アプリが眠って
+#   起き直したりすると毎回選び直しになる。URLに ?store=店名 を残しておけば、店が
+#   そのURLをブックマークするだけで次回から自分の店で開ける。
+#   ※データそのものは保管庫（Gシート）にあるので、URLに何が入っていても中身は変わらない。
+#     アップロード時の取り違えは従来どおり「ファイル名 × 選択店名」の突合が止める。
 # ============================================================================
-def upload_section(backend):
-    st.subheader('① 自分の店を選んで、在庫ファイルをアップロード')
+def _raw_store_in_url():
+    """ URLの ?store= の生の値を1つだけ取り出す。
+        ★同じキーが複数ある場合にリストで返る実装があるため、必ず1つ目を取り出して文字列にそろえる。
+          （そろえないと下の「同じ値なら書かない」判定が毎回不一致になり、URLを書き続けてしまう。） """
+    try:
+        raw = st.query_params.get('store')
+    except Exception:
+        return None      # query_params が無い古いStreamlit＝URL記憶なしで従来どおり動く
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    return raw
+
+
+def _store_from_query():
+    """ URLの ?store=店名 を読む。★登録店との完全一致のときだけ採用する（部分一致は使わない）。 """
+    raw = _raw_store_in_url()
+    if not raw:
+        return None
+    norm = _normalize_store(raw)
+    for s in STORE_NAMES:
+        if _normalize_store(s) == norm:
+            return s
+    return None
+
+
+def _remember_store_in_url(store):
+    """ 選んだ店をURLに残す（未選択なら消す）。失敗しても画面は止めない。
+        ★「いまURLに入っている値と違うときだけ書く」＝同じ値を書き続けないようにする。 """
+    try:
+        current = _raw_store_in_url()
+        if store:
+            if current != store:
+                st.query_params['store'] = store
+        elif current is not None:
+            del st.query_params['store']
+    except Exception:
+        pass
+
+
+# ============================================================================
+# ①店の選択 ＋ アップロード欄
+#   ★2026-07-28：アップロードは「毎回やること」ではない。当月ぶんが保管庫に入っていれば、
+#     店を選ぶだけで②③④の表が見られる（データはGシートに残っていて、セッションとは無関係）。
+#     以前は店の選択とアップロードが1つの塊だったため「毎回アップしないと見られない」ように
+#     見えていた。そこで、アップロード欄は当月ぶんが済んでいれば折りたたんでおき、
+#     「アップ済みです。このまま下の表を見られます」とはっきり出すようにした。
+# ============================================================================
+def upload_section(backend, index, latest):
+    st.subheader('① 自分の店を選ぶ')
 
     # 店舗名の選択（先頭は「選択してください」。会社名（ソユーズ/内観堂）の付記は無し）
     options = [SENTINEL_STORE] + STORE_NAMES
+    # 思い出す順番：1) このセッションで選んだ店 → 2) URLの ?store=
     prev = st.session_state.get('my_store')
+    if prev not in STORE_NAMES:
+        prev = _store_from_query()
     default_index = options.index(prev) if prev in STORE_NAMES else 0
 
     # ラベルはこの位置に後から入れる（選択状態に応じて色を変えるため）
@@ -469,13 +528,49 @@ def upload_section(backend):
         label_ph.markdown('店舗名（必須）')
         my_store = choice
         st.session_state['my_store'] = my_store
-        st.caption('→ **%s** で提出します。' % my_store)
     else:
         # 未選択 → ラベルを赤の太字で強調
         label_ph.markdown(':red[**店舗名（必須）**]')
         my_store = None
         st.session_state['my_store'] = None
         st.caption('※ まず店舗名を選んでください。')
+    _remember_store_in_url(my_store)
+
+    # ------------------------------------------------------------------
+    # 選んだ店の「当月ぶんアップ済みか」を出し、アップロード欄の開き方を決める
+    #   済んでいる … 折りたたんでおく（ふだんは触らない）
+    #   まだ      … 開いておく（今すぐアップしてほしい）
+    # ------------------------------------------------------------------
+    ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '（まだデータがありません）'
+    entry = index.get(my_store) if my_store else None
+    done = bool(entry) and entry.get('ym') == latest \
+        and not str(entry.get('format', '')).startswith('NG')
+
+    if my_store and done:
+        st.success('**%s**の%s分はアップ済みです（%s／%s行／%s）。  \n'
+                   '**このまま下の表を見られます。毎回アップロードし直す必要はありません。**'
+                   % (my_store, ym_disp, entry.get('uploaded_at', '不明'),
+                      entry.get('rows', '?'), entry.get('filename', '')))
+        exp_label = '新しいデータに差し替える（アップロードし直す）'
+        exp_open = False
+    elif my_store:
+        st.warning('**%s**の在庫ファイルは、まだアップされていません%s。'
+                   '下の欄からアップロードしてください。'
+                   % (my_store, ('' if latest is None else '（今の対象月は%s）' % ym_disp)))
+        exp_label = '在庫ファイルをアップロードする'
+        exp_open = True
+    else:
+        exp_label = '在庫ファイルをアップロードする'
+        exp_open = True
+
+    with st.expander(exp_label, expanded=exp_open):
+        _upload_form(backend, my_store)
+
+
+def _upload_form(backend, my_store):
+    """ 在庫ファイルを選んでアップロードする欄。upload_section から折りたたみの中に置いて呼ぶ。 """
+    if my_store:
+        st.caption('→ **%s** で提出します。' % my_store)
 
     up = st.file_uploader(
         '薬VANの在庫ファイル（.xls / .csv / .xlsx）',
@@ -524,7 +619,7 @@ def upload_section(backend):
                 key='confirm_unknown_store_%s' % up.name)
 
     can_upload = (up is not None) and (my_store is not None) and guard_ok
-    if st.button('② この内容でアップロードする', type='primary', disabled=not can_upload):
+    if st.button('この内容でアップロードする', type='primary', disabled=not can_upload):
         if my_store is None:
             st.warning('先に店舗名を選んでください。')
             return
@@ -559,8 +654,9 @@ def upload_section(backend):
 #   ※2026-07-28：②③④を切替ボタン（view_switcher）で1つずつ表示するようにした。
 #     3つを縦に並べると④まで延々スクロールが要るため。Excelボタンは切替の外＝常に一番下にある。
 # ============================================================================
-def results_section(backend):
-    stores, latest, index = backend.load_current_month_stores()
+def results_section(backend, stores, latest, index):
+    # ※保管庫の読み込み（load_current_month_stores）は main() で1回だけ行い、
+    #   アップロード欄と結果表示で使い回す（Gシートへの往復を増やさないため）。
     status = app_logic.uploaded_status(index, latest, STORE_NAMES)
 
     st.subheader('現在の状況')
@@ -687,9 +783,17 @@ def main():
         st.error('保管庫（Googleシート）に接続できませんでした。Secrets の設定をご確認ください：%s' % e)
         return
 
-    upload_section(backend)
+    # 保管庫の読み込みは1回だけ。アップロード欄（当月アップ済みかの判定）と
+    #   結果表示の両方で同じ結果を使い回す（Gシートへの往復を2倍にしないため）。
+    try:
+        stores, latest, index = backend.load_current_month_stores()
+    except Exception as e:
+        st.error('保管庫からデータを読めませんでした：%s' % e)
+        return
+
+    upload_section(backend, index, latest)
     st.divider()
-    results_section(backend)
+    results_section(backend, stores, latest, index)
 
 
 if __name__ == '__main__':
