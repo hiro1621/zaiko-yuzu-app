@@ -62,6 +62,7 @@
 """
 
 import datetime
+import hashlib
 
 import streamlit as st
 import pandas as pd   # ※ streamlit に同梱されるので requirements への追記は不要
@@ -99,6 +100,51 @@ def gsheet_configured():
 
 
 # ============================================================================
+# Googleシートへのアクセス回数を減らす（2026-07-28）
+#   ★★背景：Streamlitは操作のたびにスクリプト全体を作り直す。表の行を1つ選ぶだけでも
+#     （on_select='rerun'）1回まるごと走るため、素直に書くと1クリックごとに
+#       _index 1回 ＋ raw_<店> 店数ぶん ＋ _除外 ＋ _予約 ＋ 結果4タブの書き戻し8回
+#     ＝14店なら30回近いAPI呼び出しになる。GoogleのAPIは1分60回が上限で、
+#     そこに当たると gspread が待ち続け、画面が固まったように見える（実際に発生）。
+#   そこで次の2つを入れて、ふつうの操作（行を選ぶ・画面を切り替える）では
+#   Googleシートをほとんど触らないようにする。
+# ============================================================================
+def _signature(obj):
+    """ 中身が変わったかどうかを見るための短い指紋。 """
+    return hashlib.md5(repr(obj).encode('utf-8', 'replace')).hexdigest()
+
+
+def load_stores_cached(backend):
+    """
+    当月の全店データを読む。ただし **_index が前回と同じなら読み直さない**。
+
+    ★これは「古いデータを見せる」ことにはならない。店がアップロードすると必ず
+      _index の行（アップ日時・行数・ファイル名）が書き換わるので、_index が
+      1文字も変わっていなければ raw_ の中身も変わっていない、と言い切れるため。
+      念のため、アップロードを保存した直後にはこのキャッシュを明示的に捨てている
+      （同じ分・同じ行数・同じファイル名で上げ直した場合の取りこぼしを防ぐ）。
+    読むのは _index の1タブだけ（1回）で済むので、行を選ぶたびの読み込みが
+    「店数ぶん」から「1回」に減る。
+    """
+    if not hasattr(backend, 'load_index'):
+        return backend.load_current_month_stores()      # 古い保管庫でもそのまま動く
+    index = backend.load_index()
+    sig = _signature(sorted(index.items()))
+    cache = st.session_state.get('stores_cache')
+    if cache and cache.get('sig') == sig:
+        return cache['stores'], cache['latest'], index
+    stores, latest, index = backend.load_current_month_stores()
+    st.session_state['stores_cache'] = {'sig': sig, 'stores': stores, 'latest': latest}
+    return stores, latest, index
+
+
+def clear_stores_cache():
+    """ アップロードを保存した直後に呼ぶ（次の描画で必ず読み直させる）。 """
+    st.session_state.pop('stores_cache', None)
+    st.session_state.pop('results_sig', None)
+
+
+# ============================================================================
 # 保管庫バックエンド（Gシート or ローカル）を用意する
 #   ・両者は同じメソッド名（save_store_upload / load_current_month_stores）を持つ。
 # ============================================================================
@@ -128,6 +174,10 @@ class _GSheetAdapter:
 
     def save_reservations(self, rows):
         gsheet_store.write_reservations(self.sh, rows)
+
+    def load_index(self):
+        """ _index だけを読む（1タブ）。在庫本体（raw_）を読み直すかどうかの判定に使う。 """
+        return gsheet_store.read_index(self.sh)
 
 
 @st.cache_resource(show_spinner='Googleシートに接続しています…')
@@ -275,7 +325,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     event = st.dataframe(
         _style_expiry(df, paint=paint_expiry),
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         on_select='rerun',
         selection_mode='multi-row',
         key='table_%s' % table_key)
@@ -377,7 +427,7 @@ def receive_section(view_receive, my_store, backend, reservations, ym):
     event = st.dataframe(
         _style_expiry(df, paint=False),
         hide_index=True,
-        use_container_width=True,
+        width='stretch',
         on_select='rerun',
         selection_mode='multi-row',
         key='table_receive')
@@ -442,7 +492,7 @@ def reserved_section(view_reserved, my_store, backend, reservations):
         df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden}
                            for r in view_reserved])
         event = st.dataframe(
-            _style_expiry(df, paint=False), hide_index=True, use_container_width=True,
+            _style_expiry(df, paint=False), hide_index=True, width='stretch',
             on_select='rerun', selection_mode='multi-row', key='table_reserved')
         picked = _selected_rows(event)
         checked = [view_reserved[i] for i in picked if 0 <= i < len(view_reserved)]
@@ -465,7 +515,7 @@ def excluded_section(my_store, backend, exclusions):
         st.caption('融通の対象に戻したい品を左端の□で選び、下のボタンを押してください。')
         df = pd.DataFrame([{'薬品名': r['薬品名'], '除外日時': r['除外日時']} for r in mine])
         event = st.dataframe(
-            df, hide_index=True, use_container_width=True,
+            df, hide_index=True, width='stretch',
             on_select='rerun', selection_mode='multi-row', key='table_undo')
         # 選んだ行を「行の位置」で拾い、位置で元の mine から引く
         picked = _selected_rows(event)
@@ -739,6 +789,7 @@ def _upload_form(backend, my_store):
             st.stop()
 
         backend.save_store_upload(my_store, ym, res['slim'], up.name, res['format_ok'])
+        clear_stores_cache()   # 次の描画で必ず読み直す（アップした中身をすぐ反映する）
         st.success('%s の %s年%s月分を受け付けました（%d行・前処理後）。'
                    % (my_store, ym[:4], ym[4:6], res['n_kept']))
         st.rerun()
@@ -798,12 +849,18 @@ def results_section(backend, stores, latest, index):
     csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
 
     # 結果を保管庫にも書き戻す（次の月替わりで前月退避できるように）
+    #   ★中身が前回と同じなら書かない。結果4タブの書き戻しは clear＋update で8回の
+    #     API呼び出しになり、行を選ぶたびにこれをやるとGoogleの上限に当たって
+    #     画面が固まる。結果が変わっていないなら書き直す意味もない。
     try:
         payload = gsheet_store.build_results_payload(result, base_ym_disp, csv_base_disp)
-        if hasattr(backend, 'write_results'):
-            backend.write_results(payload)
-        elif hasattr(backend, 'save_results'):
-            backend.save_results(payload)
+        sig = _signature(payload)
+        if st.session_state.get('results_sig') != sig:
+            if hasattr(backend, 'write_results'):
+                backend.write_results(payload)
+            elif hasattr(backend, 'save_results'):
+                backend.save_results(payload)
+            st.session_state['results_sig'] = sig   # 書けたときだけ覚える
     except Exception as e:
         st.warning('結果の保管庫への書き戻しに失敗しました（画面表示は続行します）：%s' % e)
 
@@ -904,7 +961,7 @@ def main():
     # 保管庫の読み込みは1回だけ。アップロード欄（当月アップ済みかの判定）と
     #   結果表示の両方で同じ結果を使い回す（Gシートへの往復を2倍にしないため）。
     try:
-        stores, latest, index = backend.load_current_month_stores()
+        stores, latest, index = load_stores_cached(backend)
     except Exception as e:
         st.error('保管庫からデータを読めませんでした：%s' % e)
         return

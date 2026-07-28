@@ -383,6 +383,10 @@ class LocalBackend:
         }
         return self.state['index']
 
+    def load_index(self):
+        """ _index だけを返す（Gシート版と同じインターフェース）。 """
+        return dict(self.state['index'])
+
     def load_current_month_stores(self):
         index = self.state['index']
         latest = self._latest_ym()
