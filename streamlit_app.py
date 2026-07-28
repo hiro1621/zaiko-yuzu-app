@@ -358,7 +358,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
             have.add(pair)
             added += 1
         backend.save_exclusions(keep)
-        st.success('%d件を融通の対象から外しました。' % added)
+        st.success('%d件をデッドストックから外しました。' % added)
         st.rerun()
 
 
@@ -508,11 +508,11 @@ def excluded_section(my_store, backend, exclusions):
     """ 「除外中の品目」を折りたたみで出し、選んで元に戻せるようにする（②③と同じ行選択方式）。
         操作方法が画面内で2種類あると迷うため、②③のチェックと同じ「左端の□で選ぶ」に統一している。 """
     mine = [r for r in exclusions if r['店名'] == my_store]
-    with st.expander('除外中の品目（%d件）＝融通の対象から外している薬' % len(mine)):
+    with st.expander('除外中の品目（%d件）＝デッドストックから外している薬' % len(mine)):
         if not mine:
             st.write('いまは1件もありません。')
             return
-        st.caption('融通の対象に戻したい品を左端の□で選び、下のボタンを押してください。')
+        st.caption('デッドストックに戻したい品を左端の□で選び、下のボタンを押してください。')
         df = pd.DataFrame([{'薬品名': r['薬品名'], '除外日時': r['除外日時']} for r in mine])
         event = st.dataframe(
             df, hide_index=True, width='stretch',
@@ -526,7 +526,7 @@ def excluded_section(my_store, backend, exclusions):
             keep = [r for r in exclusions
                     if not (r['店名'] == my_store and r['除外キー'] in back)]
             backend.save_exclusions(keep)
-            st.success('%d件を融通の対象に戻しました。' % n)
+            st.success('%d件をデッドストックに戻しました。' % n)
             st.rerun()
 
 
@@ -651,7 +651,7 @@ def _remember_store_in_url(store):
 #     「アップ済みです。このまま下の表を見られます」とはっきり出すようにした。
 # ============================================================================
 def upload_section(backend, index, latest):
-    st.subheader('① 自分の店を選ぶ')
+    st.subheader('① 店舗を選択')
 
     # 店舗名の選択（先頭は「選択してください」。会社名（ソユーズ/内観堂）の付記は無し）
     options = [SENTINEL_STORE] + STORE_NAMES
@@ -897,7 +897,8 @@ def results_section(backend, stores, latest, index):
                 min_amt = result.get('min_supply_amount', 0)
                 sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
                 cap = ('行が薄赤の品は期限切迫を兼ねています。'
-                       '融通に出さない品は左端の□にチェックを入れて「除外を保存」を押してください。'
+                       'デッドストックリストに載せない医薬品は左端の□にチェックを入れて'
+                       '「除外を保存」を押してください。'
                        '／在庫金額%s円以上のものだけを載せています。'
                        % '{:,}'.format(min_amt))
                 if sbs.get('count'):
