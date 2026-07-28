@@ -670,6 +670,35 @@ def build_candidates(by_key, key, source_store, supply_qty, exp_date, base_date)
     return main_str, ref_str
 
 
+# ============================================================================
+# 予約（受け手の店が「この品はうちが引き取ります」と押さえた印）の小道具
+#   ・予約1件は (出し手店, 予約キー) で1つ。予約キーは除外キー（exclusion_key）と同じ。
+#   ・「品目まるごと」を押さえる方式（本間部長判断 2026-07-28）。数量の指定はしない
+#     ＝何錠もらうかの相談は従来どおり電話・デスクネッツで行う。
+# ============================================================================
+def reservation_key(source_store, row):
+    """ 予約1件を特定するキー (出し手店, 品目キー) を返す。★除外と同じ品目キーを使う。 """
+    return (source_store, exclusion_key(row))
+
+
+def _reserved_by(reserved, source_store, ex_key):
+    """ その品を予約している店の名前を返す（予約が無ければ空文字）。 """
+    if not reserved:
+        return ''
+    r = reserved.get((source_store, ex_key))
+    return (r or {}).get('店', '') or ''
+
+
+def _reserve_label(reserved, source_store, ex_key):
+    """ Excel／Gシートの『予約』列に入れる文字列（例：'東立石 2026/07/28 11:40'）。 """
+    if not reserved:
+        return ''
+    r = reserved.get((source_store, ex_key))
+    if not r:
+        return ''
+    return ('%s %s' % (r.get('店', ''), r.get('日時', ''))).strip()
+
+
 def build_candidate_names(key, entries):
     """ 引取候補店を「店名だけ」つないだ文字列を返す（②③の画面表示用。2026-07-28 本間部長指示）。
 
@@ -773,12 +802,22 @@ def build_candidate_entries(by_key, key, source_store, supply_qty, exp_date, bas
 #   ※ 現在 create_yuzu_list.main() にベタ書きされていた計算を、そのまま関数化したものです。
 #     計算内容は一切変えていません（回帰で1円も変わらないことを保証する目的）。
 # ============================================================================
-def compute_matching(stores, excluded=None):
+def compute_matching(stores, excluded=None, reserved=None):
     """ excluded … 店が「融通に出さない」と外した品目の集合。
         {(店名, exclusion_key(row)), ...} の形。ここで出し手から完全に取り除くので、
         自店の②③だけでなく全店一覧・マトリクス・受け手の供給元・Excel・サマリ・
-        自己検算のすべてから同時に消える（どこかに残って他店から問い合わせが来る事故を防ぐ）。 """
+        自己検算のすべてから同時に消える（どこかに残って他店から問い合わせが来る事故を防ぐ）。
+
+        reserved … 受け手の店が「この品はうちが引き取ります」と予約した品。
+        {(出し手店, exclusion_key(row)): {'店': 予約した店, '日時': 'YYYY/MM/DD HH:MM'}, ...} の形。
+        ★除外と違い、ここでは出し手から取り除かない（＝件数・金額・自己検算は1円も動かない）。
+          予約は「もう相手が決まった」という印であって、品が消えるわけではないため。
+            ・出し手の②③  … 引取候補店の欄が「◯◯が引取予定」に変わる（誰に渡すか分かる）
+            ・受け手の④    … 予約した店だけに残り、ほかの店の④からは消える
+            ・Excel／Gシート… 融通提案シートの『予約』列に「店名 日時」が入る
+          そのため予約キーは除外キー（exclusion_key）と同じものを使う＝品目の呼び名を1つに保つ。 """
     excluded = set(excluded or ())
+    reserved = dict(reserved or {})
 
     def is_excluded(store_name, row):
         return bool(excluded) and (store_name, exclusion_key(row)) in excluded
@@ -907,6 +946,11 @@ def compute_matching(stores, excluded=None):
                 '引取候補店（店名のみ）': build_candidate_names(key, cand_entries),
                 '6ヶ月出庫回数': round(usage_cnt6(row), 2), '医薬品CD': key or '',
                 '_ex_key': exclusion_key(row),
+                # 予約（受け手の店が「うちが引き取ります」と押さえた印）。
+                #   '予約'   … Excel／Gシートに出す文字列（例：'東立石 2026/07/28 11:40'）
+                #   '_予約店' … 画面のしぼり込みに使う店名だけ（予約が無ければ空文字）
+                '予約': _reserve_label(reserved, s['name'], exclusion_key(row)),
+                '_予約店': _reserved_by(reserved, s['name'], exclusion_key(row)),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
                 '_remain': remain, '_amt_raw': over_amt}
             proposal_rows.append(pr)
@@ -922,6 +966,12 @@ def compute_matching(stores, excluded=None):
                     '在庫数':   pr['在庫数'],   '在庫金額': pr['在庫金額'],
                     '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
                     '_remain':  remain,
+                    # 予約済みなら、その店の④にだけ残して他店の④からは消すために持たせる
+                    '_予約店': pr['_予約店'],
+                    # ★予約を保存するときのキー。(出し手店, _ex_key) で1件を特定する。
+                    #   ここで渡しておかないと、④から予約したときにキーが空のまま保存され、
+                    #   読み込み時に捨てられて「予約したのに消える」ことになる。
+                    '_ex_key': pr['_ex_key'],
                 })
     proposal_rows.sort(key=lambda r: -r['在庫金額'])
 
@@ -1089,10 +1139,12 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     ws.cell(row=1, column=1, value=note).fill = NOTE_FILL
     ws.cell(row=1, column=1).font = Font(bold=True, color='7F6000')
 
+    # ※末尾の『予約』は2026-07-28に追加した列（受け手の店が押さえた印）。
+    #   既存の列は順番も中身も変えていないので、旧版との照合は予約列を除いて行える。
     headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額',
                '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                '最終出庫日', '区分', '引取候補店', '参考:過剰だが使用中の店',
-               '6ヶ月出庫回数', '医薬品CD']
+               '6ヶ月出庫回数', '医薬品CD', '予約']
     # 「参考」列は本命（引取候補店）とはっきり区別するため、見出し・セルをグレーで塗る
     ref_col_idx = headers.index('参考:過剰だが使用中の店') + 1  # 1始まり
     hr = 2
@@ -1107,7 +1159,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
                 pr['在庫金額'], pr['過剰在庫区分'], pr['不動区分'], pr['期限切迫区分'],
                 pr['有効期限'], pr['ロットNO'], pr['最終出庫日'], pr['区分'],
                 pr['引取候補店'], pr['参考:過剰だが使用中の店'],
-                pr['6ヶ月出庫回数'], pr['医薬品CD']]
+                pr['6ヶ月出庫回数'], pr['医薬品CD'], pr.get('予約', '')]
         for ci, v in enumerate(vals, start=1):
             cell = ws.cell(row=r, column=ci, value=v)
             cell.border = BORDER

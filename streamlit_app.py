@@ -123,6 +123,12 @@ class _GSheetAdapter:
     def save_exclusions(self, rows):
         gsheet_store.write_exclusions(self.sh, rows)
 
+    def load_reservations(self):
+        return gsheet_store.read_reservations(self.sh)
+
+    def save_reservations(self, rows):
+        gsheet_store.write_reservations(self.sh, rows)
+
 
 @st.cache_resource(show_spinner='Googleシートに接続しています…')
 def _open_sheet():
@@ -283,7 +289,17 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
         keep = list(exclusions)
         have = {(r['店名'], r['除外キー']) for r in keep}
         added = 0
+        # ★予約が入っている品は除外しない。黙って外すと、引き取るつもりでいる店の
+        #   予約が理由も分からず消えるため。品名と相手店を出して、話を付けてもらう。
+        booked = [d for d in checked if d.get('_予約店')]
+        if booked:
+            st.warning('  \n'.join(
+                ['次の品はすでに引取先が決まっているため、除外しませんでした。'
+                 '取りやめる場合は相手店に連絡してください：']
+                + ['%s → %s が引取予定' % (d['薬品名'], d['_予約店']) for d in booked]))
         for d in checked:
+            if d.get('_予約店'):
+                continue
             pair = (my_store, d['_key'])
             if pair in have:
                 continue
@@ -337,26 +353,105 @@ def view_switcher(n_dead, n_expiry, n_receive):
     return chosen or VIEW_DEAD
 
 
-def receive_section(view_receive, my_store):
+def receive_section(view_receive, my_store, backend, reservations, ym):
     """
-    ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧を描く。
-      ・見るだけの一覧。ボタン・申込みの仕組みは付けない（連絡は従来どおり電話・デスクネッツ）。
-      ・★st.dataframe に on_select を渡さない＝行選択・チェックボックスなしの「読むだけ」の表にする。
-      ・_style_expiry(df, paint=False) を通すことで、在庫数・在庫金額がカンマ区切り＋小数第2位で
-        表示される（②③と同じ体裁）。paint=False なので背景は塗らない。
+    ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧。
+      ・2026-07-28に「予約」を付けた。左端の□で選んで「予約する」を押すと、その品は
+        ほかの店の④から消え、出し手の②③には「◯◯が引取予定」と出る。
+      ・予約は品目まるごと。数量の相談は従来どおり電話・デスクネッツ。
+      ・★保存の直前に予約表を読み直して重複を止める（下の _save_reservations 参照）。
     """
     st.subheader('④（%s）が引き取れる薬（他店のデッド・期限切迫）' % my_store)
     st.caption('他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品です。'
+               '引き取りたい品は左端の□にチェックを入れて「予約する」を押してください'
+               '（予約するとほかの店の一覧からは消え、出し手の画面に自店名が出ます）。'
                '『区分』に表示がある薬（向精神薬・毒薬・劇薬）は、受け取る側でも記録が必要です。'
-               '連絡は従来どおり電話・デスクネッツでお願いします。')
+               '数量の相談・連絡は従来どおり電話・デスクネッツでお願いします。')
     if not view_receive:
         st.info('いま他店から引き取れる品はありません。')
         return
-    df = pd.DataFrame(view_receive)
-    st.dataframe(
+
+    # 内部用の列（_出し手店・_key）は画面に出さない
+    hidden = ('_出し手店', '_key', '_予約店')
+    df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_receive])
+    event = st.dataframe(
         _style_expiry(df, paint=False),
         hide_index=True,
-        use_container_width=True)
+        use_container_width=True,
+        on_select='rerun',
+        selection_mode='multi-row',
+        key='table_receive')
+
+    # 選ばれた行を「行の位置」で拾い、位置で元の view_receive から引く（隠し列の値に頼らない）
+    picked = _selected_rows(event)
+    checked = [view_receive[i] for i in picked if 0 <= i < len(view_receive)]
+    n = len(checked)
+    if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve', disabled=(n == 0)):
+        _save_reservations(backend, my_store, ym, checked, reservations)
+
+
+def _save_reservations(backend, my_store, ym, checked, reservations):
+    """
+    選ばれた品を予約として保存する。
+
+    ★★保存の直前に予約表を読み直す。
+      Googleシートは同時書き込みを止められないので、画面を開いてからボタンを押すまでの間に
+      別の店が同じ品を予約している可能性がある。読み直さずに書くと、あとから押した店が
+      先の予約を上書きしてしまい、どちらも「自分が予約できた」と思い込む事故になる。
+      すでに他店が押さえていた品は保存せず、赤でその品名と店名を知らせる。
+      残り（重複していない品）はそのまま保存する＝全部やり直しにはしない。
+    """
+    try:
+        latest_rows = backend.load_reservations()
+    except Exception:
+        latest_rows = list(reservations)   # 読み直せなければ画面の内容で進む
+
+    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    picked = [dict(d, _now=now) for d in checked]
+    plan = app_logic.plan_reservations(latest_rows, my_store, ym, picked)
+
+    if plan['added']:
+        backend.save_reservations(plan['keep'])
+    if plan['conflicts']:
+        st.error('  \n'.join(
+            ['次の品は、ひと足先にほかの店が予約していました（予約できていません）：']
+            + ['%s（%s）→ %s が予約済み' % (c['薬品名'], c['出し手店'], c['予約した店'])
+               for c in plan['conflicts']]))
+    if plan['added']:
+        st.success('%d件を予約しました。出し手の画面に「%s が引取予定」と表示されます。'
+                   % (plan['added'], my_store))
+    if plan.get('broken'):
+        # 通常は起こらない。起きたら黙って落とさず知らせる（気づけない不具合を防ぐ）。
+        st.error('%d件は内部キーが取れず予約できませんでした。'
+                 'お手数ですが管理本部に連絡してください。' % plan['broken'])
+    if not plan['added'] and not plan['conflicts'] and not plan.get('broken'):
+        st.info('新しく予約する品はありませんでした（すでに予約済みです）。')
+    if plan['added'] or plan['conflicts']:
+        st.rerun()
+
+
+def reserved_section(view_reserved, my_store, backend, reservations):
+    """ 「予約中の品」を折りたたみで出し、選んで取り消せるようにする（②③の除外と同じ操作感）。 """
+    with st.expander('予約中の品（%d件）＝自店が引き取ると押さえている薬' % len(view_reserved)):
+        if not view_reserved:
+            st.write('いまは1件もありません。')
+            return
+        st.caption('予約をやめる品を左端の□で選び、下のボタンを押してください。'
+                   '取り消すと、その品はまたほかの店の一覧にも出るようになります。')
+        hidden = ('_出し手店', '_key')
+        df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden}
+                           for r in view_reserved])
+        event = st.dataframe(
+            _style_expiry(df, paint=False), hide_index=True, use_container_width=True,
+            on_select='rerun', selection_mode='multi-row', key='table_reserved')
+        picked = _selected_rows(event)
+        checked = [view_reserved[i] for i in picked if 0 <= i < len(view_reserved)]
+        n = len(checked)
+        if st.button('予約を取り消す（%d件）' % n, key='btn_unreserve', disabled=(n == 0)):
+            keep = app_logic.cancel_reservations(reservations, my_store, checked)
+            backend.save_reservations(keep)
+            st.success('%d件の予約を取り消しました。' % (len(reservations) - len(keep)))
+            st.rerun()
 
 
 def excluded_section(my_store, backend, exclusions):
@@ -685,8 +780,20 @@ def results_section(backend, stores, latest, index):
         st.warning('除外リストを読めませんでした（除外なしで表示します）：%s' % e)
         exclusions = []
 
+    # 予約リスト（受け手の店が「うちが引き取る」と押さえた品目）を読む。
+    #   ★対象年月が当月と一致するものだけを効かせる（reservation_map の中で絞る）＝
+    #     月が変わったら前月の予約は自動で無効になる。
+    try:
+        reservations = backend.load_reservations()
+    except Exception as e:
+        st.warning('予約リストを読めませんでした（予約なしで表示します）：%s' % e)
+        reservations = []
+    reserved = app_logic.reservation_map(reservations, latest)
+
     # 全店ぶんを毎回まとめて再計算
-    result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions))
+    #   ※予約は出し手から品を取り除かない（件数・金額・自己検算は動かない）。印を付けるだけ。
+    result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions),
+                                        reserved=reserved)
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
     csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
 
@@ -717,8 +824,11 @@ def results_section(backend, stores, latest, index):
             view_a = app_logic.build_view_a(result, my_store)       # 種別＝デッド
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
             view_receive = app_logic.build_view_receive(result, my_store)  # ④受け手ビュー
+            # 自店が押さえている品（予約中）。④の下に折りたたみで出し、ここから取り消せる。
+            view_reserved = app_logic.build_view_reserved(result, my_store, reservations, latest)
 
             # ---- ②③④の切替ボタン。選ばれた1つだけを下に描く ----
+            #   ④のボタンには「引き取れる薬の件数」を出す。予約中の件数は④の中で別に出す。
             chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive))
 
             if chosen == VIEW_DEAD:
@@ -752,7 +862,8 @@ def results_section(backend, stores, latest, index):
 
             else:
                 # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
-                receive_section(view_receive, my_store)
+                receive_section(view_receive, my_store, backend, reservations, latest)
+                reserved_section(view_reserved, my_store, backend, reservations)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()

@@ -52,12 +52,18 @@ TAB_MATRIX = '品目×店舗マトリクス'
 TAB_SUMMARY = '店舗別サマリ'
 PREV_PREFIX = '前月_'   # 前月_YYYYMM
 EXCLUDE_TAB = '_除外'   # 店が「この品は融通に出さない」と外した品目
+RESERVE_TAB = '_予約'   # 受け手の店が「この品はうちが引き取ります」と押さえた品目
 
 # _index の見出し（列順）
 INDEX_HEADERS = ['店名', '対象年月', 'アップ日時', '行数', '様式', 'ファイル名']
 
 # _除外 の見出し（列順）
 EXCLUDE_HEADERS = ['店名', '除外キー', '薬品名', '除外日時']
+
+# _予約 の見出し（列順）
+#   1行＝1予約。(出し手店, 予約キー) で1件を特定する＝同じ品を2店が予約することはない。
+#   対象年月を持たせているのは、月が変わったら前月の予約を自動で無効にするため。
+RESERVE_HEADERS = ['予約した店', '出し手店', '対象年月', '予約キー', '薬品名', '予約日時']
 
 
 # ============================================================================
@@ -183,6 +189,51 @@ def write_exclusions(sh, rows):
     for r in rows:
         body.append([r.get('店名', ''), r.get('除外キー', ''),
                      r.get('薬品名', ''), r.get('除外日時', '')])
+    _update(ws, body)
+
+
+# ============================================================================
+# _予約（受け手の店が「この品はうちが引き取ります」と押さえた品目）の読み書き
+#   ・_除外 とまったく同じ作り。1行＝1予約。全部読んで全部書き直す（丸ごと上書き）。
+#   ・(出し手店, 予約キー) で1件。同じ品を2店が予約することはない（保存前に画面側で突合する）。
+# ============================================================================
+def read_reservations(sh):
+    """ _予約 タブを読んで
+        [{'予約した店','出し手店','対象年月','予約キー','薬品名','予約日時'}, ...] を返す。
+        タブがまだ無ければ空リスト。 """
+    try:
+        ws = sh.worksheet(RESERVE_TAB)
+    except Exception:
+        return []
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        # 予約した店・出し手店・予約キーの3つがそろっていない行は読み飛ばす
+        if not cell('予約した店') or not cell('出し手店') or not cell('予約キー'):
+            continue
+        out.append({'予約した店': cell('予約した店'), '出し手店': cell('出し手店'),
+                    '対象年月': cell('対象年月'), '予約キー': cell('予約キー'),
+                    '薬品名': cell('薬品名'), '予約日時': cell('予約日時')})
+    return out
+
+
+def write_reservations(sh, rows):
+    """ 予約リストを丸ごと書き直す（rows は read_reservations と同じ形の辞書リスト）。 """
+    ws = _get_or_create_ws(sh, RESERVE_TAB, rows=max(2000, len(rows) + 10), cols=8)
+    ws.clear()
+    body = [list(RESERVE_HEADERS)]
+    for r in rows:
+        body.append([r.get('予約した店', ''), r.get('出し手店', ''), r.get('対象年月', ''),
+                     r.get('予約キー', ''), r.get('薬品名', ''), r.get('予約日時', '')])
     _update(ws, body)
 
 
@@ -355,15 +406,17 @@ def build_results_payload(result, base_ym_disp, csv_base_disp):
     yuzu_core.compute_matching(...) の戻り値 result を、結果4タブ書き戻し用の
     「文字列2次元配列」に整える。Excel出力（write_excel）と同じ列・同じ並び。
     """
+    # ※末尾の『予約』は2026-07-28に追加した列（write_excel と同じ並び）。
     proposal_headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額',
                         '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                         '最終出庫日', '区分', '引取候補店', '参考:過剰だが使用中の店',
-                        '6ヶ月出庫回数', '医薬品CD']
+                        '6ヶ月出庫回数', '医薬品CD', '予約']
     proposal_rows = [[r['出し手店'], r['種別'], r['薬品名'], r['単位'], r['メーカ名'], r['在庫数'],
                       r['在庫金額'], r['過剰在庫区分'], r['不動区分'], r['期限切迫区分'],
                       r['有効期限'], r['ロットNO'], r['最終出庫日'], r['区分'],
                       r['引取候補店'], r['参考:過剰だが使用中の店'],
-                      r['6ヶ月出庫回数'], r['医薬品CD']] for r in result['proposal_rows']]
+                      r['6ヶ月出庫回数'], r['医薬品CD'],
+                      r.get('予約', '')] for r in result['proposal_rows']]
 
     shortage_headers = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', 'デッド/期限切迫で持つ他店']
     shortage_rows = [[r['店'], r['薬品名'], r['在庫数'], r['安全在庫数'], r['不足数'],
