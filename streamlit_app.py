@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-店舗間 在庫融通アプリ（streamlit_app.py）＝店舗セルフアップロード型の画面本体
+デッドストックリスト（streamlit_app.py）＝店舗セルフアップロード型の画面本体
+  ※画面の名前は2026-07-28に「店舗間 在庫融通」から「デッドストックリスト」へ変更（本間部長指示）。
+    フォルダ名・リポジトリ名・関数名は在庫融通のままなので、探すときは両方の呼び名で当たること。
 
 【何をするアプリか】
 各店がブラウザから薬VANの在庫ファイル（.xls / .csv / .xlsx）をアップロードすると、
@@ -76,7 +78,7 @@ SENTINEL_STORE = '選択してください'
 # ============================================================================
 # 画面の基本設定
 # ============================================================================
-st.set_page_config(page_title='店舗間 在庫融通', page_icon='💊', layout='wide')
+st.set_page_config(page_title='デッドストックリスト', page_icon='💊', layout='wide')
 
 
 # ============================================================================
@@ -149,7 +151,7 @@ def password_gate():
     if st.session_state.get('authed'):
         return True
 
-    st.title('💊 店舗間 在庫融通')
+    st.title('💊 デッドストックリスト')
     st.caption('社内限定ツール。共有パスワードを入力してください。')
 
     expected = _get_secret('app_password')
@@ -637,7 +639,7 @@ def _upload_form(backend, my_store):
             return
 
         if not res['format_ok']:
-            st.error('このファイルは在庫融通に必要な列が足りません（別様式の可能性）。'
+            st.error('このファイルには、突合に必要な列が足りません（別様式の可能性）。'
                      '不足列：' + '、'.join(res['missing']))
             st.stop()
 
@@ -756,10 +758,15 @@ def results_section(backend, stores, latest, index):
     st.divider()
     try:
         xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
+        # ダウンロードされるファイル名も画面の名前にそろえる（2026-07-28の改称に追随）
+        if latest:
+            xls_name = 'デッドストックリスト_%s-%s.xlsx' % (latest[:4], latest[4:6])
+        else:
+            xls_name = 'デッドストックリスト.xlsx'
         st.download_button(
             'この結果をExcel（4シート）でダウンロード',
             data=xls,
-            file_name='在庫融通リスト_%s-%s.xlsx' % (latest[:4], latest[4:6]) if latest else '在庫融通リスト.xlsx',
+            file_name=xls_name,
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     except Exception as e:
         st.warning('Excel生成に失敗しました：%s' % e)
@@ -772,7 +779,7 @@ def main():
     if not password_gate():
         return
 
-    st.title('💊 店舗間 在庫融通')
+    st.title('💊 デッドストックリスト')
     if not gsheet_configured():
         st.warning('（開発モード）Googleシート未接続のため、このブラウザのセッションにだけ保存します。'
                    '本番では Streamlit Cloud の Secrets を設定してください。')
