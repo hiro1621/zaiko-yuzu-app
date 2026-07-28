@@ -22,7 +22,8 @@
   1. 共有パスワードを入れる（1回だけ）。
   2. 自分の店をドロップダウンで選ぶ。
   3. 薬VANの在庫ファイルを選んでアップロードする。
-  4. 結果（自店のデッド品・期限切迫品／全店一覧／○/14）が表示される。
+  4. 結果が表示される。②③④は切替ボタンで1つずつ表示する（2026-07-28。3つを縦に
+     並べると④まで延々スクロールが要るため。Excelボタンは切替の外＝常に一番下にある）。
 
 ★数量・金額の定義（本間部長判断 2026-07-27）★
   「在庫数」＝その店がいま持っている全量、「在庫金額」＝在庫数×薬価（薬VANの薬価金額列）。
@@ -289,6 +290,47 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
         st.rerun()
 
 
+# ============================================================================
+# ②③④の切替ボタン（2026-07-28 本間部長指示）
+#   3つの表を縦に並べると画面がとても長くなり、④を見るのに延々スクロールが要る。
+#   → ボタンで「選んだ1つだけを描く」＝ページを分けたのと同じ使い勝手にする。
+#     （描く表が1つになるので表示も軽くなる。）
+# ============================================================================
+VIEW_DEAD = 'dead'        # ②自店のデッド品
+VIEW_EXPIRY = 'expiry'    # ③自店の期限切迫品
+VIEW_RECEIVE = 'receive'  # ④自店が引き取れる薬
+VIEW_ORDER = [VIEW_DEAD, VIEW_EXPIRY, VIEW_RECEIVE]
+
+
+def view_switcher(n_dead, n_expiry, n_receive):
+    """
+    ②③④を切り替えるボタンを描き、選ばれた画面の記号（VIEW_*）を返す。
+      ・件数をボタンに入れて、開く前に中身があるかどうか分かるようにする。
+      ・★選択肢そのものは VIEW_* の記号にして、見た目の文字は format_func で作る。
+        ボタンの文字（件数入り）を選択肢にしてしまうと、除外を保存して件数が変わった瞬間に
+        「保存されている選択」が選択肢の中から消えて、③④を見ていても②に戻されてしまう。
+      ・★segmented_control は選択中のボタンをもう一度押すと「選択なし（None）」を返すので、
+        そのときは②に戻す（画面が空になるのを防ぐ）。
+      ・segmented_control が無い古いStreamlitでは st.radio（横並び）に自動で切り替える。
+    """
+    labels = {
+        VIEW_DEAD:    '②  デッド品（%d件）' % n_dead,
+        VIEW_EXPIRY:  '③  期限切迫品（%d件）' % n_expiry,
+        VIEW_RECEIVE: '④  引き取れる薬（%d件）' % n_receive,
+    }
+    st.caption('見たい表のボタンを押してください（選んだものだけを表示します）。')
+    picker = getattr(st, 'segmented_control', None)
+    if picker is None:
+        chosen = st.radio('表示する内容', VIEW_ORDER, horizontal=True,
+                          format_func=lambda k: labels[k],
+                          label_visibility='collapsed', key='view_switch')
+    else:
+        chosen = picker('表示する内容', VIEW_ORDER, default=VIEW_DEAD, required=True,
+                        format_func=lambda k: labels[k],
+                        label_visibility='collapsed', key='view_switch')
+    return chosen or VIEW_DEAD
+
+
 def receive_section(view_receive, my_store):
     """
     ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧を描く。
@@ -511,9 +553,11 @@ def upload_section(backend):
 
 
 # ============================================================================
-# 結果表示（②自店のデッド品／③自店の期限切迫品＋Excel）
+# 結果表示（②自店のデッド品／③自店の期限切迫品／④自店が引き取れる薬＋Excel）
 #   ※2026-07-27：画面から「参考ビューB（自店の不足を持つ店）」と「④全店一覧」を外した。
 #     どちらも Excel（4シート）・Gシートには従来どおり出力している（画面が長すぎる対策）。
+#   ※2026-07-28：②③④を切替ボタン（view_switcher）で1つずつ表示するようにした。
+#     3つを縦に並べると④まで延々スクロールが要るため。Excelボタンは切替の外＝常に一番下にある。
 # ============================================================================
 def results_section(backend):
     stores, latest, index = backend.load_current_month_stores()
@@ -567,44 +611,50 @@ def results_section(backend):
                 'それぞれを欲しがっている店が表示されます。')
     else:
         my_uploaded = (my_store in status['uploaded'])
-        # ---- ②（自店）のデッド品 ----
-        st.subheader('②（%s）のデッド品' % my_store)
         if not my_uploaded:
+            st.subheader('②（%s）のデッド品' % my_store)
             st.warning('まず自店（%s）の在庫ファイルをアップロードしてください。'
                        '自店のデッド・期限切迫が入って初めて、自店視点の提案が出ます。' % my_store)
         else:
             view_a = app_logic.build_view_a(result, my_store)       # 種別＝デッド
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
+            view_receive = app_logic.build_view_receive(result, my_store)  # ④受け手ビュー
 
-            # ②の注記：少額カット（在庫金額しきい値未満で非表示）の件数・金額は「自店分」で出す。
-            #   全店合計ではなく small_by_store の自店分を使う。0件なら少額の注記は出さない。
-            #   しきい値（1,500円）は result['min_supply_amount'] から取る（ベタ書きしない）。
-            min_amt = result.get('min_supply_amount', 0)
-            sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
-            cap = ('行が薄赤の品は期限切迫を兼ねています。'
-                   '融通に出さない品は左端の□にチェックを入れて「除外を保存」を押してください。'
-                   '／在庫金額%s円以上のものだけを載せています。'
-                   % '{:,}'.format(min_amt))
-            if sbs.get('count'):
-                cap += '（少額のため非表示：%d件・計%s円）' % (
-                    sbs['count'], '{:,.0f}'.format(sbs.get('amt', 0.0)))
-            st.caption(cap)
-            supply_editor(view_a, my_store, backend, exclusions, table_key='dead')
+            # ---- ②③④の切替ボタン。選ばれた1つだけを下に描く ----
+            chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive))
 
-            # ---- ③（自店）の期限切迫品 ----
-            st.subheader('③（%s）の期限切迫品' % my_store)
-            st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
-                       '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
-                       '（③は全行が期限切迫のため、背景は白のままにしています）')
-            supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
-                          paint_expiry=False)
+            if chosen == VIEW_DEAD:
+                # ---- ②（自店）のデッド品 ----
+                st.subheader('②（%s）のデッド品' % my_store)
+                # ②の注記：少額カット（在庫金額しきい値未満で非表示）の件数・金額は「自店分」で出す。
+                #   全店合計ではなく small_by_store の自店分を使う。0件なら少額の注記は出さない。
+                #   しきい値（1,500円）は result['min_supply_amount'] から取る（ベタ書きしない）。
+                min_amt = result.get('min_supply_amount', 0)
+                sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
+                cap = ('行が薄赤の品は期限切迫を兼ねています。'
+                       '融通に出さない品は左端の□にチェックを入れて「除外を保存」を押してください。'
+                       '／在庫金額%s円以上のものだけを載せています。'
+                       % '{:,}'.format(min_amt))
+                if sbs.get('count'):
+                    cap += '（少額のため非表示：%d件・計%s円）' % (
+                        sbs['count'], '{:,.0f}'.format(sbs.get('amt', 0.0)))
+                st.caption(cap)
+                supply_editor(view_a, my_store, backend, exclusions, table_key='dead')
+                excluded_section(my_store, backend, exclusions)
 
-            # ---- 除外中の品目（戻せる） ----
-            excluded_section(my_store, backend, exclusions)
+            elif chosen == VIEW_EXPIRY:
+                # ---- ③（自店）の期限切迫品 ----
+                st.subheader('③（%s）の期限切迫品' % my_store)
+                st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
+                           '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
+                           '（③は全行が期限切迫のため、背景は白のままにしています）')
+                supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
+                              paint_expiry=False)
+                excluded_section(my_store, backend, exclusions)
 
-            # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
-            view_receive = app_logic.build_view_receive(result, my_store)
-            receive_section(view_receive, my_store)
+            else:
+                # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
+                receive_section(view_receive, my_store)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()

@@ -70,6 +70,10 @@ def _view_supply(result, store_name, category):
     """
     融通提案（result['proposal_rows']）のうち、出し手店＝自店 かつ 種別＝category の行を、
     自店視点の表（引取候補店つき）に整えて返す。build_view_a / build_view_expiry の共通処理。
+
+    ★『引取候補店』は店名だけの版（proposal_rows の '引取候補店（店名のみ）'）を使う
+      （2026-07-28 本間部長指示。tier・消化目安つきだと横に長く、肝心の店名が読みづらいため）。
+      Excel／Gシートの『引取候補店』は従来どおり詳細つきのまま。
     """
     out = []
     for r in result['proposal_rows']:
@@ -81,7 +85,7 @@ def _view_supply(result, store_name, category):
             '薬品名': r['薬品名'], '単位': r['単位'], '在庫数': r['在庫数'],
             '在庫金額': r['在庫金額'], '有効期限': r['有効期限'],
             '期限切迫区分': r['期限切迫区分'], '区分': r['区分'],
-            '引取候補店': r['引取候補店'],
+            '引取候補店': r['引取候補店（店名のみ）'],
             # 除外チェック欄で使う内部キー（画面には出さない）
             '_key': r['_ex_key'],
         })
@@ -137,9 +141,14 @@ def build_view_receive(result, store_name):
 
       並べ替え：不足中（_tier_order=0）を上・使用中（=1）を下。各グループ内は有効期限が近い順。
         有効期限が空（_remain が None）の行は最後にまわす。
+        ★『なぜ候補か』列は下のとおり画面から外したが、並べ替えには引き続き _tier_order を使う
+          （不足中の品が上に来る優先順位はそのまま）。
 
-      画面用の10列だけに整えて返す（内部用の _tier_order・_remain・引取候補店 は返さない）：
-        出し手店／薬品名／単位／在庫数／在庫金額／有効期限／なぜ候補か／消化目安／区分／医薬品CD
+      画面用の9列だけに整えて返す（内部用の _tier_order・_remain・引取候補店 は返さない）：
+        出し手店／薬品名／単位／在庫数／在庫金額／有効期限／消化目安／区分／医薬品CD
+      ※2026-07-28 本間部長指示で『なぜ候補か』（不足中／使用中）列を削除した。
+        引き取る側にとっては「自店で使える品かどうか」は消化目安を見れば足り、
+        出し手側の tier 区分まで出す必要がないため。
     """
     rows = []
     for r in result.get('candidate_rows', []):
@@ -151,7 +160,7 @@ def build_view_receive(result, store_name):
                              r['_remain'] is None,
                              r['_remain'] if r['_remain'] is not None else 0))
     disp_cols = ['出し手店', '薬品名', '単位', '在庫数', '在庫金額', '有効期限',
-                 'なぜ候補か', '消化目安', '区分', '医薬品CD']
+                 '消化目安', '区分', '医薬品CD']
     return [{c: r[c] for c in disp_cols} for r in rows]
 
 

@@ -14,6 +14,12 @@
     build_candidate_entries()（丸めを通さず候補を全件返す）＋ compute_matching の戻り値 'candidate_rows'。
     既存キー・Excel4シート・Gシート出力は一切変えていません（増やすだけ）。
 
+  【2026-07-28 追加】CSVの文字コードを自動判定するようにしました（UTF-8 →Shift-JIS の順）。
+    薬VANのCSVは店によって UTF-8(BOM付き) と Shift-JIS(cp932) の2種類が出力されるためです。
+  【2026-07-28 追加】②③の画面用に、引取候補店を「店名だけ」つないだ build_candidate_names() と、
+    compute_matching の提案行キー '引取候補店（店名のみ）' を追加しました。
+    既存の『引取候補店』（tier・消化目安つき＝Excel／Gシート用）は一切変えていません（増やすだけ）。
+
 このファイルは「単一の真実」です。次の2つが必ず同じ計算をするよう、両者ともここを呼びます。
   ・コマンド版：create_yuzu_list.py（input フォルダのファイルをパスから読む）
   ・アプリ版　：streamlit_app.py（店がアップロードしたファイルのバイトをそのまま読む）
@@ -664,6 +670,26 @@ def build_candidates(by_key, key, source_store, supply_qty, exp_date, base_date)
     return main_str, ref_str
 
 
+def build_candidate_names(key, entries):
+    """ 引取候補店を「店名だけ」つないだ文字列を返す（②③の画面表示用。2026-07-28 本間部長指示）。
+
+        画面の『引取候補店』列は店名だけを出す。理由：店がやることは「その店に電話する」で、
+        tier（不足中／使用中）や消化目安まで並ぶと横に長くなり、肝心の店名が読み取りづらい。
+        ★Excel／Gシートの『引取候補店』列は従来どおり tier・消化目安つきのまま（本部が優先順位を見るため）。
+
+        ★build_candidates が作った文字列から店名を切り出してはいけない。
+          あの文字列は上位 max_candidates 店で「他N店」に丸められるため、解析すると候補が漏れる。
+          そこで丸め前の候補リスト（build_candidate_entries の戻り値）から組み立てる。
+          並び順（①不足中→②使用中、各グループ内は消化ペースの速い順）と丸めの仕方は
+          build_candidates とまったく同じなので、店名の並びは詳細版と一致する。
+
+        文言も build_candidates とそろえる：
+          医薬品コード無し → '（医薬品コード無し・突合対象外）' ／ 候補ゼロ → '該当なし' """
+    if not key:
+        return '（医薬品コード無し・突合対象外）'
+    return _join_with_overflow([e['引取候補店'] for e in entries]) or '該当なし'
+
+
 def build_candidate_entries(by_key, key, source_store, supply_qty, exp_date, base_date):
     """ 出し手（デッド／期限切迫）1件について、引取候補店を「候補ごとに1件の辞書」で返す。
         ④受け手ビュー（他店が出そうとしていて、自店が引き取れば活かせる品の一覧）の土台です。
@@ -862,6 +888,10 @@ def compute_matching(stores, excluded=None):
             exp = parse_date(g(row, '有効期限'))
             cand_main, cand_ref = build_candidates(
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
+            # 丸め無しの候補リスト。④受け手ビューの土台と、②③画面用の「店名だけ」の文字列の
+            #   両方をここから作る（同じ候補を2度計算しない／出どころを1つに保つ）。
+            cand_entries = build_candidate_entries(
+                by_key, key, s['name'], over_qty, exp, s['base_date'])
             remain = month_diff(s['base_date'], exp) if exp else None
             pr = {
                 '出し手店': s['name'], '種別': supplier_category(row),
@@ -873,6 +903,8 @@ def compute_matching(stores, excluded=None):
                 'ロットNO': g(row, 'ロットNO'), '最終出庫日': g(row, '最終出庫日'),
                 '区分': warn_labels(row),
                 '引取候補店': cand_main, '参考:過剰だが使用中の店': cand_ref,
+                # 画面（②③）用の店名だけの版。Excel／Gシートは上の『引取候補店』（詳細つき）を使う。
+                '引取候補店（店名のみ）': build_candidate_names(key, cand_entries),
                 '6ヶ月出庫回数': round(usage_cnt6(row), 2), '医薬品CD': key or '',
                 '_ex_key': exclusion_key(row),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
@@ -882,7 +914,7 @@ def compute_matching(stores, excluded=None):
             #   品目情報（薬品名・在庫数など）は上で作った提案行 pr から借りてマージして貯める。
             #   ★ここは少額カット（1,500円未満）・除外・法規制除外を全部くぐり抜けた行だけが到達するので、
             #     それらの除外は候補にも自動で反映される（この地点に置いているのがミソ）。
-            for ce in build_candidate_entries(by_key, key, s['name'], over_qty, exp, s['base_date']):
+            for ce in cand_entries:
                 candidate_rows.append({
                     '引取候補店': ce['引取候補店'], 'なぜ候補か': ce['なぜ候補か'],
                     '消化目安':   ce['消化目安'],   '_tier_order': ce['_tier_order'],
