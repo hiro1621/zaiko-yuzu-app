@@ -447,14 +447,33 @@ def _norm_openpyxl_value(v):
     return str(v).strip()
 
 
-# --- .csv（バイト → utf-8-sig で復号。newline='' で開いていた挙動に合わせる）---
+# --- .csv（バイト → 文字コードを自動判定して復号。newline='' で開いていた挙動に合わせる）---
+# 薬VANのCSVは店（出力の設定）によって UTF-8(BOM付き) と Shift-JIS(cp932) の2種類があるため、
+# UTF-8 で読めなければ cp932 で読み直す。UTF-8 は不正なバイト列を確実に弾くので、この順なら誤判定しない。
+_CSV_ENCODINGS = ('utf-8-sig', 'cp932')
+
+
+def _decode_csv_bytes(data):
+    """ CSVのバイト列を文字列に復号する。UTF-8（BOM有無どちらも）→ Shift-JIS(cp932) の順に試す。 """
+    last_err = None
+    for enc in _CSV_ENCODINGS:
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError as e:
+            last_err = e
+    raise ValueError(
+        'CSVの文字コードを判別できませんでした（UTF-8 でも Shift-JIS でもありません）。'
+        '詳細：%s' % last_err
+    )
+
+
 def _read_csv_header_bytes(data):
-    text = data.decode('utf-8-sig')
+    text = _decode_csv_bytes(data)
     return list(next(csv.reader(io.StringIO(text, newline=''))))
 
 
 def _read_csv_rows_bytes(data):
-    text = data.decode('utf-8-sig')
+    text = _decode_csv_bytes(data)
     return list(csv.DictReader(io.StringIO(text, newline='')))
 
 
