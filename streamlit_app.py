@@ -133,9 +133,28 @@ def load_stores_cached(backend):
     cache = st.session_state.get('stores_cache')
     if cache and cache.get('sig') == sig:
         return cache['stores'], cache['latest'], index
-    stores, latest, index = backend.load_current_month_stores()
+    # ★読み直すときは、いま読んだ _index をそのまま渡す（同じタブを2回読まない・2026-07-29）
+    stores, latest, index = backend.load_current_month_stores(index)
     st.session_state['stores_cache'] = {'sig': sig, 'stores': stores, 'latest': latest}
     return stores, latest, index
+
+
+def show_gsheet_error(e, what, level='error'):
+    """
+    Googleシートのエラーを画面に出す。1分あたりの上限（429）に当たったときは、
+    英語のAPIエラーをそのまま見せず、店が取るべき行動だけを日本語で伝える。
+      ★gsheet_store 側で2秒→5秒→10秒の自動やり直しを入れてあるので、
+        ここまで来るのは「かなり混み合っている」ときだけ。
+      level='warning' … 画面表示は続けられる（読めなくても致命的でない）場面用。
+    """
+    s = str(e)
+    out = st.warning if level == 'warning' else st.error
+    if ('429' in s) or ('Quota exceeded' in s) or ('RATE_LIMIT_EXCEEDED' in s):
+        out('ただいま混み合っています（Googleスプレッドシートの1分あたりの上限）。'
+            '**1分ほど待ってから、ページを再読み込み（F5）してください。**'
+            'データは無事です。何度も再読み込みすると、かえって開けなくなります。')
+    else:
+        out('%s：%s' % (what, e))
 
 
 def clear_stores_cache():
@@ -157,8 +176,8 @@ class _GSheetAdapter:
     def save_store_upload(self, store_name, ym, slim_rows, filename, format_ok):
         return gsheet_store.save_store_upload(self.sh, store_name, ym, slim_rows, filename, format_ok)
 
-    def load_current_month_stores(self):
-        return gsheet_store.load_current_month_stores(self.sh)
+    def load_current_month_stores(self, index=None):
+        return gsheet_store.load_current_month_stores(self.sh, index)
 
     def write_results(self, payload):
         gsheet_store.write_results(self.sh, payload)
@@ -828,7 +847,7 @@ def results_section(backend, stores, latest, index):
     try:
         exclusions = backend.load_exclusions()
     except Exception as e:
-        st.warning('除外リストを読めませんでした（除外なしで表示します）：%s' % e)
+        show_gsheet_error(e, '除外リストを読めませんでした（除外なしで表示します）', 'warning')
         exclusions = []
 
     # 予約リスト（受け手の店が「うちが引き取る」と押さえた品目）を読む。
@@ -837,7 +856,7 @@ def results_section(backend, stores, latest, index):
     try:
         reservations = backend.load_reservations()
     except Exception as e:
-        st.warning('予約リストを読めませんでした（予約なしで表示します）：%s' % e)
+        show_gsheet_error(e, '予約リストを読めませんでした（予約なしで表示します）', 'warning')
         reservations = []
     reserved = app_logic.reservation_map(reservations, latest)
 
@@ -862,7 +881,7 @@ def results_section(backend, stores, latest, index):
                 backend.save_results(payload)
             st.session_state['results_sig'] = sig   # 書けたときだけ覚える
     except Exception as e:
-        st.warning('結果の保管庫への書き戻しに失敗しました（画面表示は続行します）：%s' % e)
+        show_gsheet_error(e, '結果の保管庫への書き戻しに失敗しました（画面表示は続行します）', 'warning')
 
     my_store = st.session_state.get('my_store')
 
@@ -965,7 +984,7 @@ def main():
     try:
         stores, latest, index = load_stores_cached(backend)
     except Exception as e:
-        st.error('保管庫からデータを読めませんでした：%s' % e)
+        show_gsheet_error(e, '保管庫からデータを読めませんでした')
         return
 
     upload_section(backend, index, latest)

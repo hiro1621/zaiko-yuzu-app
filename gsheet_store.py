@@ -36,6 +36,7 @@
 """
 
 import datetime
+import time
 
 # yuzu_core（同じフォルダ）から、保管庫に入れる列の定義と道具を借りる
 from yuzu_core import KEEP_COLS, g
@@ -85,18 +86,104 @@ def open_spreadsheet(sa_info, spreadsheet_id):
     return gc.open_by_key(spreadsheet_id)
 
 
+# ============================================================================
+# Google APIの呼び出し回数を減らす／上限に当たっても自動でやり直す（2026-07-29）
+#   ★★背景：Googleスプレッドシートは「1分あたり60回」まで（読み取り・書き込みで別枠）。
+#     この上限はサービスアカウント1つあたり＝全店で共有なので、店数が増えるほど当たりやすい。
+#
+#   問題だったのは、gspread の sh.worksheet('タブ名') が呼ぶたびにブックの目次を
+#   取りに行く（＝1回ぶん消費する）こと。タブを触る＝「目次を取る」＋「中身を読む」の
+#   2回だったため、起動1回で14店なら約40回に達していた。
+#   → 目次は最初の1回だけ取って使い回す（_ws_map）。読み取りはほぼ半分になる。
+#      3店なら18回→7回、14店なら約40回→約18回。
+# ============================================================================
+_WS_CACHE = {}   # {ブックのID: {タブ名: ワークシート}}
+
+# 上限（429）に当たったときに待つ秒数。3回までやり直す。
+_RETRY_WAITS = [2, 5, 10]
+
+
+def _is_rate_limited(e):
+    """ 例外が「1分あたりの上限に当たった（429）」ものかどうか。 """
+    status = getattr(getattr(e, 'response', None), 'status_code', None)
+    if status == 429:
+        return True
+    s = str(e)
+    return ('429' in s) or ('Quota exceeded' in s) or ('RATE_LIMIT_EXCEEDED' in s)
+
+
+def _call(fn, *args, **kwargs):
+    """
+    Google APIを1回呼ぶ。1分あたりの上限に当たったら少し待って自動でやり直す。
+      ・待ち時間は 2秒 → 5秒 → 10秒（最大3回）。たいていは1回目のやり直しで通る。
+      ・上限以外のエラーは、そのまま呼び出し元へ返す（握りつぶさない）。
+        ただしタブの取り違え（外でタブを消した等）に備え、目次のキャッシュは捨てておく。
+    """
+    last = None
+    for wait in [0] + _RETRY_WAITS:
+        if wait:
+            time.sleep(wait)
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not _is_rate_limited(e):
+                _WS_CACHE.clear()
+                raise
+            last = e
+    raise last
+
+
+def _book_key(sh):
+    return getattr(sh, 'id', None) or id(sh)
+
+
+def _ws_map(sh, refresh=False):
+    """ タブ名→ワークシートの対応表。初回だけ目次を取りに行き、あとは使い回す。 """
+    key = _book_key(sh)
+    if refresh or key not in _WS_CACHE:
+        _WS_CACHE[key] = {ws.title: ws for ws in _call(sh.worksheets)}
+    return _WS_CACHE[key]
+
+
+def reset_ws_cache():
+    """ タブの目次キャッシュを捨てる（タブを新しく作った直後などに呼ぶ）。 """
+    _WS_CACHE.clear()
+
+
+def _find_ws(sh, title):
+    """ 指定名のタブを返す。無ければ None。
+        キャッシュに無いときだけ目次を1回取り直す（新しく作られたタブを拾うため）。 """
+    m = _ws_map(sh)
+    if title in m:
+        return m[title]
+    m = _ws_map(sh, refresh=True)
+    return m.get(title)
+
+
 def _get_or_create_ws(sh, title, rows=2000, cols=40):
     """ 指定名のタブを取得。無ければ作る。 """
-    try:
-        return sh.worksheet(title)
-    except Exception:
-        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+    ws = _find_ws(sh, title)
+    if ws is not None:
+        return ws
+    ws = _call(sh.add_worksheet, title=title, rows=str(rows), cols=str(cols))
+    _ws_map(sh)[title] = ws      # 作ったタブを目次キャッシュにも足す（取り直さない）
+    return ws
+
+
+def _values(ws):
+    """ タブの中身を全部読む（上限に当たったら自動でやり直す）。 """
+    return _call(ws.get_all_values)
+
+
+def _clear(ws):
+    """ タブを空にする（上限に当たったら自動でやり直す）。 """
+    return _call(ws.clear)
 
 
 def _update(ws, values, range_name='A1'):
     """ ws.update をバージョン差（引数順）に強い形（キーワード指定）で呼ぶ。
         gspread 5系（range_name, values）／6系（values, range_name）どちらでも通る。 """
-    ws.update(range_name=range_name, values=values, value_input_option='RAW')
+    _call(ws.update, range_name=range_name, values=values, value_input_option='RAW')
 
 
 # ============================================================================
@@ -107,11 +194,10 @@ def read_index(sh):
     _index タブを読んで {店名: {'ym','uploaded_at','rows','format','filename'}} を返す。
     タブが無ければ空の辞書。
     """
-    try:
-        ws = sh.worksheet(INDEX_TAB)
-    except Exception:
+    ws = _find_ws(sh, INDEX_TAB)
+    if ws is None:
         return {}
-    values = ws.get_all_values()
+    values = _values(ws)
     if not values or len(values) < 2:
         return {}
     header = values[0]
@@ -141,7 +227,7 @@ def read_index(sh):
 def _write_index(sh, index):
     """ index 辞書を _index タブへ丸ごと書き出す（店名の五十音でなく登録順を保つため店名でソート）。 """
     ws = _get_or_create_ws(sh, INDEX_TAB)
-    ws.clear()
+    _clear(ws)
     body = [list(INDEX_HEADERS)]
     for name in sorted(index.keys()):
         e = index[name]
@@ -158,11 +244,10 @@ def _write_index(sh, index):
 def read_exclusions(sh):
     """ _除外 タブを読んで [{'店名','除外キー','薬品名','除外日時'}, ...] を返す。
         タブがまだ無ければ空リスト。 """
-    try:
-        ws = sh.worksheet(EXCLUDE_TAB)
-    except Exception:
+    ws = _find_ws(sh, EXCLUDE_TAB)
+    if ws is None:
         return []
-    values = ws.get_all_values()
+    values = _values(ws)
     if not values or len(values) < 2:
         return []
     header = values[0]
@@ -184,7 +269,7 @@ def read_exclusions(sh):
 def write_exclusions(sh, rows):
     """ 除外リストを丸ごと書き直す（rows は read_exclusions と同じ形の辞書リスト）。 """
     ws = _get_or_create_ws(sh, EXCLUDE_TAB, rows=max(2000, len(rows) + 10), cols=8)
-    ws.clear()
+    _clear(ws)
     body = [list(EXCLUDE_HEADERS)]
     for r in rows:
         body.append([r.get('店名', ''), r.get('除外キー', ''),
@@ -201,11 +286,10 @@ def read_reservations(sh):
     """ _予約 タブを読んで
         [{'予約した店','出し手店','対象年月','予約キー','薬品名','予約日時'}, ...] を返す。
         タブがまだ無ければ空リスト。 """
-    try:
-        ws = sh.worksheet(RESERVE_TAB)
-    except Exception:
+    ws = _find_ws(sh, RESERVE_TAB)
+    if ws is None:
         return []
-    values = ws.get_all_values()
+    values = _values(ws)
     if not values or len(values) < 2:
         return []
     header = values[0]
@@ -229,7 +313,7 @@ def read_reservations(sh):
 def write_reservations(sh, rows):
     """ 予約リストを丸ごと書き直す（rows は read_reservations と同じ形の辞書リスト）。 """
     ws = _get_or_create_ws(sh, RESERVE_TAB, rows=max(2000, len(rows) + 10), cols=8)
-    ws.clear()
+    _clear(ws)
     body = [list(RESERVE_HEADERS)]
     for r in rows:
         body.append([r.get('予約した店', ''), r.get('出し手店', ''), r.get('対象年月', ''),
@@ -255,7 +339,7 @@ def write_raw(sh, store_name, slim_rows):
         slim_rows は {列名:文字列} の辞書のリスト（yuzu_core.slim_rows の出力）。 """
     ws = _get_or_create_ws(sh, _raw_tab_name(store_name),
                            rows=max(2000, len(slim_rows) + 10), cols=len(KEEP_COLS) + 2)
-    ws.clear()
+    _clear(ws)
     body = [list(KEEP_COLS)]
     for r in slim_rows:
         body.append([r.get(c, '') for c in KEEP_COLS])
@@ -264,11 +348,10 @@ def write_raw(sh, store_name, slim_rows):
 
 def read_raw(sh, store_name):
     """ raw_<店名> を読み、{列名:文字列} の辞書のリストで返す。タブが無ければ空リスト。 """
-    try:
-        ws = sh.worksheet(_raw_tab_name(store_name))
-    except Exception:
+    ws = _find_ws(sh, _raw_tab_name(store_name))
+    if ws is None:
         return []
-    values = ws.get_all_values()
+    values = _values(ws)
     if not values or len(values) < 2:
         return []
     header = values[0]
@@ -294,7 +377,7 @@ def write_results(sh, payload):
     """
     # 融通提案
     ws = _get_or_create_ws(sh, TAB_PROPOSAL)
-    ws.clear()
+    _clear(ws)
     note = ('基準年月：%s ／ CSV基準日：%s ／ ※月初スナップショットです（現在庫と異なる場合があります）'
             % (payload.get('base_ym', ''), payload.get('csv_base', '')))
     body = [[note], list(payload['proposal_headers'])]
@@ -303,17 +386,17 @@ def write_results(sh, payload):
 
     # 不足品目一覧
     ws2 = _get_or_create_ws(sh, TAB_SHORTAGE)
-    ws2.clear()
+    _clear(ws2)
     _update(ws2, [list(payload['shortage_headers'])] + [list(r) for r in payload['shortage_rows']])
 
     # 品目×店舗マトリクス
     ws3 = _get_or_create_ws(sh, TAB_MATRIX)
-    ws3.clear()
+    _clear(ws3)
     _update(ws3, [list(payload['matrix_headers'])] + [list(r) for r in payload['matrix_rows']])
 
     # 店舗別サマリ
     ws4 = _get_or_create_ws(sh, TAB_SUMMARY)
-    ws4.clear()
+    _clear(ws4)
     _update(ws4, [list(payload['summary_headers'])] + [list(r) for r in payload['summary_rows']])
 
 
@@ -324,15 +407,14 @@ def snapshot_results_to_prev(sh, prev_ym):
     """
     if not prev_ym:
         return
-    try:
-        old = sh.worksheet(TAB_PROPOSAL)
-    except Exception:
+    old = _find_ws(sh, TAB_PROPOSAL)
+    if old is None:
         return
-    values = old.get_all_values()
+    values = _values(old)
     if not values:
         return
     prev = _get_or_create_ws(sh, PREV_PREFIX + prev_ym)
-    prev.clear()
+    _clear(prev)
     _update(prev, values)
 
 
@@ -371,7 +453,7 @@ def save_store_upload(sh, store_name, ym, slim_rows, filename, format_ok):
 # ============================================================================
 # 当月データを持つ全店を読み込む（マッチング入力を組み立てる）
 # ============================================================================
-def load_current_month_stores(sh):
+def load_current_month_stores(sh, index=None):
     """
     _index を見て「当月（最新年月）のデータを持つ店」だけを raw から読み込み、
     compute_matching に渡せる stores のリストを組み立てて返す。
@@ -379,8 +461,12 @@ def load_current_month_stores(sh):
         stores … [{'name','ym','base_date','rows'}, ...]（当月のみ）
         latest … 当月の年月(YYYYMM) または None
         index  … _index の全内容（画面の「未アップ店」表示等に使う）
+    ★index を渡すと _index を読み直さない（2026-07-29）。
+      呼び出し側（load_stores_cached）はキャッシュ判定のために _index を先に読んでおり、
+      ここでもう一度読むと同じタブを2回読むことになるため。
     """
-    index = read_index(sh)
+    if index is None:
+        index = read_index(sh)
     latest = latest_ym(index)
     stores = []
     if latest is None:

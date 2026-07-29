@@ -387,7 +387,8 @@ class LocalBackend:
         """ _index だけを返す（Gシート版と同じインターフェース）。 """
         return dict(self.state['index'])
 
-    def load_current_month_stores(self):
+    def load_current_month_stores(self, index=None):
+        # index は Gシート版と引数をそろえるためだけに受ける（ローカルは読み直しの費用が無い）
         index = self.state['index']
         latest = self._latest_ym()
         stores = []
