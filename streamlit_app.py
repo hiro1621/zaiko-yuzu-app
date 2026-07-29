@@ -896,7 +896,8 @@ def results_section(backend, stores, latest, index):
                 #   しきい値（1,500円）は result['min_supply_amount'] から取る（ベタ書きしない）。
                 min_amt = result.get('min_supply_amount', 0)
                 sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
-                cap = ('行が薄赤の品は期限切迫を兼ねています。'
+                cap = ('デッド＝直近6ヶ月以上、出庫（払い出し）がない在庫です。'
+                       '行が薄赤の品は期限切迫を兼ねています。'
                        'デッドストックリストに載せない医薬品は左端の□にチェックを入れて'
                        '「除外を保存」を押してください。'
                        '／在庫金額%s円以上のものだけを載せています。'
