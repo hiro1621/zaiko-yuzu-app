@@ -94,6 +94,10 @@ def _view_supply(result, store_name, category):
             '_key': r['_ex_key'],
             # 予約済みの品を誤って除外しないよう、店名を持たせておく（画面には出さない）
             '_予約店': taker,
+            # 滞留（何ヶ月つづけて載っているか）。'滞留' が画面に出す文字、
+            #   '_滞留区分' は色を決めるための区分（画面には出さない）。
+            '滞留': r.get('滞留', ''), '_滞留区分': r.get('_滞留区分', 'new'),
+            '_滞留月数': r.get('_滞留月数', 1),
         })
     return out
 
@@ -167,16 +171,89 @@ def build_view_receive(result, store_name):
         if r.get('_予約店', ''):
             continue
         rows.append(r)
-    # 不足中→使用中の順、各グループ内は有効期限の近い順、有効期限が空（_remain=None）の行は最後
-    rows.sort(key=lambda r: (r['_tier_order'],
+    # 並べ替え：まず滞留の長い品を上に、そのあと従来どおり 不足中→使用中／有効期限の近い順。
+    #   ★滞留を最優先にしているのは、この一覧の目的が「引取候補店がいるのに動いていない品を
+    #     引き取ってもらう」ことだから（2026-07-30 本間部長指摘）。
+    #     長く残っている品ほど上に来るので、下までスクロールしなくても目に入る。
+    #     ただし「先月予約されたのに残っている品」は月数に関係なく最上段に置く
+    #     （受け渡しの取りこぼし＝いちばん先に確認してほしいもの）。
+    rows.sort(key=lambda r: (0 if r.get('_滞留区分') == 'booked' else 1,
+                             -int(r.get('_滞留月数', 1) or 1),
+                             r['_tier_order'],
                              r['_remain'] is None,
                              r['_remain'] if r['_remain'] is not None else 0))
-    disp_cols = ['出し手店', '薬品名', '単位', '在庫数', '在庫金額', '有効期限',
+    disp_cols = ['出し手店', '薬品名', '滞留', '単位', '在庫数', '在庫金額', '有効期限',
                  '消化目安', '区分', '医薬品CD']
     # ★画面に出す列のほかに、予約を保存するためのキーを2つ持たせる（画面では隠す）。
     #   _出し手店・_key の組が予約1件を特定する。医薬品CD列とは別物（CDが無い品は「名:薬品名」）。
-    return [dict({c: r[c] for c in disp_cols},
-                 _出し手店=r['出し手店'], _key=r['_ex_key']) for r in rows]
+    return [dict({c: r.get(c, '') for c in disp_cols},
+                 _出し手店=r['出し手店'], _key=r['_ex_key'],
+                 _滞留区分=r.get('_滞留区分', 'new'),
+                 _滞留月数=r.get('_滞留月数', 1)) for r in rows]
+
+
+# ============================================================================
+# 滞留（同じ品が何ヶ月つづけてリストに載っているか）
+#   ・前月の結果（gsheet_store.read_prev_proposal の戻り）と、今月の計算結果を突き合わせる。
+#   ・色とラベルの決め方は yuzu_core.stagnation_view に一本化してある（画面・Excel共通）。
+# ============================================================================
+def apply_stagnation(result, prev_map):
+    """
+    今月の計算結果に「滞留」の情報を書き込む（result をその場で書き換える）。
+
+      prev_map … {(出し手店, 品目キー): {'滞留月数','引取候補店','予約'}}
+                 gsheet_store.read_prev_proposal の戻り。空なら全部「今月から」になる。
+
+    数え方：
+      前月に同じ (出し手店, 品目キー) が載っていれば 前月の月数＋1、載っていなければ 1。
+      ★品目キーは除外・予約と同じ _ex_key を使う（品目の呼び名を1つに保つ）。
+
+    ★前月に一部の店がアップし忘れていると、その店の品は前月の結果に入っていないため
+      滞留が1に戻る（実際より短く出る）。数え落とす側に倒しているのは、
+      載っていないものを「滞留していた」と決めつけるより安全なため。
+
+    戻り値：滞留区分ごとの件数（{'m2': 3, 'booked': 1, ...}）。画面の注記に使う。
+    """
+    prev_map = prev_map or {}
+    counts = {}
+
+    # --- 出し手の提案行に滞留を書き込む ---
+    for pr in result.get('proposal_rows', []):
+        prev = prev_map.get((pr['出し手店'], pr['_ex_key']))
+        months = (prev.get('滞留月数', 1) + 1) if prev else 1
+        was_reserved = bool(prev and str(prev.get('予約', '') or '').strip())
+        level, label = yuzu_core.stagnation_view(
+            months, pr.get('_候補あり', False), was_reserved)
+        pr['_滞留月数'] = months
+        pr['_先月予約'] = was_reserved
+        pr['_滞留区分'] = level
+        pr['滞留'] = label
+        counts[level] = counts.get(level, 0) + 1
+
+    # --- ④受け手ビューの土台にも同じ値を配る ---
+    #   candidate_rows は「1つの出し手行 × 候補店の数」だけ複製されているので、
+    #   (出し手店, _ex_key) で引き当てて同じ滞留を持たせる。
+    by_key = {(pr['出し手店'], pr['_ex_key']): pr for pr in result.get('proposal_rows', [])}
+    for cr in result.get('candidate_rows', []):
+        pr = by_key.get((cr['出し手店'], cr['_ex_key']))
+        if not pr:
+            continue
+        for k in ('滞留', '_滞留月数', '_滞留区分', '_先月予約'):
+            cr[k] = pr[k]
+
+    result['stagnation_counts'] = counts
+    return counts
+
+
+def stagnation_summary(rows):
+    """ 表示中の行リストから、滞留区分ごとの件数を数える（画面の注記用）。
+        rows … build_view_a / build_view_expiry / build_view_receive の戻り。 """
+    counts = {}
+    for r in (rows or []):
+        lv = r.get('_滞留区分', 'new')
+        if lv and lv != 'new':
+            counts[lv] = counts.get(lv, 0) + 1
+    return counts
 
 
 # ============================================================================
@@ -415,6 +492,13 @@ class LocalBackend:
     def save_results(self, payload):
         """ 結果を保持（次の月替わりで prev へ退避できるように）。 """
         self.state['results'] = payload
+
+    def load_prev_proposal(self, current_ym=None):
+        """ 前月の結果（滞留の判定材料）を返す。
+            ローカル保管庫は検証・お試し用で月をまたいだ運用をしないため、
+            state['prev_proposal'] に手で入れたものだけを返す（既定は空＝全部「今月から」）。
+            ★テストから滞留の挙動を確かめられるように、入口だけは用意しておく。 """
+        return dict(self.state.get('prev_proposal', {}))
 
     def load_exclusions(self):
         """ 店が「融通に出さない」と外した品目の一覧を返す（Gシート版と同じ形）。 """

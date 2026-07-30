@@ -139,6 +139,29 @@ def load_stores_cached(backend):
     return stores, latest, index
 
 
+def load_prev_cached(backend, latest):
+    """
+    前月の結果（滞留の判定材料）を読む。**同じ月のあいだは1回しか読まない**。
+
+    ★キャッシュしてよい理由：読む相手は 前月_YYYYMM タブで、これは月替わりのときにしか
+      作られない＝当月のあいだは中身が変わらないため。行を選ぶたびに読み直すと、
+      Googleの1分あたりの上限に近づくだけで得るものが無い。
+    読めなかったときは空の辞書を返す（＝全部「今月から」扱い。画面は普通に出る）。
+    """
+    if not hasattr(backend, 'load_prev_proposal'):
+        return {}
+    cache = st.session_state.get('prev_cache')
+    if cache and cache.get('ym') == latest:
+        return cache['map']
+    try:
+        m = backend.load_prev_proposal(latest)
+    except Exception as e:
+        show_gsheet_error(e, '前月の記録を読めませんでした（滞留の表示は省きます）', 'warning')
+        m = {}
+    st.session_state['prev_cache'] = {'ym': latest, 'map': m}
+    return m
+
+
 def show_gsheet_error(e, what, level='error'):
     """
     Googleシートのエラーを画面に出す。1分あたりの上限（429）に当たったときは、
@@ -161,6 +184,9 @@ def clear_stores_cache():
     """ アップロードを保存した直後に呼ぶ（次の描画で必ず読み直させる）。 """
     st.session_state.pop('stores_cache', None)
     st.session_state.pop('results_sig', None)
+    # 月替わりのアップロードでは 前月_YYYYMM タブが新しく作られるので、前月の記録も捨てる。
+    #   （当月の年月が変わればキャッシュのキーも変わるが、念のためここでも落としておく）
+    st.session_state.pop('prev_cache', None)
 
 
 # ============================================================================
@@ -197,6 +223,10 @@ class _GSheetAdapter:
     def load_index(self):
         """ _index だけを読む（1タブ）。在庫本体（raw_）を読み直すかどうかの判定に使う。 """
         return gsheet_store.read_index(self.sh)
+
+    def load_prev_proposal(self, current_ym=None):
+        """ 前月の結果（滞留＝何ヶ月つづけて載っているか の判定材料）を読む。 """
+        return gsheet_store.read_prev_proposal(self.sh, current_ym)
 
 
 @st.cache_resource(show_spinner='Googleシートに接続しています…')
@@ -265,13 +295,16 @@ def _df(rows, columns=None):
 _NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数']
 
 
-def _style_expiry(df, paint=True):
+def _style_expiry(df, paint=True, stag_levels=None):
     """ 表を見やすく整えた pandas Styler を返す。
           ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00・カンマ区切り）
           ・paint=True のとき、「期限切迫区分」が非空の行を【薄赤の背景＋黒文字】で行ごと目立たせる
             （②デッド一覧の中で"期限が近いデッド"が一目で分かるように）
           ・paint=False のときは背景を塗らない（③期限切迫品は全行が期限切迫で、
             塗ると表全体が赤くなるだけで情報量がゼロのため。数値フォーマットは②③とも効かせる）。
+          ・stag_levels（行ごとの滞留区分のリスト）を渡すと、「滞留」列のセルだけを
+            滞留区分の色で塗る。★行の色（＝期限のこと）とは別のことを表しているので、
+            行全体ではなくセル1つだけを塗って意味を混ぜないようにしている。
         ★文字色を黒（#000000）で明示するのは、ダークテーマだと白文字×薄赤で読めなくなるため。
           ライトテーマでは元から黒文字なので見た目は変わらない。
         Styler が使えない環境では素の DataFrame をそのまま返す。 """
@@ -286,6 +319,15 @@ def _style_expiry(df, paint=True):
         hit = str(row.get('期限切迫区分', '') or '').strip() != ''
         return [HIT_STYLE if hit else '' for _ in row]
 
+    def _paint_stag(col):
+        """ 「滞留」列のセルを、行ごとの滞留区分の色で塗る。 """
+        out = []
+        for i in range(len(col)):
+            lv = stag_levels[i] if i < len(stag_levels) else 'new'
+            bg, fg, _x, _d = yuzu_core.STAGNATION_STYLES.get(lv, ('', '', None, ''))
+            out.append(('background-color: %s; color: %s' % (bg, fg)) if bg else '')
+        return out
+
     try:
         sty = df.style
         fmt = {c: '{:,.2f}' for c in _NUM2_COLS if c in df.columns}
@@ -293,10 +335,38 @@ def _style_expiry(df, paint=True):
             sty = sty.format(fmt)
         if paint and '期限切迫区分' in df.columns:
             sty = sty.apply(_paint, axis=1)
+        if stag_levels and '滞留' in df.columns:
+            sty = sty.apply(_paint_stag, subset=['滞留'])
         return sty
     except Exception:
         # 万一 Styler が使えない環境でも、表示自体は素のDataFrameで続行する
         return df
+
+
+def stagnation_legend(rows):
+    """
+    「滞留」列の色の意味を、色チップつきで画面に出す（＝色を見ただけで意味が分かるように）。
+      rows … いま表示している行リスト。実際に出ている区分だけを並べるので、
+             関係のない色の説明で画面がうるさくならない。
+    1件も滞留が無い月は何も出さない。
+    """
+    counts = app_logic.stagnation_summary(rows)
+    if not counts:
+        return
+    chips = []
+    for lv in yuzu_core.STAGNATION_LEGEND_ORDER:
+        n = counts.get(lv)
+        if not n:
+            continue
+        bg, fg, _x, desc = yuzu_core.STAGNATION_STYLES[lv]
+        chips.append(
+            '<span style="background-color:%s;color:%s;padding:2px 8px;'
+            'border-radius:4px;border:1px solid #BBB;white-space:nowrap;">'
+            '%s <b>%d件</b></span>' % (bg, fg, desc, n))
+    st.markdown(
+        '<div style="font-size:0.86rem;line-height:2.1;">'
+        '<b>「滞留」列の色の見方</b>　' + '　'.join(chips) + '</div>',
+        unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -337,17 +407,21 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
         st.info('該当する品目はありません。')
         return
 
-    disp_cols = ['薬品名', '単位', '在庫数', '在庫金額',
+    # 「滞留」は薬品名のすぐ隣に置く。★いちばん右に足すと横スクロールの先に隠れて
+    #   気づかれないため、品名と並べて必ず目に入る位置にしている。
+    disp_cols = ['薬品名', '滞留', '単位', '在庫数', '在庫金額',
                  '有効期限', '期限切迫区分', '区分', '引取候補店']
-    df = pd.DataFrame([{c: r[c] for c in disp_cols} for r in rows])
+    df = pd.DataFrame([{c: r.get(c, '') for c in disp_cols} for r in rows])
+    stag_levels = [r.get('_滞留区分', 'new') for r in rows]
 
     event = st.dataframe(
-        _style_expiry(df, paint=paint_expiry),
+        _style_expiry(df, paint=paint_expiry, stag_levels=stag_levels),
         hide_index=True,
         width='stretch',
         on_select='rerun',
         selection_mode='multi-row',
         key='table_%s' % table_key)
+    stagnation_legend(rows)
 
     # 選択された行を「行の位置」で拾い、位置で元の rows から引く（隠し列の値に頼らない確実な方法）
     picked = _selected_rows(event)
@@ -434,22 +508,26 @@ def receive_section(view_receive, my_store, backend, reservations, ym):
     st.caption('他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品です。'
                '引き取りたい品は左端の□にチェックを入れて「予約する」を押してください'
                '（予約するとほかの店の一覧からは消え、出し手の画面に自店名が出ます）。'
+               '『滞留』の欄は、その品が何ヶ月つづけて動いていないかです。'
+               '長く残っている品ほど上に並べています（色の意味は表の下に出ます）。'
                '『区分』に表示がある薬（向精神薬・毒薬・劇薬）は、受け取る側でも記録が必要です。'
                '数量の相談・連絡は従来どおり電話・デスクネッツでお願いします。')
     if not view_receive:
         st.info('いま他店から引き取れる品はありません。')
         return
 
-    # 内部用の列（_出し手店・_key）は画面に出さない
-    hidden = ('_出し手店', '_key', '_予約店')
+    # 内部用の列（_出し手店・_key・滞留区分など）は画面に出さない
+    hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数')
     df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_receive])
+    stag_levels = [r.get('_滞留区分', 'new') for r in view_receive]
     event = st.dataframe(
-        _style_expiry(df, paint=False),
+        _style_expiry(df, paint=False, stag_levels=stag_levels),
         hide_index=True,
         width='stretch',
         on_select='rerun',
         selection_mode='multi-row',
         key='table_receive')
+    stagnation_legend(view_receive)
 
     # 選ばれた行を「行の位置」で拾い、位置で元の view_receive から引く（隠し列の値に頼らない）
     picked = _selected_rows(event)
@@ -864,6 +942,15 @@ def results_section(backend, stores, latest, index):
     #   ※予約は出し手から品を取り除かない（件数・金額・自己検算は動かない）。印を付けるだけ。
     result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions),
                                         reserved=reserved)
+
+    # 滞留（同じ品が何ヶ月つづけて載っているか）を書き込む。
+    #   ★compute_matching の直後・ビューを作る前に済ませる。ここで result に書き込むので、
+    #     ②③④の画面・Excel・Gシートのすべてに同じ値が行き渡る。
+    #   前月の記録がまだ無い月（この機能を入れた最初の月）は全部「今月から」になる＝
+    #     画面は今までどおりの見た目で、2ヶ月目以降から色が付きはじめる。
+    prev_map = load_prev_cached(backend, latest)
+    app_logic.apply_stagnation(result, prev_map)
+
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
     csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
 
@@ -917,6 +1004,8 @@ def results_section(backend, stores, latest, index):
                 sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
                 cap = ('デッド＝直近6ヶ月以上、出庫（払い出し）がない在庫です。'
                        '行が薄赤の品は期限切迫を兼ねています。'
+                       '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
+                       '（色の意味は表の下に出ます）。'
                        'デッドストックリストに載せない医薬品は左端の□にチェックを入れて'
                        '「除外を保存」を押してください。'
                        '／在庫金額%s円以上のものだけを載せています。'
@@ -933,6 +1022,8 @@ def results_section(backend, stores, latest, index):
                 st.subheader('③（%s）の期限切迫品' % my_store)
                 st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
                            '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
+                           '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
+                           '（色の意味は表の下に出ます）。'
                            '（③は全行が期限切迫のため、背景は白のままにしています）')
                 supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
                               paint_expiry=False)

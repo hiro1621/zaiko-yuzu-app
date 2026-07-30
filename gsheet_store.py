@@ -419,6 +419,121 @@ def snapshot_results_to_prev(sh, prev_ym):
 
 
 # ============================================================================
+# 前月の結果を読む（滞留＝何ヶ月つづけて載っているか の判定に使う）
+# ----------------------------------------------------------------------------
+# 2026-07-30 追加。前月_YYYYMM タブはこれまで「書くだけで誰も読んでいない」状態だった。
+#
+# 【なぜ前月の1枚だけ読むのか（過去12ヶ月ぶんを読まない理由）】
+#   滞留月数を前月タブに書き込んでおき、翌月は「前月の月数＋1」で数える方式にしている。
+#   こうすると読むタブは常に1枚で済み、それでいて何ヶ月でもさかのぼって数えられる。
+#   過去タブを何枚も読む方式だと、Googleの読み取り上限（このファイル冒頭の対策の理由）に
+#   近づくうえ、さかのぼれる月数がタブの枚数で頭打ちになる。
+# ============================================================================
+def _prev_tab_yms(sh):
+    """ 保管庫にある 前月_YYYYMM タブの年月を、新しい順のリストで返す。 """
+    yms = []
+    for title in _ws_map(sh).keys():
+        if not title.startswith(PREV_PREFIX):
+            continue
+        ym = title[len(PREV_PREFIX):].strip()
+        if len(ym) == 6 and ym.isdigit():
+            yms.append(ym)
+    return sorted(yms, reverse=True)
+
+
+def _prev_row_key(cd, name):
+    """ 前月タブの1行から品目キーを作る。
+        ★yuzu_core.exclusion_key と必ず同じ作り方にすること
+          （個別医薬品CDが取れればそれを使い、取れない品だけ『名:薬品名』で代用）。
+          ここがズレると、同じ品なのに前月と別物と見なされ、滞留がいつまでも1ヶ月目になる。 """
+    cd = str(cd or '').strip()
+    if cd:
+        return cd
+    return '名:' + str(name or '').strip()
+
+
+def read_prev_proposal(sh, current_ym=None):
+    """
+    直前の月の 前月_YYYYMM タブを読み、
+      {(出し手店, 品目キー): {'滞留月数': int, '引取候補店': str, '予約': str}}
+    を返す。タブが1枚も無ければ空の辞書（＝全部「今月から」になる）。
+
+      current_ym … 当月の年月(YYYYMM)。これより前で最も新しいタブを読む。
+                   None なら単純に最も新しいタブを読む。
+
+    ※タブの中身は「融通提案」をそのまま退避したもの＝1行目が注記、2行目が見出し。
+      見出しの位置は決め打ちせず『出し手店』を含む行を探して特定する
+      （注記の有無が将来変わっても壊れないようにするため）。
+    """
+    yms = _prev_tab_yms(sh)
+    if current_ym:
+        yms = [y for y in yms if y < str(current_ym)]
+    if not yms:
+        return {}
+
+    ws = _find_ws(sh, PREV_PREFIX + yms[0])
+    if ws is None:
+        return {}
+    values = _values(ws)
+    if not values:
+        return {}
+
+    # 見出し行を探す（'出し手店' が入っている最初の行）
+    hi = None
+    for i, rowv in enumerate(values[:5]):
+        if any(str(c).strip() == '出し手店' for c in rowv):
+            hi = i
+            break
+    if hi is None:
+        return {}
+    header = [str(c).strip() for c in values[hi]]
+
+    def col(name):
+        return header.index(name) if name in header else None
+
+    i_store = col('出し手店')
+    i_cd = col('医薬品CD')
+    i_name = col('薬品名')
+    i_cand = col('引取候補店')
+    i_book = col('予約')
+    i_stag = col('滞留')          # 滞留列を足す前の月のタブには存在しない
+    if i_store is None or i_name is None:
+        return {}
+
+    out = {}
+    for rowv in values[hi + 1:]:
+        def cell(i):
+            return str(rowv[i]).strip() if (i is not None and i < len(rowv)) else ''
+        store = cell(i_store)
+        if not store:
+            continue
+        key = _prev_row_key(cell(i_cd), cell(i_name))
+
+        # 前月の滞留月数を数字として取り出す（'3ヶ月目' → 3 ／ '⚠ 4ヶ月目・先月予約済' → 4）。
+        #   ★滞留列がまだ無い月のタブでは 1 とみなす。
+        #     こうすると「前月に載っていた」という事実だけは拾えるので、
+        #     この機能を入れた最初の月から、ちゃんと『2ヶ月目』が出せる。
+        months = 1
+        s = cell(i_stag)
+        if s:
+            digits = ''
+            for ch in s:
+                if ch.isdigit():
+                    digits += ch
+                elif digits:
+                    break
+            if digits:
+                months = int(digits)
+
+        out[(store, key)] = {
+            '滞留月数': months,
+            '引取候補店': cell(i_cand),
+            '予約': cell(i_book),
+        }
+    return out
+
+
+# ============================================================================
 # アップロード1件を保管する（月替わり退避つき）
 # ============================================================================
 def save_store_upload(sh, store_name, ym, slim_rows, filename, format_ok):
@@ -492,17 +607,19 @@ def build_results_payload(result, base_ym_disp, csv_base_disp):
     yuzu_core.compute_matching(...) の戻り値 result を、結果4タブ書き戻し用の
     「文字列2次元配列」に整える。Excel出力（write_excel）と同じ列・同じ並び。
     """
-    # ※末尾の『予約』は2026-07-28に追加した列（write_excel と同じ並び）。
+    # ※末尾の『予約』は2026-07-28、『滞留』は2026-07-30に追加した列（write_excel と同じ並び）。
+    #   ★『滞留』はここに書き出すことが翌月の判定材料そのものになる（read_prev_proposal が読む）。
+    #     列名・書式を変えるときは read_prev_proposal も必ず合わせること。
     proposal_headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額',
                         '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                         '最終出庫日', '区分', '引取候補店', '参考:過剰だが使用中の店',
-                        '6ヶ月出庫回数', '医薬品CD', '予約']
+                        '6ヶ月出庫回数', '医薬品CD', '予約', '滞留']
     proposal_rows = [[r['出し手店'], r['種別'], r['薬品名'], r['単位'], r['メーカ名'], r['在庫数'],
                       r['在庫金額'], r['過剰在庫区分'], r['不動区分'], r['期限切迫区分'],
                       r['有効期限'], r['ロットNO'], r['最終出庫日'], r['区分'],
                       r['引取候補店'], r['参考:過剰だが使用中の店'],
                       r['6ヶ月出庫回数'], r['医薬品CD'],
-                      r.get('予約', '')] for r in result['proposal_rows']]
+                      r.get('予約', ''), r.get('滞留', '')] for r in result['proposal_rows']]
 
     shortage_headers = ['店', '薬品名', '在庫数', '安全在庫数', '不足数', '医薬品CD', 'デッド/期限切迫で持つ他店']
     shortage_rows = [[r['店'], r['薬品名'], r['在庫数'], r['安全在庫数'], r['不足数'],

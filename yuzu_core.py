@@ -976,6 +976,14 @@ def compute_matching(stores, excluded=None, reserved=None):
                 '予約': _reserve_label(reserved, s['name'], exclusion_key(row)),
                 '_予約店': _reserved_by(reserved, s['name'], exclusion_key(row)),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
+                # 滞留（何ヶ月つづけて載っているか）。ここでは「今月から」を初期値として置き、
+                #   過去の記録がある場合だけ app_logic.apply_stagnation が上書きする。
+                #   ★初期値を必ず入れておくのは、履歴が読めなかった月でも画面・Excelが
+                #     欠損キーで落ちないようにするため（履歴は「あれば良くなる」情報に留める）。
+                '滞留': '', '_滞留月数': 1, '_滞留区分': 'new', '_先月予約': False,
+                # 引取候補店がいるか。★文字列（'該当なし' 等）を見て判定すると
+                #   文言を変えた瞬間に壊れるので、候補リストの中身そのもので持たせる。
+                '_候補あり': bool(cand_entries),
                 '_remain': remain, '_amt_raw': over_amt}
             proposal_rows.append(pr)
             # ④受け手ビューの土台：この出し手行の引取候補店を「候補ごとに1件」で作り（丸め無し）、
@@ -990,6 +998,11 @@ def compute_matching(stores, excluded=None, reserved=None):
                     '在庫数':   pr['在庫数'],   '在庫金額': pr['在庫金額'],
                     '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
                     '_remain':  remain,
+                    # 滞留は出し手の提案行と同じ値を持たせる（④受け手の画面にも出すため）。
+                    #   ★apply_stagnation は提案行を直したあとに候補行へ配り直すので、
+                    #     ここでの値は初期値。実値の詰め直しは app_logic 側で行う。
+                    '滞留': pr['滞留'], '_滞留月数': pr['_滞留月数'],
+                    '_滞留区分': pr['_滞留区分'], '_先月予約': pr['_先月予約'],
                     # 予約済みなら、その店の④にだけ残して他店の④からは消すために持たせる
                     '_予約店': pr['_予約店'],
                     # ★予約を保存するときのキー。(出し手店, _ex_key) で1件を特定する。
@@ -1120,6 +1133,89 @@ def compute_matching(stores, excluded=None, reserved=None):
 
 
 # ============================================================================
+# 滞留（同じ品が何ヶ月つづけてリストに載っているか）
+# ----------------------------------------------------------------------------
+# 2026-07-30 追加。毎月アップロードしても動かない品を目立たせるための仕組み。
+#
+# 【何のため】
+#   「引取候補店がいるのに、2ヶ月目・3ヶ月目と引き取られないまま残っている品」を
+#   一目で分かるようにする（本間部長への指摘より）。
+#
+# 【色の意味】★画面（Streamlit）とExcelで必ず同じ色・同じ言葉を使うため、ここに一本化する。
+#   ・行の色  … 期限のこと（既存。赤＝期限切迫／黄＝期限1年以内）
+#   ・滞留列の色 … 動いていない期間のこと（ここで定義）
+#   この2つは別のことを表しているので、色の系統を分けている。
+#
+#   new     塗らない  今月から載った品（初めて出てきた）
+#   m2      薄い黄    2ヶ月目。引取候補店はいるのに動いていない
+#   m3      オレンジ  3ヶ月目。同上（そろそろ手を打つ）
+#   m4      濃い橙    4ヶ月目以上。同上（最優先で動かす）
+#   nocand  グレー    2ヶ月目以上だが引取候補店がいない
+#                     ＝引き取れる店がそもそも無い。店の努力では動かせないので、
+#                       暖色で急かさずグレーにして区別する（廃棄・返品の検討対象）。
+#   booked  紫        先月ほかの店が予約したのに、今月もまだ残っている
+#                     ＝受け渡しが実行されていない。予約は月替わりで自動失効するため、
+#                       この取りこぼしは今まで誰にも見えていなかった。最優先で確認する。
+# ============================================================================
+
+# 滞留区分 → (画面用の背景色, 画面用の文字色, Excelの塗り色, 凡例の説明)
+#   ★文字色を黒で明示するのは、ダークテーマだと白文字×淡い背景で読めなくなるため
+#     （既存の _style_expiry と同じ理由）。
+STAGNATION_STYLES = {
+    'new':    ('',        '',        None,     '今月から載った品'),
+    'm2':     ('#FFF0B3', '#000000', 'FFF0B3', '2ヶ月目（引取候補店はいるのに動いていない）'),
+    'm3':     ('#FFCB7A', '#000000', 'FFCB7A', '3ヶ月目（そろそろ手を打つ）'),
+    'm4':     ('#F2925E', '#000000', 'F2925E', '4ヶ月目以上（最優先で動かす）'),
+    'nocand': ('#E4E4E4', '#000000', 'E4E4E4', '引取候補店がいない（廃棄・返品の検討）'),
+    'booked': ('#D6B3E8', '#000000', 'D6B3E8', '先月予約されたのに残っている（受け渡し未完了）'),
+}
+
+# 凡例に出す順番（画面の「色の見方」で使う）
+STAGNATION_LEGEND_ORDER = ['m2', 'm3', 'm4', 'booked', 'nocand']
+
+
+def stagnation_view(months, has_candidate, was_reserved):
+    """
+    滞留の状態から（区分, 画面に出す文字）を返す。
+
+      months        … 何ヶ月つづけて載っているか（今月だけなら 1）
+      has_candidate … 今月、引取候補店がいるか（True/False）
+      was_reserved  … 先月、どこかの店が予約していたか（True/False）
+
+    判定の優先順位（上が強い）：
+      1. 先月予約されたのに残っている  → booked（受け渡しの取りこぼし。最優先）
+      2. 今月から載った品              → new（塗らない）
+      3. 引取候補店がいない            → nocand（グレー。店のせいではない）
+      4. 2/3/4ヶ月目以上               → m2 / m3 / m4
+    """
+    try:
+        months = int(months)
+    except (TypeError, ValueError):
+        months = 1
+    if months < 1:
+        months = 1
+
+    # 1. 先月予約されたのに、今月もまだ残っている
+    if was_reserved:
+        return 'booked', '⚠ %dヶ月目・先月予約済' % months
+
+    # 2. 今月から載った品は塗らない（毎月ほとんどの行が新規なので、塗ると意味が薄れる）
+    if months <= 1:
+        return 'new', ''
+
+    # 3. 引き取れる店がそもそもいない品は、急かしても動かないのでグレーで区別する
+    if not has_candidate:
+        return 'nocand', '%dヶ月目（候補店なし）' % months
+
+    # 4. 候補店がいるのに動いていない＝今回いちばん見せたいところ
+    if months == 2:
+        return 'm2', '2ヶ月目'
+    if months == 3:
+        return 'm3', '3ヶ月目'
+    return 'm4', '%dヶ月目' % months
+
+
+# ============================================================================
 # Excel出力（コマンド版のExcelダウンロードと、アプリ版のExcelダウンロードで共用）
 # ============================================================================
 RED_FILL = PatternFill('solid', fgColor='FFC7CE')     # 期限切迫（赤系）
@@ -1164,13 +1260,17 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     ws.cell(row=1, column=1).font = Font(bold=True, color='7F6000')
 
     # ※末尾の『予約』は2026-07-28に追加した列（受け手の店が押さえた印）。
-    #   既存の列は順番も中身も変えていないので、旧版との照合は予約列を除いて行える。
+    #   ※末尾の『滞留』は2026-07-30に追加した列（何ヶ月つづけて載っているか）。
+    #   既存の列は順番も中身も変えていないので、旧版との照合は追加2列を除いて行える。
+    #   ★新しい列を末尾に足すのは、途中に差し込むと過去のExcelとの列位置が合わなくなるため。
     headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額',
                '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                '最終出庫日', '区分', '引取候補店', '参考:過剰だが使用中の店',
-               '6ヶ月出庫回数', '医薬品CD', '予約']
+               '6ヶ月出庫回数', '医薬品CD', '予約', '滞留']
     # 「参考」列は本命（引取候補店）とはっきり区別するため、見出し・セルをグレーで塗る
     ref_col_idx = headers.index('参考:過剰だが使用中の店') + 1  # 1始まり
+    # 「滞留」列は行の色（＝期限のこと）とは別に、滞留区分ごとの色で塗る
+    stag_col_idx = headers.index('滞留') + 1  # 1始まり
     hr = 2
     for ci, h in enumerate(headers, start=1):
         c = ws.cell(row=hr, column=ci, value=h)
@@ -1183,7 +1283,8 @@ def write_excel(path, base_ym_disp, csv_base_disp,
                 pr['在庫金額'], pr['過剰在庫区分'], pr['不動区分'], pr['期限切迫区分'],
                 pr['有効期限'], pr['ロットNO'], pr['最終出庫日'], pr['区分'],
                 pr['引取候補店'], pr['参考:過剰だが使用中の店'],
-                pr['6ヶ月出庫回数'], pr['医薬品CD'], pr.get('予約', '')]
+                pr['6ヶ月出庫回数'], pr['医薬品CD'], pr.get('予約', ''),
+                pr.get('滞留', '')]
         for ci, v in enumerate(vals, start=1):
             cell = ws.cell(row=r, column=ci, value=v)
             cell.border = BORDER
@@ -1198,11 +1299,16 @@ def write_excel(path, base_ym_disp, csv_base_disp,
             fill = YELLOW_FILL
         if fill:
             for ci in range(1, len(headers) + 1):
-                if ci == ref_col_idx:
+                if ci in (ref_col_idx, stag_col_idx):
                     continue
                 ws.cell(row=r, column=ci).fill = fill
         # 「参考」列は行の色に関係なく常にグレー＝本命候補と一目で区別できるようにする
         ws.cell(row=r, column=ref_col_idx).fill = REF_FILL
+        # 「滞留」列は行の色（期限のこと）とは別系統の色で塗る。
+        #   行の赤／黄に上書きされないよう、上の塗りつぶしから除外している。
+        stag_color = STAGNATION_STYLES.get(pr.get('_滞留区分', 'new'), (None, None, None, ''))[2]
+        if stag_color:
+            ws.cell(row=r, column=stag_col_idx).fill = PatternFill('solid', fgColor=stag_color)
         r += 1
     ws.auto_filter.ref = '%s%d:%s%d' % ('A', hr, get_column_letter(len(headers)), max(hr, r - 1))
     ws.freeze_panes = 'A%d' % (hr + 1)
