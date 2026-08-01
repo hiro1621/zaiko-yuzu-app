@@ -292,7 +292,9 @@ def _df(rows, columns=None):
 
 
 # 小数第2位まで表示する数値列（在庫数・在庫金額など）
-_NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数']
+#   ★2026-08-01：④の列を「出し手の在庫数／自店の在庫数」に分けたので、その2列も同じ体裁にする。
+#     これらの列名は④（と別枠）にしか出ないので、②③の見た目には影響しない。
+_NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数', '出し手の在庫数', '自店の在庫数']
 
 
 def _style_expiry(df, paint=True, stag_levels=None):
@@ -466,6 +468,20 @@ VIEW_EXPIRY = 'expiry'    # ③自店の期限切迫品
 VIEW_RECEIVE = 'receive'  # ④自店が引き取れる薬
 VIEW_ORDER = [VIEW_DEAD, VIEW_EXPIRY, VIEW_RECEIVE]
 
+# ④の予約で選ぶ「受取時期」（今すぐ／1〜3ヶ月後の4択・最大3ヶ月・本間部長確定）。
+#   実際に予約する月は、品ごとの有効期限キャップ（app_logic.pickup_cap）で頭打ちにする。
+PICKUP_OFFSETS = [0, 1, 2, 3]
+PICKUP_LABELS = {0: '今すぐ', 1: '1ヶ月後', 2: '2ヶ月後', 3: '3ヶ月後'}
+
+
+def _pickup_offset_selector(key):
+    """ 受取時期（今すぐ／1〜3ヶ月後）を選ぶドロップダウンを描き、選ばれたオフセット（0〜3）を返す。 """
+    return st.selectbox(
+        '受取時期（いつ引き取るか）', PICKUP_OFFSETS,
+        format_func=lambda o: PICKUP_LABELS[o], key=key,
+        help='いま在庫があって使い切ってから引き取りたいときは、先の月を選べます（最大3ヶ月）。'
+             '有効期限が近い品は、期限の月より先は選べません（自動で早めます）。')
+
 
 def view_switcher(n_dead, n_expiry, n_receive):
     """
@@ -516,8 +532,8 @@ def receive_section(view_receive, my_store, backend, reservations, ym):
         st.info('いま他店から引き取れる品はありません。')
         return
 
-    # 内部用の列（_出し手店・_key・滞留区分など）は画面に出さない
-    hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数')
+    # 内部用の列（_出し手店・_key・滞留区分・有効期限キャップ用など）は画面に出さない
+    hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数', '_有効期限')
     df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_receive])
     stag_levels = [r.get('_滞留区分', 'new') for r in view_receive]
     event = st.dataframe(
@@ -533,11 +549,12 @@ def receive_section(view_receive, my_store, backend, reservations, ym):
     picked = _selected_rows(event)
     checked = [view_receive[i] for i in picked if 0 <= i < len(view_receive)]
     n = len(checked)
+    offset = _pickup_offset_selector('pickup_offset_receive')
     if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve', disabled=(n == 0)):
-        _save_reservations(backend, my_store, ym, checked, reservations)
+        _save_reservations(backend, my_store, ym, checked, reservations, offset)
 
 
-def _save_reservations(backend, my_store, ym, checked, reservations):
+def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
     """
     選ばれた品を予約として保存する。
 
@@ -547,6 +564,10 @@ def _save_reservations(backend, my_store, ym, checked, reservations):
       先の予約を上書きしてしまい、どちらも「自分が予約できた」と思い込む事故になる。
       すでに他店が押さえていた品は保存せず、赤でその品名と店名を知らせる。
       残り（重複していない品）はそのまま保存する＝全部やり直しにはしない。
+
+    ★2026-08-01：受取時期（offset＝今から何ヶ月後に引き取るか・0〜3）を受け取る。
+      品ごとに有効期限キャップ（app_logic.pickup_cap）で頭打ちにしてから受取予定月を決める
+      ＝期限の月より先の受け取りは選ばせない（自動で早める）。早めた品は下で知らせる。
     """
     try:
         latest_rows = backend.load_reservations()
@@ -554,8 +575,20 @@ def _save_reservations(backend, my_store, ym, checked, reservations):
         latest_rows = list(reservations)   # 読み直せなければ画面の内容で進む
 
     now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
-    picked = [dict(d, _now=now) for d in checked]
+    picked = []
+    clamped = []   # 有効期限が近く、受取時期を早めた品（薬品名, 実際の受取ラベル）
+    for d in checked:
+        cap = app_logic.pickup_cap(d.get('_有効期限', d.get('有効期限', '')), ym)
+        eff_off = max(0, min(int(offset), cap))
+        if eff_off < int(offset):
+            clamped.append((d.get('薬品名', ''), yuzu_core.pickup_label(eff_off)))
+        picked.append(dict(d, _now=now, _受取予定月=yuzu_core.ym_add(ym, eff_off)))
     plan = app_logic.plan_reservations(latest_rows, my_store, ym, picked)
+
+    if clamped:
+        st.info('  \n'.join(
+            ['次の品は有効期限が近いため、受取時期を早めて予約しました：']
+            + ['%s → 受取：%s' % (name, lab) for name, lab in clamped]))
 
     if plan['added']:
         backend.save_reservations(plan['keep'])
@@ -577,15 +610,51 @@ def _save_reservations(backend, my_store, ym, checked, reservations):
         st.rerun()
 
 
-def reserved_section(view_reserved, my_store, backend, reservations):
-    """ 「予約中の品」を折りたたみで出し、選んで取り消せるようにする（②③の除外と同じ操作感）。 """
+def receive_ref_section(view_ref, my_store, backend, reservations, ym):
+    """
+    ④の別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修・2026-08-01）。
+      ・自店もその薬を使っているが、いま在庫を余らせている品（tier③参考）。今すぐ引き取ると
+        移した先で新しいデッドを作りかねないので、本来の④からは外している。
+      ・ここから「1〜3ヶ月後」の受取予定月つきで予約できる（本命の狙い）。
+      ・④本体と同じ方式（st.dataframe + 行選択）・同じ2列構成（出し手の在庫数＋自店の在庫数）。
+        ★本来の④に出る品目は1件も変えない（増えるのはこの別枠だけ）。
+    """
+    with st.expander('いまは在庫があるが、先になら引き取れる薬（%d件）' % len(view_ref)):
+        st.caption('自店もこの薬を使っていますが、いまは在庫を余らせているため、今すぐ引き取ると'
+                   'かえって自店で新しいデッドを作りかねない品です。'
+                   'いまの在庫を使い切る先の時期（1〜3ヶ月後）を選んで予約できます。'
+                   '数量の相談・連絡は従来どおり電話・デスクネッツでお願いします。')
+        if not view_ref:
+            st.info('該当する品はありません。')
+            return
+        # ④本体と同じ隠し列
+        hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数', '_有効期限')
+        df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_ref])
+        stag_levels = [r.get('_滞留区分', 'new') for r in view_ref]
+        event = st.dataframe(
+            _style_expiry(df, paint=False, stag_levels=stag_levels),
+            hide_index=True, width='stretch', on_select='rerun',
+            selection_mode='multi-row', key='table_receive_ref')
+        stagnation_legend(view_ref)
+
+        picked = _selected_rows(event)
+        checked = [view_ref[i] for i in picked if 0 <= i < len(view_ref)]
+        n = len(checked)
+        offset = _pickup_offset_selector('pickup_offset_ref')
+        if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve_ref', disabled=(n == 0)):
+            _save_reservations(backend, my_store, ym, checked, reservations, offset)
+
+
+def reserved_section(view_reserved, my_store, backend, reservations, result, latest):
+    """ 「予約中の品」を折りたたみで出し、選んで取り消せるようにする（②③の除外と同じ操作感）。
+        ★2026-08-01：一番下に「引取依頼書（出し手店ごとのExcel）」を作るボタンを足した（④の改修）。 """
     with st.expander('予約中の品（%d件）＝自店が引き取ると押さえている薬' % len(view_reserved)):
         if not view_reserved:
             st.write('いまは1件もありません。')
             return
         st.caption('予約をやめる品を左端の□で選び、下のボタンを押してください。'
                    '取り消すと、その品はまたほかの店の一覧にも出るようになります。')
-        hidden = ('_出し手店', '_key')
+        hidden = ('_出し手店', '_key', '_受取予定月')
         df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden}
                            for r in view_reserved])
         event = st.dataframe(
@@ -595,10 +664,38 @@ def reserved_section(view_reserved, my_store, backend, reservations):
         checked = [view_reserved[i] for i in picked if 0 <= i < len(view_reserved)]
         n = len(checked)
         if st.button('予約を取り消す（%d件）' % n, key='btn_unreserve', disabled=(n == 0)):
-            keep = app_logic.cancel_reservations(reservations, my_store, checked)
+            keep = app_logic.cancel_reservations(reservations, my_store, checked, latest)
             backend.save_reservations(keep)
+            st.session_state.pop('pickup_xls', None)   # 予約が変わったので作りかけの帳票は捨てる
             st.success('%d件の予約を取り消しました。' % (len(reservations) - len(keep)))
             st.rerun()
+
+        # ---- 引取依頼書（出し手店ごとのExcel）＝FAX・デスクネッツ用 ----
+        #   ★st.download_button はページを描くたびに中身を作るので、
+        #     「作成する」ボタンを押したときだけ生成し、そのあとダウンロードボタンを出す2段にする。
+        #   ★画面最下部の「この結果をExcel（4シート）でダウンロード」（全店分析用）とは
+        #     場所も名前も混ぜない（こちらは自店の発注用の紙）。
+        st.divider()
+        st.caption('予約した品を、もらう先（出し手店）ごとにまとめた「引取依頼書」をExcelで作れます'
+                   '（A4横・出し手店ごとにシート・FAX/デスクネッツ用）。'
+                   '数量は在庫まるごとを初期値にしているので、必要に応じて紙の上で書き換えてください。')
+        if st.button('引取依頼書を作成する', key='btn_make_pickup'):
+            try:
+                st.session_state['pickup_xls'] = app_logic.pickup_request_bytes(
+                    result, my_store, reservations, latest)
+            except Exception as e:
+                st.session_state.pop('pickup_xls', None)
+                st.warning('引取依頼書の作成に失敗しました：%s' % e)
+        if st.session_state.get('pickup_xls'):
+            if latest:
+                pk_name = '引取依頼書_%s_%s-%s.xlsx' % (my_store, latest[:4], latest[4:6])
+            else:
+                pk_name = '引取依頼書_%s.xlsx' % my_store
+            st.download_button(
+                '⬇ 出し手店ごとの引取依頼書（Excel）を作成',
+                data=st.session_state['pickup_xls'], file_name=pk_name,
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                key='dl_pickup')
 
 
 def excluded_section(my_store, backend, exclusions):
@@ -987,6 +1084,8 @@ def results_section(backend, stores, latest, index):
             view_a = app_logic.build_view_a(result, my_store)       # 種別＝デッド
             view_expiry = app_logic.build_view_expiry(result, my_store)  # 種別＝期限切迫
             view_receive = app_logic.build_view_receive(result, my_store)  # ④受け手ビュー
+            # ④の別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修・use_ref）
+            view_receive_ref = app_logic.build_view_receive_ref(result, my_store)
             # 自店が押さえている品（予約中）。④の下に折りたたみで出し、ここから取り消せる。
             view_reserved = app_logic.build_view_reserved(result, my_store, reservations, latest)
 
@@ -1032,7 +1131,10 @@ def results_section(backend, stores, latest, index):
             else:
                 # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
                 receive_section(view_receive, my_store, backend, reservations, latest)
-                reserved_section(view_reserved, my_store, backend, reservations)
+                # ④の下に別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修）
+                receive_ref_section(view_receive_ref, my_store, backend, reservations, latest)
+                # さらに下に「予約中の品」＋引取依頼書ボタン（④の改修）
+                reserved_section(view_reserved, my_store, backend, reservations, result, latest)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()

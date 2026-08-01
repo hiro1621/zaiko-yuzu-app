@@ -122,6 +122,13 @@ CONFIG = {
     'max_candidates': 5,
     # 有効期限「1年以内」を黄色でハイライトする閾値（月）
     'expiry_yellow_months': 12,
+
+    # 失効予約（当月＞受取予定月＝もう受け取れない予約）を _予約 タブから自動で消すか。
+    #   既定＝False（消さない）。オフの間は「画面内の有効判定だけで無害化」する
+    #   ＝失効予約は表示・マッチングに一切効かないが、_予約 タブには残しておく。
+    #   ★True にした場合でも、掃除専用の書き込みは作らない＝予約／取消の“保存に相乗り”して
+    #     落とす（Google APIの呼び出し回数を増やさないため。plan_reservations / cancel_reservations 参照）。
+    'reservation_autoclean': False,
 }
 
 # 必須列（このどれかが欠けている店はスキップ）
@@ -204,6 +211,39 @@ def fmt_months(m):
     """ 消化目安の月数を読みやすく（小数1桁、整数なら整数で） """
     m = round(m, 1)
     return str(int(m)) if m == int(m) else str(m)
+
+
+# --- 年月（YYYYMM文字列）の計算。予約の「受取予定月」で使う（2026-08-01 追加）---
+#   ★日付(date)ではなく年月(YYYYMM6桁の文字列)で扱うのは、予約の受取時期が「◯ヶ月後」という
+#     月単位の約束であり、対象年月・受取予定月ともに6桁文字列で保管しているため。
+def ym_offset(base_ym, target_ym):
+    """ base_ym から target_ym までの月数（target が先なら正）。どちらも 'YYYYMM' の6桁文字列。
+        読めない値が来たら 0 を返す（画面が落ちないように）。 """
+    try:
+        by, bm = int(str(base_ym)[:4]), int(str(base_ym)[4:6])
+        ty, tm = int(str(target_ym)[:4]), int(str(target_ym)[4:6])
+    except (ValueError, TypeError):
+        return 0
+    return (ty - by) * 12 + (tm - bm)
+
+
+def ym_add(base_ym, months):
+    """ 'YYYYMM' に months ヶ月を足した 'YYYYMM' を返す。読めない値ならそのまま返す。 """
+    try:
+        y, m = int(str(base_ym)[:4]), int(str(base_ym)[4:6])
+    except (ValueError, TypeError):
+        return str(base_ym or '')
+    total = y * 12 + (m - 1) + int(months)
+    return '%04d%02d' % (total // 12, total % 12 + 1)
+
+
+def pickup_label(offset):
+    """ 受取までの月数（0=今すぐ）を画面に出す短い言葉にする。0以下は『今すぐ』、それ以外は『Nヶ月後』。 """
+    try:
+        offset = int(offset)
+    except (ValueError, TypeError):
+        offset = 0
+    return '今すぐ' if offset <= 0 else '%dヶ月後' % offset
 
 
 def fmt_qty(x):
@@ -714,13 +754,29 @@ def _reserved_by(reserved, source_store, ex_key):
 
 
 def _reserve_label(reserved, source_store, ex_key):
-    """ Excel／Gシートの『予約』列に入れる文字列（例：'東立石 2026/07/28 11:40'）。 """
+    """ Excel／Gシートの『予約』列に入れる文字列（例：'東立石 2026/07/28 11:40（受取：3ヶ月後）'）。
+        ★2026-08-01：受取時期（今すぐ／Nヶ月後）を末尾に足した。予約を翌月以降へ持ち越せる
+          ようになったので、Gシート・Excel の記録だけを見ても「いつ引き取るか」が分かるようにする。 """
     if not reserved:
         return ''
     r = reserved.get((source_store, ex_key))
     if not r:
         return ''
-    return ('%s %s' % (r.get('店', ''), r.get('日時', ''))).strip()
+    base = ('%s %s' % (r.get('店', ''), r.get('日時', ''))).strip()
+    pickup = r.get('受取ラベル', '')
+    if pickup:
+        base = '%s（受取：%s）' % (base, pickup)
+    return base
+
+
+def _reserved_pickup(reserved, source_store, ex_key):
+    """ その品の予約の『受取ラベル』（例 '3ヶ月後'／'今すぐ'）を返す（予約が無ければ空文字）。
+        受取ラベルは reservation_map（当月を知っている app_logic 側）で作って渡してもらう
+        ＝当月からの月数を計算できる場所を1つに保ち、ここ（yuzu_core）は受け取るだけにする。 """
+    if not reserved:
+        return ''
+    r = reserved.get((source_store, ex_key))
+    return (r or {}).get('受取ラベル', '') or ''
 
 
 def build_candidate_names(key, entries):
@@ -758,13 +814,21 @@ def build_candidate_entries(by_key, key, source_store, supply_qty, exp_date, bas
           ③参考（過剰だが使用中／use_ref）は含めません
           （本間部長確定：④の「なぜ候補か」は 不足中／使用中 の2値）。
 
-        返す辞書は「候補ごとに違う情報」だけに絞ります（薬品名・在庫数などの品目情報は持たせません）。
+        返す辞書は「候補ごとに違う情報」だけに絞ります（薬品名・出し手の在庫数などの品目情報は持たせません）。
           理由：同じ値を2箇所で作ると、将来どちらかを直したときに静かにズレます。
                 品目情報は呼び出し側（compute_matching）が提案行から借りて付け足します（値の出どころを1つに保つ）。
 
+        ★2026-08-01 追加：候補ごとに違う情報として『自店の在庫数』を持たせます（④の新しい列）。
+          値は候補店 e の e['over_qty'] を借ります。over_qty は store_key_info で組んだ
+          「その(店,キー)の在庫数（＝stock_qty）」で、同じ(店,キー)が複数行（ロット別様式）でも
+          合算済みです。★ここで e['zaiko'] を使ってはいけません。zaiko は store_key_info の
+          else 分岐（同じ(店,キー)の2行目以降）で合算されず捨てられており、ロット別で複数行に
+          分かれている店では過少になります。over_qty は合算されているので正しい在庫数になります。
+
         戻り値は辞書のリスト（候補が無ければ空リスト）：
           {'引取候補店': 店名, 'なぜ候補か': '不足中' or '使用中',
-           '_tier_order': 0(不足中) or 1(使用中), '消化目安': 目安文字列}
+           '_tier_order': 0(不足中) or 1(使用中), '消化目安': 目安文字列,
+           '自店の在庫数': 候補店(=④では自店)がいまその品を持っている在庫数}
         ※ key が空（医薬品コード無し・突合対象外）のときは空リストを返します
           （build_candidates が '（医薬品コード無し・突合対象外）' を返すのと同じケース）。 """
     if not key:
@@ -809,12 +873,72 @@ def build_candidate_entries(by_key, key, source_store, supply_qty, exp_date, bas
     L = CONFIG['tier_labels']
     out = []
     # ①不足中（_tier_order=0）を先に、②使用中（_tier_order=1）を後に並べる（既存の本命順と同じ）
+    #   ★『自店の在庫数』＝候補店 e の over_qty（合算済みの在庫数）。zaiko は使わない（上の docstring 参照）。
     for e in short:
         out.append({'引取候補店': e['store'], 'なぜ候補か': L['short'],
-                    '_tier_order': 0, '消化目安': detail_for(e)})
+                    '_tier_order': 0, '消化目安': detail_for(e), '自店の在庫数': e['over_qty']})
     for e in use_ok:
         out.append({'引取候補店': e['store'], 'なぜ候補か': L['use_ok'],
-                    '_tier_order': 1, '消化目安': detail_for(e)})
+                    '_tier_order': 1, '消化目安': detail_for(e), '自店の在庫数': e['over_qty']})
+    return out
+
+
+def build_candidate_entries_ref(by_key, key, source_store, supply_qty, exp_date, base_date):
+    """ ③参考（過剰だが使用中／use_ref）を「候補ごとに1件の辞書」で丸め無しで返す（2026-08-01 追加）。
+        ④の別枠『いまは在庫があるが、先になら引き取れる薬』の土台です。
+
+        build_candidate_entries（①不足中②使用中）と対になる関数で、こちらは use_ref だけを拾います。
+          use_ref ＝ その薬を使ってはいる（6ヶ月出庫回数>0）が、受け取り側も過剰保有している店。
+          今すぐ送ると移した先で新しいデッドを作りかねないため、本来の④（今すぐ引き取れる薬）からは
+          意図的に除外されている（2026-07-27 本間部長確定）。この判断は覆さず、別枠に分けて
+          「今は在庫があるが、いまの在庫を使い切る先の時期なら引き取れる」品として出します。
+
+        ★build_candidate_entries と同じく _join_with_overflow（丸め）を通しません。
+          上位5店で『他N店』に丸めた文字列から作ると候補が漏れ、しかも画面に『該当なし』と出て
+          漏れに気づけないため、必ず丸め前の構造化データから作ります。
+
+        戻り値は辞書のリスト（候補が無ければ空リスト）：
+          {'引取候補店': 店名, 'なぜ候補か': '参考:過剰だが使用中',
+           '_tier_order': 2, '消化目安': 目安文字列, '自店の在庫数': 候補店の在庫数}
+        ※ 自店の在庫数の取り方（over_qty を借りる・zaiko は使わない）は build_candidate_entries と同じ。 """
+    if not key:
+        return []
+    entries = by_key.get(key, [])
+    use_ref = []   # ③ 使用中(過剰)：使っているが受け取り側も過剰保有＝参考
+    for e in entries:
+        if e['store'] == source_store:
+            # 自店は引取候補にしない（build_candidates と同じガード）
+            continue
+        if e['shortage']:
+            # 不足中は本来の④（build_candidate_entries）の担当。ここでは拾わない
+            continue
+        if e['usage_cnt6'] > 0 and e['holds_excess']:
+            use_ref.append(e)
+
+    def pace(e):
+        # 月あたり消化量。薬VANの出庫数はマイナス＝出庫なので、絶対値をとってから6で割る。
+        return abs(e['usage_qty6']) / 6.0
+
+    def detail_for(e):
+        # ★build_candidates / build_candidate_entries 内の detail_for と一字一句同じ計算式
+        #   （既存2関数がすでに同じ式を持ち「必ず同じにする」約束のため、それに合わせる）。
+        p = pace(e)
+        if p <= 0:
+            return '消化ペース不明'
+        months = supply_qty / p
+        if exp_date and base_date:
+            remain = month_diff(base_date, exp_date)
+            if months <= remain:
+                return '約%sヶ月で消化可' % fmt_months(months)
+            return '約%sヶ月・期限内消化不可' % fmt_months(months)
+        return '約%sヶ月' % fmt_months(months)
+
+    use_ref.sort(key=lambda e: -pace(e))
+    L = CONFIG['tier_labels']
+    out = []
+    for e in use_ref:
+        out.append({'引取候補店': e['store'], 'なぜ候補か': L['use_ref'],
+                    '_tier_order': 2, '消化目安': detail_for(e), '自店の在庫数': e['over_qty']})
     return out
 
 
@@ -833,12 +957,15 @@ def compute_matching(stores, excluded=None, reserved=None):
         自己検算のすべてから同時に消える（どこかに残って他店から問い合わせが来る事故を防ぐ）。
 
         reserved … 受け手の店が「この品はうちが引き取ります」と予約した品。
-        {(出し手店, exclusion_key(row)): {'店': 予約した店, '日時': 'YYYY/MM/DD HH:MM'}, ...} の形。
+        {(出し手店, exclusion_key(row)): {'店': 予約した店, '日時': 'YYYY/MM/DD HH:MM',
+                                          '受取予定月': 'YYYYMM', '受取ラベル': '3ヶ月後'|'今すぐ'}, ...} の形。
+          ★受取予定月・受取ラベルは2026-08-01追加（予約を最大3ヶ月先まで持ち越せるように）。
+            当月からの月数を計算できる app_logic.reservation_map（当月を知っている場所）で作って渡す。
         ★除外と違い、ここでは出し手から取り除かない（＝件数・金額・自己検算は1円も動かない）。
           予約は「もう相手が決まった」という印であって、品が消えるわけではないため。
-            ・出し手の②③  … 引取候補店の欄が「◯◯が引取予定」に変わる（誰に渡すか分かる）
+            ・出し手の②③  … 引取候補店の欄が「◯◯が引取予定（受取：3ヶ月後）」に変わる（誰にいつ渡すか分かる）
             ・受け手の④    … 予約した店だけに残り、ほかの店の④からは消える
-            ・Excel／Gシート… 融通提案シートの『予約』列に「店名 日時」が入る
+            ・Excel／Gシート… 融通提案シートの『予約』列に「店名 日時（受取：◯）」が入る
           そのため予約キーは除外キー（exclusion_key）と同じものを使う＝品目の呼び名を1つに保つ。 """
     excluded = set(excluded or ())
     reserved = dict(reserved or {})
@@ -912,6 +1039,10 @@ def compute_matching(stores, excluded=None, reserved=None):
     proposal_rows = []
     # ④受け手ビューの土台：引取候補店を「候補ごとに1件」で貯めるリスト（丸め無し・下のループで足す）
     candidate_rows = []
+    # ④の別枠『いまは在庫があるが、先になら引き取れる薬』の土台（use_ref＝過剰だが使用中）。
+    #   ★candidate_rows（本来の④）とは完全に別のリストにして、既存④に出る品目は1件も変えない。
+    #   ★このリストは Gシート／Excel には書き戻さない（結果4タブの payload に含めない）。
+    candidate_rows_ref = []
     legal_excluded_count = 0
     legal_excluded_amt = 0.0
     nokey_overstock = 0
@@ -955,6 +1086,10 @@ def compute_matching(stores, excluded=None, reserved=None):
             #   両方をここから作る（同じ候補を2度計算しない／出どころを1つに保つ）。
             cand_entries = build_candidate_entries(
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
+            # ④の別枠『先になら引き取れる薬』用の候補（use_ref＝過剰だが使用中）。丸め無し。
+            #   本来の④（cand_entries）とは別のリストへ入れるので、既存④の品目には一切影響しない。
+            cand_entries_ref = build_candidate_entries_ref(
+                by_key, key, s['name'], over_qty, exp, s['base_date'])
             remain = month_diff(s['base_date'], exp) if exp else None
             pr = {
                 '出し手店': s['name'], '種別': supplier_category(row),
@@ -971,10 +1106,12 @@ def compute_matching(stores, excluded=None, reserved=None):
                 '6ヶ月出庫回数': round(usage_cnt6(row), 2), '医薬品CD': key or '',
                 '_ex_key': exclusion_key(row),
                 # 予約（受け手の店が「うちが引き取ります」と押さえた印）。
-                #   '予約'   … Excel／Gシートに出す文字列（例：'東立石 2026/07/28 11:40'）
+                #   '予約'   … Excel／Gシートに出す文字列（例：'東立石 2026/07/28 11:40（受取：3ヶ月後）'）
                 #   '_予約店' … 画面のしぼり込みに使う店名だけ（予約が無ければ空文字）
+                #   '_予約受取' … 受取時期のラベル（例 '3ヶ月後'／'今すぐ'）。②③画面の「◯◯が引取予定」に足す。
                 '予約': _reserve_label(reserved, s['name'], exclusion_key(row)),
                 '_予約店': _reserved_by(reserved, s['name'], exclusion_key(row)),
+                '_予約受取': _reserved_pickup(reserved, s['name'], exclusion_key(row)),
                 '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
                 # 滞留（何ヶ月つづけて載っているか）。ここでは「今月から」を初期値として置き、
                 #   過去の記録がある場合だけ app_logic.apply_stagnation が上書きする。
@@ -996,6 +1133,9 @@ def compute_matching(stores, excluded=None, reserved=None):
                     '消化目安':   ce['消化目安'],   '_tier_order': ce['_tier_order'],
                     '出し手店': pr['出し手店'], '薬品名': pr['薬品名'], '単位': pr['単位'],
                     '在庫数':   pr['在庫数'],   '在庫金額': pr['在庫金額'],
+                    # ★『自店の在庫数』＝候補店（④では自店）がいまその品を持っている在庫数。
+                    #   候補ごとに違う情報なので候補 ce から借りる（品目情報は上の pr から借りる）。
+                    '自店の在庫数': round(ce['自店の在庫数'], 2),
                     '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
                     '_remain':  remain,
                     # 滞留は出し手の提案行と同じ値を持たせる（④受け手の画面にも出すため）。
@@ -1008,6 +1148,23 @@ def compute_matching(stores, excluded=None, reserved=None):
                     # ★予約を保存するときのキー。(出し手店, _ex_key) で1件を特定する。
                     #   ここで渡しておかないと、④から予約したときにキーが空のまま保存され、
                     #   読み込み時に捨てられて「予約したのに消える」ことになる。
+                    '_ex_key': pr['_ex_key'],
+                })
+            # ④の別枠『先になら引き取れる薬』の土台。作りは candidate_rows とそっくりだが、
+            #   拾う候補が use_ref（過剰だが使用中）だけ＝別リスト candidate_rows_ref に貯める。
+            #   ★これにより既存④（candidate_rows）の中身はバイト単位で不変のまま、別枠を足せる。
+            for ce in cand_entries_ref:
+                candidate_rows_ref.append({
+                    '引取候補店': ce['引取候補店'], 'なぜ候補か': ce['なぜ候補か'],
+                    '消化目安':   ce['消化目安'],   '_tier_order': ce['_tier_order'],
+                    '出し手店': pr['出し手店'], '薬品名': pr['薬品名'], '単位': pr['単位'],
+                    '在庫数':   pr['在庫数'],   '在庫金額': pr['在庫金額'],
+                    '自店の在庫数': round(ce['自店の在庫数'], 2),
+                    '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
+                    '_remain':  remain,
+                    '滞留': pr['滞留'], '_滞留月数': pr['_滞留月数'],
+                    '_滞留区分': pr['_滞留区分'], '_先月予約': pr['_先月予約'],
+                    '_予約店': pr['_予約店'],
                     '_ex_key': pr['_ex_key'],
                 })
     proposal_rows.sort(key=lambda r: -r['在庫金額'])
@@ -1110,6 +1267,9 @@ def compute_matching(stores, excluded=None, reserved=None):
         'proposal_rows': proposal_rows,
         # ④受け手ビュー用：引取候補店を「1件1行」で持つ丸め無しの構造化データ（既存キーは一切変えず、増やすだけ）
         'candidate_rows': candidate_rows,
+        # ④の別枠『いまは在庫があるが、先になら引き取れる薬』用（use_ref）。本来の④とは完全分離。
+        #   ★Gシート／Excel には書き戻さない（結果4タブの payload には含めない）。
+        'candidate_rows_ref': candidate_rows_ref,
         'shortage_rows': shortage_rows,
         'store_names': store_names,
         'matrix_keys': matrix_keys,
@@ -1387,3 +1547,168 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     _auto_width(ws4, headers4)
 
     wb.save(path)
+
+
+# ============================================================================
+# 引取依頼書（帳票）Excel ＝ 受け手（引き取る側）が予約した品を、出し手店ごとの
+#   シートにまとめた「もらいに行くための紙」。デスクネッツ貼付・FAX・電話しながらの参照用。
+# ----------------------------------------------------------------------------
+# 2026-08-01 追加。★write_excel（全店4シート・画面/分析用）とは別物です。
+#   ・write_excel は絶対に無編集（品質管理部が毎回「全セル差分ゼロ」で回帰を取っている）。
+#   ・こちらは新設。印刷設定（A4横・横1ページ）を入れるのはこちらのシートだけ。
+#     write_excel に印刷設定を足すと回帰の前提が変わるため、あちらには入れない。
+#
+# ★FAX（白黒）運用の判断（本間部長 追加指示 2026-08-01）
+#   FAXは白黒なので、期限切迫の赤（RED_FILL）や1年以内の黄（YELLOW_FILL）で行を塗ると、
+#   送った先ではどちらも同じ灰色の塊になり、かえって字が読みにくくなります。
+#   そこで【この帳票では期限を色で塗らず】、期限が近い品は『有効期限』欄の文字を太字にして
+#   伝えます（塗りに意味を持たせない）。見出し行だけは薄い色（HEADER_FILL）で、
+#   白黒でも「ここが列名」と分かる程度に留めます。
+#   （既存の小道具 HEADER_FILL / BORDER / HEADER_FONT / _auto_width は呼ぶだけで使い回し、
+#     RED_FILL / YELLOW_FILL は意味づけには使いません。）
+# ============================================================================
+
+# 引取依頼書の明細列（この順・本間部長確定）。在庫金額は載せない（発注用の紙なので）。
+PICKUP_REQUEST_COLS = ['薬品名', '単位', '数量', '有効期限', 'ロットNO', '医薬品CD',
+                       '受取予定月', '区分', '状態']
+
+# 各列の幅（文字数）。★_auto_width の結果をそのまま使わず、A4横に収まる上限を決め打ちする。
+#   合計が A4横の印刷可能幅（余白を引いた実寸）に収まることを、生成後に数値で検算する
+#   （過去に図の表で右端が枠外に切れた事故があり、列幅合計を枠内に収める検算で解決した）。
+PICKUP_REQUEST_WIDTHS = {
+    '薬品名': 28, '単位': 6, '数量': 8, '有効期限': 12, 'ロットNO': 14,
+    '医薬品CD': 14, '受取予定月': 16, '区分': 10, '状態': 22,
+}
+
+# Excelのシート名に使えない文字。将来の飛鳥22店追加に備えた保険（現行14店では発動しない）。
+_SHEET_NAME_BAD_CHARS = set('[]:*?/\\')
+
+
+def _safe_sheet_name(name):
+    """ Excelのシート名として安全な名前にする：禁止文字 []:*?/\\ を除き、31文字以内に切る。
+        ★現行14店（東大泉／海浜幕張／…／下落合）はすべて禁止文字なし・31文字以内で、この関数は
+          実質何もしない。将来 飛鳥22店などを足したときに黙って壊れないための保険。 """
+    s = ''.join(ch for ch in str(name) if ch not in _SHEET_NAME_BAD_CHARS).strip()
+    if not s:
+        s = 'シート'
+    return s[:31]
+
+
+def write_pickup_request_excel(path_or_buf, data):
+    """ 引取依頼書Excelを書き出す（FAX・デスクネッツ用）。
+        data … app_logic.build_pickup_request の戻り：
+          {'my_store': 自店名, 'ym': 'YYYYMM',
+           'sheets': [{'出し手店': 店名,
+                       'rows': [{'薬品名','単位','数量','有効期限','ロットNO','医薬品CD',
+                                 '受取予定月','区分','状態','_期限強調'(bool)}, ...]}, ...]}
+        ・シート＝出し手店ごと（さと和光シート／東立石シート…）。シート名は出し手店名そのまま。
+        ・PDFは作らない（Excel 1ファイル）。ファイル名は呼び出し側で付ける。 """
+    from openpyxl.worksheet.page import PageMargins
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    wb = Workbook()
+    wb.remove(wb.active)   # 既定の空シートは消し、出し手店ごとに作り直す
+
+    my_store = data.get('my_store', '')
+    ym = data.get('ym', '')
+    ym_disp = ('%s年%s月' % (ym[:4], ym[4:6])) if (ym and len(str(ym)) >= 6) else '不明'
+    today = datetime.date.today().strftime('%Y/%m/%d')
+
+    ncol = len(PICKUP_REQUEST_COLS)
+    last_col = get_column_letter(ncol)
+    # FAXで潰れないよう本文は10pt（9pt以上の目安を満たす）。太字は期限強調用。
+    body_font = Font(size=10)
+    body_bold = Font(size=10, bold=True)
+
+    used_names = set()
+    for sheet in data.get('sheets', []):
+        # --- シート名（禁止文字除去・31文字・重複回避）---
+        title = _safe_sheet_name(sheet.get('出し手店', ''))
+        base = title
+        n = 2
+        while title in used_names:                 # 万一同名になったら連番（現行14店では起きない）
+            title = '%s%d' % (base[:28], n)
+            n += 1
+        used_names.add(title)
+        ws = wb.create_sheet(title=title)
+
+        # --- 上部ヘッダー欄（罫線付き・横幅いっぱいに結合）---
+        r = 1
+        tcell = ws.cell(row=r, column=1, value='引取依頼書')
+        tcell.font = Font(size=14, bold=True)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+        r += 1
+        for text in ['依頼元（引き取る店）：%s' % my_store,
+                     '出し手店（もらう先）：%s' % sheet.get('出し手店', ''),
+                     '作成日：%s' % today,
+                     '対象年月：%s' % ym_disp]:
+            cell = ws.cell(row=r, column=1, value=text)
+            cell.font = body_bold
+            cell.border = BORDER
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+            r += 1
+        for text in ['数量は在庫まるごとを初期値にしています。減らす場合はこの欄を手で書き換えてください。',
+                     '『区分』に表示のある薬（向精神薬・毒薬・劇薬）は、受け取る側でも譲受の記録が必要です。']:
+            cell = ws.cell(row=r, column=1, value=text)
+            cell.font = body_font
+            cell.fill = NOTE_FILL   # 薄い注記色（白黒FAXでもうっすら残る程度で、字は読める）
+            cell.border = BORDER
+            cell.alignment = Alignment(wrap_text=True, vertical='center')
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+            r += 1
+        r += 1   # ヘッダーと明細のあいだを1行あける
+
+        # --- 明細ヘッダー（この行を全ページで繰り返す）---
+        header_row = r
+        for ci, h in enumerate(PICKUP_REQUEST_COLS, start=1):
+            hc = ws.cell(row=r, column=ci, value=h)
+            hc.fill = HEADER_FILL          # 見出しだけは薄色（白黒でも列名と分かる程度）
+            hc.font = HEADER_FONT
+            hc.border = BORDER
+            hc.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        r += 1
+        first_detail = r
+
+        # --- 明細 ---
+        for d in sheet.get('rows', []):
+            for ci, colname in enumerate(PICKUP_REQUEST_COLS, start=1):
+                cell = ws.cell(row=r, column=ci, value=d.get(colname, ''))
+                cell.border = BORDER
+                # 期限が近い品は【塗らずに】有効期限の文字だけ太字（白黒FAX対策）
+                if colname == '有効期限' and d.get('_期限強調'):
+                    cell.font = body_bold
+                else:
+                    cell.font = body_font
+                if colname in ('薬品名', '状態'):
+                    cell.alignment = Alignment(wrap_text=True, vertical='top')
+                else:
+                    cell.alignment = Alignment(vertical='top')
+            r += 1
+        last_detail = max(r - 1, header_row)
+
+        # --- 列幅（A4横に収まる上限つき固定。_auto_width は使わない）---
+        for ci, h in enumerate(PICKUP_REQUEST_COLS, start=1):
+            ws.column_dimensions[get_column_letter(ci)].width = PICKUP_REQUEST_WIDTHS[h]
+
+        # --- 印刷設定（A4横・横は必ず1ページ・縦は品数に応じて何ページでも）---
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.orientation = 'landscape'
+        # ★fitToPage=True を立てないと fitToWidth は効かない
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.page_margins = PageMargins(left=0.4, right=0.4, top=0.5, bottom=0.5,
+                                      header=0.2, footer=0.2)
+        # 明細の列名行を全ページで繰り返す（2ページ目以降で列名の無い紙が出ないように）
+        ws.print_title_rows = '%d:%d' % (header_row, header_row)
+        ws.print_area = 'A1:%s%d' % (last_col, last_detail)
+        # フッター右にページ番号（FAXで枚数の取り違えを防ぐ）
+        ws.oddFooter.right.text = '&P / &N'
+        ws.freeze_panes = 'A%d' % first_detail
+
+    # 予約が1件も無い（シート0枚）の保険。呼び出し側でボタンを出さない想定だが、空ブック回避。
+    if not wb.sheetnames:
+        ws = wb.create_sheet('引取依頼書')
+        ws.cell(row=1, column=1, value='予約されている品がありません。')
+
+    wb.save(path_or_buf)

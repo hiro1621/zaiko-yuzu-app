@@ -83,13 +83,23 @@ def _view_supply(result, store_name, category):
             continue
         # 予約が入っている品は、候補店を並べる意味がもう無い（相手が決まっている）ので、
         #   『引取候補店』の欄をそのまま「◯◯が引取予定」に置き換える。
-        #   出し手はこの欄を見て、どこへ送ればよいかが分かる。
+        #   出し手はこの欄を見て、どこへいつ送ればよいかが分かる。
+        #   ★2026-08-01：受取時期（Nヶ月後）が「今すぐ」でないときだけ「（受取：Nヶ月後）」を足す。
+        #     今すぐの予約は従来どおり「✅ ◯◯ が引取予定」のまま（文言を自然に保つ・本間部長裁量）。
         taker = r.get('_予約店', '')
+        pickup = r.get('_予約受取', '')
+        if taker:
+            if pickup and pickup != '今すぐ':
+                taker_label = '✅ %s が引取予定（受取：%s）' % (taker, pickup)
+            else:
+                taker_label = '✅ %s が引取予定' % taker
+        else:
+            taker_label = r['引取候補店（店名のみ）']
         out.append({
             '薬品名': r['薬品名'], '単位': r['単位'], '在庫数': r['在庫数'],
             '在庫金額': r['在庫金額'], '有効期限': r['有効期限'],
             '期限切迫区分': r['期限切迫区分'], '区分': r['区分'],
-            '引取候補店': ('✅ %s が引取予定' % taker) if taker else r['引取候補店（店名のみ）'],
+            '引取候補店': taker_label,
             # 除外チェック欄で使う内部キー（画面には出さない）
             '_key': r['_ex_key'],
             # 予約済みの品を誤って除外しないよう、店名を持たせておく（画面には出さない）
@@ -154,11 +164,13 @@ def build_view_receive(result, store_name):
         ★『なぜ候補か』列は下のとおり画面から外したが、並べ替えには引き続き _tier_order を使う
           （不足中の品が上に来る優先順位はそのまま）。
 
-      画面用の9列だけに整えて返す（内部用の _tier_order・_remain・引取候補店 は返さない）：
-        出し手店／薬品名／単位／在庫数／在庫金額／有効期限／消化目安／区分／医薬品CD
+      画面用の列に整えて返す（内部用の _tier_order・_remain・引取候補店 は返さない）：
+        出し手店／薬品名／滞留／単位／出し手の在庫数／自店の在庫数／在庫金額／有効期限／消化目安／区分／医薬品CD
       ※2026-07-28 本間部長指示で『なぜ候補か』（不足中／使用中）列を削除した。
-        引き取る側にとっては「自店で使える品かどうか」は消化目安を見れば足り、
-        出し手側の tier 区分まで出す必要がないため。
+      ※2026-08-01（本間部長確定）に列を2つ整理した（①の改修）：
+        ・既存の『在庫数』（＝出し手がいま持っている数）を『出し手の在庫数』に改名（取り違え防止）。
+        ・その隣に『自店の在庫数』（＝自店がいまその品を何個持っているか）を新設。
+        ★この改名は【④の画面表示だけ】。Excel／Gシートの列名『在庫数』には一切触っていない。
     """
     rows = []
     for r in result.get('candidate_rows', []):
@@ -182,14 +194,61 @@ def build_view_receive(result, store_name):
                              r['_tier_order'],
                              r['_remain'] is None,
                              r['_remain'] if r['_remain'] is not None else 0))
-    disp_cols = ['出し手店', '薬品名', '滞留', '単位', '在庫数', '在庫金額', '有効期限',
-                 '消化目安', '区分', '医薬品CD']
-    # ★画面に出す列のほかに、予約を保存するためのキーを2つ持たせる（画面では隠す）。
-    #   _出し手店・_key の組が予約1件を特定する。医薬品CD列とは別物（CDが無い品は「名:薬品名」）。
-    return [dict({c: r.get(c, '') for c in disp_cols},
-                 _出し手店=r['出し手店'], _key=r['_ex_key'],
-                 _滞留区分=r.get('_滞留区分', 'new'),
-                 _滞留月数=r.get('_滞留月数', 1)) for r in rows]
+    return [_receive_row_to_view(r) for r in rows]
+
+
+def _receive_row_to_view(r):
+    """ ④（および別枠）の候補行 r を、画面表示用の辞書に整える共通処理。
+        ★『在庫数』→『出し手の在庫数』の改名と『自店の在庫数』の追加はここで一元的に行う
+          （④本体と別枠 build_view_receive_ref で同じ整え方を使い、二重管理しないため）。 """
+    return {
+        '出し手店': r.get('出し手店', ''), '薬品名': r.get('薬品名', ''),
+        '滞留': r.get('滞留', ''), '単位': r.get('単位', ''),
+        # ①の改修：既存『在庫数』を『出し手の在庫数』に改名（値は同じ）＋『自店の在庫数』を新設
+        '出し手の在庫数': r.get('在庫数', ''), '自店の在庫数': r.get('自店の在庫数', ''),
+        '在庫金額': r.get('在庫金額', ''), '有効期限': r.get('有効期限', ''),
+        '消化目安': r.get('消化目安', ''), '区分': r.get('区分', ''),
+        '医薬品CD': r.get('医薬品CD', ''),
+        # ★予約を保存するためのキーを2つ持たせる（画面では隠す）。_出し手店・_key の組が予約1件を特定する。
+        #   ここを落とすと予約が空キーで保存され、読み込み時に捨てられて「予約したのに消える」事故になる
+        #   （2026-07 に build_view_receive で実際に起きた不具合。別枠でも必ず持たせる）。
+        '_出し手店': r.get('出し手店', ''), '_key': r.get('_ex_key', ''),
+        '_滞留区分': r.get('_滞留区分', 'new'), '_滞留月数': r.get('_滞留月数', 1),
+        # 有効期限キャップの判定に使う（受取予定月をこの月より先に選ばせない）。画面では隠す。
+        '_有効期限': r.get('有効期限', ''),
+    }
+
+
+def build_view_receive_ref(result, store_name):
+    """
+    ④の別枠『いまは在庫があるが、先になら引き取れる薬』（2026-08-01 追加・③の改修）。
+
+      他店がデッド／期限切迫で出していて、自店も同じ品を使ってはいるが在庫を余らせている
+      （＝tier③参考／use_ref）ため、本来の④（今すぐ引き取れる薬）からは意図的に外している品を、
+      別枠で拾う。狙いは「今は在庫があるが、いまの在庫を使い切る先（1〜3ヶ月後）なら受け取れる」品を
+      拾い、受取予定月つきで予約できるようにすること（本間部長の本命）。
+
+      ★元データは result['candidate_rows_ref']（compute_matching が別リストで作った丸め無しの構造化データ）。
+        『引取候補店』の文字列からは作らない（上位5店で丸められて候補漏れが起きるため）。
+      ★突き合わせは完全一致（==）のみ（和光／さと和光は別会社なので in は使わない）。
+      ★別枠の行にも _出し手店・_key を必ず持たせる（予約が空キーで消える過去の不具合を再発させない）。
+
+      列は④本体とまったく同じ（出し手の在庫数＋自店の在庫数の2列構成）。
+    """
+    rows = []
+    for r in result.get('candidate_rows_ref', []):
+        if r['引取候補店'] != store_name:
+            continue
+        if r.get('_予約店', ''):
+            continue
+        rows.append(r)
+    # 並べ替え：滞留の長い品を上に、そのあと有効期限の近い順・薬品名順（④本体と同じ考え方）。
+    rows.sort(key=lambda r: (0 if r.get('_滞留区分') == 'booked' else 1,
+                             -int(r.get('_滞留月数', 1) or 1),
+                             r['_remain'] is None,
+                             r['_remain'] if r['_remain'] is not None else 0,
+                             r.get('薬品名', '')))
+    return [_receive_row_to_view(r) for r in rows]
 
 
 # ============================================================================
@@ -261,23 +320,77 @@ def stagnation_summary(rows):
 #   ・保管庫の _予約 タブ（辞書のリスト）と、compute_matching が欲しい形（辞書）を橋渡しする。
 #   ・「品目まるごと」を押さえる方式。数量の指定はしない（本間部長判断 2026-07-28）。
 # ============================================================================
+# ----------------------------------------------------------------------------
+# 予約の「有効期間」判定（A案・据え置き＋実在チェック／2026-08-01）
+#   旧：対象年月＝当月のときだけ有効（月が変われば前月の予約は自動失効）。
+#   新：受取予定月を持たせ、「当月 ≤ 受取予定月」なら有効＝最大3ヶ月まで予約を持ち越せる。
+#
+#   ★実在チェックは特別な処理を足さない。品が当月の一覧（proposal_rows）から消えれば、
+#     その予約に紐づく表示行がそもそも存在しないので、予約は自動的に「何もしない状態」になる。
+#     ここがA案の安全装置の肝：「実在しない品を押さえたまま」を、余計なコードなしで防ぐ。
+# ----------------------------------------------------------------------------
+def _reservation_effective_ym(r):
+    """ その予約の『受取予定月』(YYYYMM)。空なら後方互換で『対象年月』（＝今すぐ）とみなす。
+        ★古い行（受取予定月の列が無かった頃の予約）は受取予定月が空なので、
+          対象年月と同じ月＝「今すぐ受け取る予定だった」と解釈する。 """
+    return (r.get('受取予定月', '') or '').strip() or (r.get('対象年月', '') or '').strip()
+
+
+def _reservation_active(r, ym):
+    """ 予約が当月 ym に有効か（当月 ≤ 受取予定月）。ym が空なら常に有効扱い。
+        受取予定月・対象年月がどちらも空の壊れた行は、無効として扱う（旧挙動＝当月不一致は捨てる、に合わせる）。 """
+    if not ym:
+        return True
+    eff = _reservation_effective_ym(r)
+    if not eff:
+        return False
+    return str(ym) <= eff
+
+
+def _pickup_display(eff_ym, ym):
+    """ 受取予定月(YYYYMM)を画面・帳票に出す読みやすい文字列にする。
+        当月と同じ（またはどちらか空）なら『今すぐ』、先なら『YYYY/MM（Nヶ月後）』。 """
+    if not eff_ym or not ym:
+        return '今すぐ'
+    off = yuzu_core.ym_offset(ym, eff_ym)
+    if off <= 0:
+        return '今すぐ'
+    return '%s/%s（%dヶ月後）' % (eff_ym[:4], eff_ym[4:6], off)
+
+
+def pickup_cap(expiry_str, ym):
+    """ 受取予定月の上限オフセット（今から何ヶ月後まで選べるか、0〜3）を返す純関数。
+        ★有効期限のある品は、その期限の月より先の受取予定月を選ばせない
+          （期限切れ後に受け取っても使えず、その間ほかの店も引き取れなくなるため）。
+        ★有効期限が空の品は3ヶ月後まで選べる（最大3ヶ月・本間部長確定）。
+          expiry_str … 'YYYY/MM/DD' などの日付文字列（④の行の『有効期限』）。 """
+    d = yuzu_core.parse_date(expiry_str)
+    if d is None:
+        return 3
+    return max(0, min(3, yuzu_core.ym_offset(ym, d.strftime('%Y%m'))))
+
+
 def reservation_map(reservations, ym):
     """ _予約 の行リストを compute_matching(reserved=...) に渡す形へ変換する。
-          {(出し手店, 予約キー): {'店': 予約した店, '日時': 予約日時}, ...}
+          {(出し手店, 予約キー): {'店': 予約した店, '日時': 予約日時,
+                                  '受取予定月': YYYYMM, '受取ラベル': '3ヶ月後'|'今すぐ'}, ...}
 
-        ★対象年月が ym と一致する行だけを採用する＝月が変わったら前月の予約は自動で無効。
-          （在庫は毎月まるごと入れ替わるので、前月の予約を持ち越すと実在しない品を
-            押さえたままになってしまう。）
+        ★2026-08-01：有効判定を「対象年月＝当月」→「当月 ≤ 受取予定月」に変更（最大3ヶ月持ち越し）。
+          受取ラベル（当月からの月数）は当月 ym を知っているここで作って渡す
+          （yuzu_core 側は月数計算をせず、このラベルを受け取って表示するだけにする）。
         同じ (出し手店, 予約キー) が複数あったら、先に書かれている行を優先する
         （＝先に予約した人が勝つ。保存側でも重複は止めているが、念のためここでも守る）。 """
     out = {}
     for r in (reservations or []):
-        if ym and r.get('対象年月', '') != ym:
+        if not _reservation_active(r, ym):
             continue
         k = (r.get('出し手店', ''), r.get('予約キー', ''))
         if not k[0] or not k[1] or k in out:
             continue
-        out[k] = {'店': r.get('予約した店', ''), '日時': r.get('予約日時', '')}
+        eff = _reservation_effective_ym(r)
+        offset = yuzu_core.ym_offset(ym, eff) if (ym and eff) else 0
+        out[k] = {'店': r.get('予約した店', ''), '日時': r.get('予約日時', ''),
+                  '受取予定月': eff, '受取ラベル': yuzu_core.pickup_label(offset)}
     return out
 
 
@@ -298,10 +411,14 @@ def plan_reservations(current_rows, my_store, ym, picked):
       別の店が予約している可能性がある。読み直さずに書くと先の予約を上書きしてしまい、
       両方の店が「自分が予約できた」と思い込む事故になる。
     ★重複していない品はそのまま予約する（1件ぶつかっただけで全部やり直しにはしない）。
+    ★2026-08-01：重複チェックを「当月」→「有効期間内の全予約（当月 ≤ 受取予定月）」に広げた。
+      予約を持ち越せるようになったので、来月・再来月受取の予約とも品目がぶつかりうるため。
+    ★picked の各要素は '_受取予定月'（解決済みのYYYYMM）を持つ。無ければ当月（＝今すぐ）とみなす。
     """
     taken = {}      # (出し手店, 予約キー) → いま予約している店
     for r in (current_rows or []):
-        if ym and r.get('対象年月', '') != ym:
+        # ★有効期間内の予約だけを『取られている』とみなす（持ち越し予約ともぶつかる）
+        if not _reservation_active(r, ym):
             continue
         taken[(r.get('出し手店', ''), r.get('予約キー', ''))] = r.get('予約した店', '')
 
@@ -321,22 +438,36 @@ def plan_reservations(current_rows, my_store, ym, picked):
         if holder == my_store:
             already += 1        # すでに自店が予約済み＝二重に足さない
             continue
+        # 受取予定月（呼び出し側で有効期限キャップまで反映して解決済み）。無ければ当月＝今すぐ。
+        pickup_ym = (d.get('_受取予定月', '') or '').strip() or (ym or '')
         keep.append({'予約した店': my_store, '出し手店': k[0], '対象年月': ym or '',
-                     '予約キー': k[1], '薬品名': d.get('薬品名', ''),
+                     '受取予定月': pickup_ym, '予約キー': k[1], '薬品名': d.get('薬品名', ''),
                      '予約日時': d.get('_now', '')})
         taken[k] = my_store
         added += 1
+
+    # ★掃除（reservation_autoclean）がON のときだけ、失効予約（当月＞受取予定月）を
+    #   この保存に相乗りして落とす。掃除専用の書き込みは作らない（Google API を増やさないため）。
+    #   既定はOFF＝失効予約は _予約 タブに残す（画面内の有効判定だけで無害化する）。
+    if yuzu_core.CONFIG.get('reservation_autoclean'):
+        keep = [r for r in keep if _reservation_active(r, ym)]
+
     return {'keep': keep, 'added': added, 'already': already,
             'conflicts': conflicts, 'broken': broken}
 
 
-def cancel_reservations(current_rows, my_store, picked):
+def cancel_reservations(current_rows, my_store, picked, ym=None):
     """ 「選んだ予約を取り消す」あとの行リストを返す純関数。
-        ★自店が予約した行だけを消す（他店の予約は絶対に触らない）。 """
+        ★自店が予約した行だけを消す（他店の予約は絶対に触らない）。
+        ★ym を渡し、掃除（reservation_autoclean）がON のときは、取消の保存に相乗りして
+          失効予約（当月＞受取予定月）も一緒に落とす（掃除専用の書き込みは作らない）。既定OFF。 """
     drop = {(d.get('_出し手店', ''), d.get('_key', '')) for d in (picked or [])}
-    return [r for r in (current_rows or [])
+    keep = [r for r in (current_rows or [])
             if not (r.get('予約した店', '') == my_store
                     and (r.get('出し手店', ''), r.get('予約キー', '')) in drop)]
+    if ym and yuzu_core.CONFIG.get('reservation_autoclean'):
+        keep = [r for r in keep if _reservation_active(r, ym)]
+    return keep
 
 
 def build_view_reserved(result, store_name, reservations, ym):
@@ -349,7 +480,9 @@ def build_view_reserved(result, store_name, reservations, ym):
       在庫数などの中身は、出し手の提案行（proposal_rows）から借りて表示する。
       出し手の一覧から品が消えていた場合は『状態』にそう書く（黙って落とさない）。
 
-    画面用の列：出し手店／薬品名／単位／在庫数／在庫金額／有効期限／区分／医薬品CD／予約日時／状態
+    画面用の列：出し手店／薬品名／単位／在庫数／在庫金額／有効期限／受取予定月／区分／医薬品CD／予約日時／状態
+    ※2026-08-01：有効判定を「当月 ≤ 受取予定月」に変更し、『受取予定月』列を足した（②の改修）。
+      内部用に _受取予定月（YYYYMMの生値）も持たせる（帳票の並べ替えに使う）。
     """
     # 出し手の提案行を (出し手店, 品目キー) で引けるようにしておく
     by_key = {(r['出し手店'], r['_ex_key']): r for r in result.get('proposal_rows', [])}
@@ -357,29 +490,112 @@ def build_view_reserved(result, store_name, reservations, ym):
     for rv in (reservations or []):
         if rv.get('予約した店', '') != store_name:
             continue
-        if ym and rv.get('対象年月', '') != ym:
+        # ★当月 ≤ 受取予定月 なら表示（旧：対象年月＝当月）。持ち越し中の予約もここに出る。
+        if not _reservation_active(rv, ym):
             continue
         k = (rv.get('出し手店', ''), rv.get('予約キー', ''))
+        eff = _reservation_effective_ym(rv)
+        pickup_disp = _pickup_display(eff, ym)
         pr = by_key.get(k)
         if pr is not None:
             out.append({
                 '出し手店': pr['出し手店'], '薬品名': pr['薬品名'], '単位': pr['単位'],
                 '在庫数': pr['在庫数'], '在庫金額': pr['在庫金額'],
-                '有効期限': pr['有効期限'], '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
+                '有効期限': pr['有効期限'], '受取予定月': pickup_disp,
+                '区分': pr['区分'], '医薬品CD': pr['医薬品CD'],
                 '予約日時': rv.get('予約日時', ''), '状態': '出し手が掲載中',
-                '_出し手店': k[0], '_key': k[1],
+                '_出し手店': k[0], '_key': k[1], '_受取予定月': eff,
             })
         else:
             # 出し手が差し替え・除外などでこの品を出さなくなった＝予約だけが残っている状態
             out.append({
                 '出し手店': k[0], '薬品名': rv.get('薬品名', ''), '単位': '',
-                '在庫数': '', '在庫金額': '', '有効期限': '', '区分': '', '医薬品CD': '',
+                '在庫数': '', '在庫金額': '', '有効期限': '', '受取予定月': pickup_disp,
+                '区分': '', '医薬品CD': '',
                 '予約日時': rv.get('予約日時', ''), '状態': '出し手の一覧から外れました（要確認）',
-                '_出し手店': k[0], '_key': k[1],
+                '_出し手店': k[0], '_key': k[1], '_受取予定月': eff,
             })
     # 出し手店ごとにまとめ、その中は薬品名順（電話をかける単位で並ぶようにする）
     out.sort(key=lambda r: (r['出し手店'], r['薬品名']))
     return out
+
+
+# ============================================================================
+# 引取依頼書（帳票）＝受け手（引き取る側）が予約した品を、出し手店ごとにまとめる
+#   2026-08-01 追加（④の改修）。デスクネッツ貼付・FAX・電話しながらの参照用。
+#   ・build_view_reserved（《予約の記録そのもの》から作る既存関数）を土台にする。
+#   ・build_view_reserved 自体は帳票のために作り替えない（同じ値を2箇所で作らない原則）。
+#     ロットNO は build_view_reserved が返さないので、出し手の提案行から引き当てて借りる。
+# ============================================================================
+def build_pickup_request(result, my_store, reservations, ym):
+    """
+    引取依頼書のデータを組み立てる純関数（Excel化は yuzu_core.write_pickup_request_excel が担当）。
+
+      戻り値：
+        {'my_store': 自店名, 'ym': 'YYYYMM',
+         'sheets': [{'出し手店': 店名,
+                     'rows': [{'薬品名','単位','数量','有効期限','ロットNO','医薬品CD',
+                               '受取予定月','区分','状態','_期限強調','_受取予定月'}, ...]}, ...]}
+
+      ・対象＝自店が予約している品のうち有効期間内（受取予定月をまだ過ぎていない）もの
+        ＝build_view_reserved の戻りそのもの（有効判定はあちらに一本化済み）。
+      ・数量＝在庫まるごと（出し手の在庫数＝提案行の在庫数）を初期値。手で書き換える前提。
+      ・ロットNO＝build_view_reserved は返さないので、出し手の提案行から (出し手店, 品目キー) で引き当てる。
+      ・『出し手の一覧から外れました（要確認）』の品も黙って落とさず載せる
+        （数量・ロットNO・有効期限は空欄、状態欄に明記）。このツールの一貫原則。
+      ・受取予定月は1枚のシートの中に列で出し、近い順（同月内は薬品名順）に並べる。
+    """
+    reserved = build_view_reserved(result, my_store, reservations, ym)
+    # ロットNO を出し手の提案行から借りる（同じ値を2箇所で作らない）。掲載が外れた品はキーが無い＝空。
+    lot_by_key = {(r['出し手店'], r['_ex_key']): r.get('ロットNO', '')
+                  for r in result.get('proposal_rows', [])}
+    # 有効期限が近い品を帳票で太字強調するための基準日（当月1日）。ym から作る。
+    base_date = None
+    if ym and len(str(ym)) >= 6:
+        try:
+            base_date = datetime.date(int(str(ym)[:4]), int(str(ym)[4:6]), 1)
+        except ValueError:
+            base_date = None
+
+    by_store = {}
+    for rv in reserved:
+        listed = (rv.get('状態') == '出し手が掲載中')
+        lot = lot_by_key.get((rv['_出し手店'], rv['_key']), '') if listed else ''
+        # 期限強調：有効期限があり、当月から expiry_yellow_months（既定12ヶ月）以内なら太字にする
+        exp_d = yuzu_core.parse_date(rv.get('有効期限', ''))
+        near = bool(exp_d and base_date
+                    and yuzu_core.month_diff(base_date, exp_d) <= yuzu_core.CONFIG['expiry_yellow_months'])
+        detail = {
+            '薬品名': rv.get('薬品名', ''),
+            '単位': rv.get('単位', ''),
+            '数量': rv.get('在庫数', ''),     # ＝出し手の在庫数（在庫まるごと）を初期値
+            '有効期限': rv.get('有効期限', ''),
+            'ロットNO': lot,
+            '医薬品CD': rv.get('医薬品CD', ''),
+            '受取予定月': rv.get('受取予定月', ''),
+            '区分': rv.get('区分', ''),
+            '状態': rv.get('状態', ''),
+            '_期限強調': near,
+            '_受取予定月': rv.get('_受取予定月', ''),   # 並べ替え用の生値（YYYYMM）
+        }
+        by_store.setdefault(rv['出し手店'], []).append(detail)
+
+    sheets = []
+    for store in sorted(by_store.keys()):
+        rows = by_store[store]
+        # 受取予定月の近い順（空＝末尾）→ 同月内は薬品名順
+        rows.sort(key=lambda d: (d.get('_受取予定月', '') or '999999', d.get('薬品名', '')))
+        sheets.append({'出し手店': store, 'rows': rows})
+    return {'my_store': my_store, 'ym': ym or '', 'sheets': sheets}
+
+
+def pickup_request_bytes(result, my_store, reservations, ym):
+    """ 引取依頼書を Excel にして bytes で返す（画面のダウンロードボタン用）。 """
+    data = build_pickup_request(result, my_store, reservations, ym)
+    bio = io.BytesIO()
+    yuzu_core.write_pickup_request_excel(bio, data)
+    bio.seek(0)
+    return bio.getvalue()
 
 
 # ============================================================================
