@@ -281,12 +281,22 @@ def apply_stagnation(result, prev_map):
         prev = prev_map.get((pr['出し手店'], pr['_ex_key']))
         months = (prev.get('滞留月数', 1) + 1) if prev else 1
         was_reserved = bool(prev and str(prev.get('予約', '') or '').strip())
+        # ★2026-08-04：いま有効な予約が生きているか（＝提案行の _予約店 が空でない）を渡す。
+        #   持ち越し予約（受取予定月が先）は was_reserved も True になるので、now を先に見ないと
+        #   約束どおり待っている品まで booked（紫）で警告され続ける誤検知になる。
+        now_reserved = bool(str(pr.get('_予約店', '') or '').strip())
         level, label = yuzu_core.stagnation_view(
-            months, pr.get('_候補あり', False), was_reserved)
+            months, pr.get('_候補あり', False), was_reserved, now_reserved)
         pr['_滞留月数'] = months
         pr['_先月予約'] = was_reserved
         pr['_滞留区分'] = level
-        pr['滞留'] = label
+        pr['滞留'] = label   # 画面・Excel の表示（reserved は '' ＝塗らない・文字なし）
+        # ★_滞留persist … Gシート『融通提案』タブの滞留列へ書き出す“翌月チェーン用”の値。
+        #   表示は空でも、月数を来月へ引き継げるよう「予約中Nヶ月目」を残す
+        #   （read_prev_proposal は滞留列の数字を拾ってチェーンをつなぐため、空だとチェーンが切れて
+        #     予約が明けたときに月数が実際より若く出てしまう）。表示（滞留列）と別値なのは、
+        #     滞留列はもともと「翌月の判定材料」として設計されている列だから（build_results_payload 参照）。
+        pr['_滞留persist'] = ('予約中%dヶ月目' % months) if level == 'reserved' else label
         counts[level] = counts.get(level, 0) + 1
 
     # --- ④受け手ビューの土台にも同じ値を配る ---
@@ -306,11 +316,13 @@ def apply_stagnation(result, prev_map):
 
 def stagnation_summary(rows):
     """ 表示中の行リストから、滞留区分ごとの件数を数える（画面の注記用）。
-        rows … build_view_a / build_view_expiry / build_view_receive の戻り。 """
+        rows … build_view_a / build_view_expiry / build_view_receive の戻り。
+        ★'new'（今月から）と 'reserved'（予約が生きていて塗らない）は凡例に出さないので数えない
+          （数えると凡例ヘッダーだけ出て中身が空、という矛盾になる。凡例＝STAGNATION_LEGEND_ORDER とそろえる）。 """
     counts = {}
     for r in (rows or []):
         lv = r.get('_滞留区分', 'new')
-        if lv and lv != 'new':
+        if lv and lv not in ('new', 'reserved'):
             counts[lv] = counts.get(lv, 0) + 1
     return counts
 
