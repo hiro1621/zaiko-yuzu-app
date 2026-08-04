@@ -297,11 +297,14 @@ def _df(rows, columns=None):
 _NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数', '出し手の在庫数', '自店の在庫数']
 
 
-def _style_expiry(df, paint=True, stag_levels=None):
+def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
     """ 表を見やすく整えた pandas Styler を返す。
           ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00・カンマ区切り）
-          ・paint=True のとき、「期限切迫区分」が非空の行を【薄赤の背景＋黒文字】で行ごと目立たせる
-            （②デッド一覧の中で"期限が近いデッド"が一目で分かるように）
+          ・paint=True のとき、「有効期限まで5ヶ月以内」の行を【薄赤の背景＋黒文字】で行ごと目立たせる
+            （②デッド一覧の中で"期限が近いデッド"が一目で分かるように）。
+            どの行が5ヶ月以内かは expiry_flags（行ごとの True/False の配列。滞留色の stag_levels と
+            同じ「行ごとの配列を渡す」方式）で受け取る＝判定は yuzu_core で1度だけ行い、画面は
+            その結果を塗るだけにして定義をズラさない（以前は期限切迫区分の非空で塗っていた）。
           ・paint=False のときは背景を塗らない（③期限切迫品は全行が期限切迫で、
             塗ると表全体が赤くなるだけで情報量がゼロのため。数値フォーマットは②③とも効かせる）。
           ・stag_levels（行ごとの滞留区分のリスト）を渡すと、「滞留」列のセルだけを
@@ -318,7 +321,10 @@ def _style_expiry(df, paint=True, stag_levels=None):
     HIT_STYLE = 'background-color: #FFE3E6; color: #000000'
 
     def _paint(row):
-        hit = str(row.get('期限切迫区分', '') or '').strip() != ''
+        # 行の位置 i（既定インデックスなので row.name＝0始まりの位置）で expiry_flags を引く。
+        #   ★「期限切迫区分が非空か」ではなく「その行が有効期限まで5ヶ月以内か」で塗る（A案）。
+        i = row.name
+        hit = bool(expiry_flags[i]) if (expiry_flags and i < len(expiry_flags)) else False
         return [HIT_STYLE if hit else '' for _ in row]
 
     def _paint_stag(col):
@@ -335,7 +341,7 @@ def _style_expiry(df, paint=True, stag_levels=None):
         fmt = {c: '{:,.2f}' for c in _NUM2_COLS if c in df.columns}
         if fmt:
             sty = sty.format(fmt)
-        if paint and '期限切迫区分' in df.columns:
+        if paint and expiry_flags:
             sty = sty.apply(_paint, axis=1)
         if stag_levels and '滞留' in df.columns:
             sty = sty.apply(_paint_stag, subset=['滞留'])
@@ -395,10 +401,10 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     ②デッド品・③期限切迫品の表を「行選択方式」で描く。
       rows          … app_logic.build_view_a / build_view_expiry の戻り
       table_key     … 画面部品を区別するための名前（'dead' / 'expiry'）
-      paint_expiry  … 期限切迫を兼ねる行を薄赤に塗るか（②=True／③=False）。
+      paint_expiry  … 有効期限まで5ヶ月以内（＝期限切迫）の行を薄赤に塗るか（②=True／③=False）。
                       ③は全行が期限切迫なので塗ると真っ赤になるだけ＝Falseで白のままにする。
     表示は8列（薬品名／単位／在庫数／在庫金額／有効期限／期限切迫区分／区分／引取候補店）。
-    ・②では期限切迫を兼ねる行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
+    ・②では有効期限まで5ヶ月以内の行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
       チェック欄つきの旧方式では行の色を付けられず ⚠ 記号で代替していたが、
       行選択方式なら Styler の背景色と左端の選択チェックが両立するので色を戻した。
     ・数値（在庫数・在庫金額）はカンマ区切り＋小数第2位で表示する（②③とも共通）。
@@ -415,9 +421,13 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
                  '有効期限', '期限切迫区分', '区分', '引取候補店']
     df = pd.DataFrame([{c: r.get(c, '') for c in disp_cols} for r in rows])
     stag_levels = [r.get('_滞留区分', 'new') for r in rows]
+    # 行ごとの「有効期限まで5ヶ月以内か」フラグ（②の薄赤ハイライト用）。
+    #   yuzu_core が計算した _expiry_flag をそのまま並べるだけ＝判定の出どころを1つに保つ。
+    expiry_flags = [bool(r.get('_expiry_flag')) for r in rows]
 
     event = st.dataframe(
-        _style_expiry(df, paint=paint_expiry, stag_levels=stag_levels),
+        _style_expiry(df, paint=paint_expiry, stag_levels=stag_levels,
+                      expiry_flags=expiry_flags),
         hide_index=True,
         width='stretch',
         on_select='rerun',
@@ -1102,7 +1112,7 @@ def results_section(backend, stores, latest, index):
                 min_amt = result.get('min_supply_amount', 0)
                 sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
                 cap = ('デッド＝直近6ヶ月以上、出庫（払い出し）がない在庫です。'
-                       '行が薄赤の品は期限切迫を兼ねています。'
+                       '行が薄赤の品は有効期限まで5ヶ月以内です（期限切迫を兼ねています）。'
                        '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
                        '（色の意味は表の下に出ます）。'
                        'デッドストックリストに載せない医薬品は左端の□にチェックを入れて'
@@ -1119,7 +1129,7 @@ def results_section(backend, stores, latest, index):
             elif chosen == VIEW_EXPIRY:
                 # ---- ③（自店）の期限切迫品 ----
                 st.subheader('③（%s）の期限切迫品' % my_store)
-                st.caption('自店の期限切迫在庫（デッドではないもの）と、その引取候補店。'
+                st.caption('自店の期限切迫在庫（有効期限まで5ヶ月以内・デッドではないもの）と、その引取候補店。'
                            '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
                            '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
                            '（色の意味は表の下に出ます）。'

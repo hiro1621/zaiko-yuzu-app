@@ -122,6 +122,14 @@ CONFIG = {
     'max_candidates': 5,
     # 有効期限「1年以内」を黄色でハイライトする閾値（月）
     'expiry_yellow_months': 12,
+    # 「期限切迫」として融通提案に載せる（＝赤で目立たせる）閾値（月）。
+    #   有効期限が基準日から この月数以内 の品だけを期限切迫として扱う（既定＝5ヶ月以内）。
+    #   ★2026-08-04（本間部長・A案）：従来は「期限切迫区分が非空なら全部」で、期限が
+    #     半年〜1年先の“まだ動いている品”まで載っていた。実データで薬VANの期限切迫区分は
+    #     B＝期限まで6〜11ヶ月先／O＝3〜5ヶ月／R＝3ヶ月未満（期限切れ含む）と判明したため、
+    #     区分に頼らず「有効期限までの実日数」で判定する方式に変えた（店ごとの基準日を使う）。
+    #   ※もっと絞る／広げるときは、この数字を 3 や 4 に変えるだけでよい。
+    'expiry_within_months': 5,
 
     # 失効予約（当月＞受取予定月＝もう受け取れない予約）を _予約 タブから自動で消すか。
     #   既定＝False（消さない）。オフの間は「画面内の有効判定だけで無害化」する
@@ -280,11 +288,16 @@ def g(row, col):
 #                          「6ヶ月以上動いていない品（O/R）だけ」へ変更。
 #                          B（3〜6ヶ月）はまだ動く見込みがあるためデッドに含めない。
 #                          → CONFIG['dead_exclude_kubun_values'] を参照。
-#     ・is_expiry(row) … 期限切迫区分が非空
-#     ・is_supplier(row)＝ is_dead または is_expiry （＝新しい出し手）
+#     ・is_expiry(row, base_date) … 有効期限が基準日から CONFIG['expiry_within_months']（既定5）
+#                        ヶ月以内なら期限切迫。有効期限が空欄・読めない品は期限切迫にしない（落とす）。
+#                        ★2026-08-04（本間部長・A案）：従来は「期限切迫区分が非空なら全部」だったが、
+#                          期限が半年〜1年先の“まだ動いている品”まで載っていたため、区分ではなく
+#                          「有効期限までの実日数」で判定する方式に変更。基準日は店ごとに違い得るので
+#                          モジュール共通変数にはせず、引数 base_date で受け取る（誤判定を防ぐため）。
+#     ・is_supplier(row, base_date)＝ is_dead または is_expiry （＝新しい出し手）
 #   カテゴリは排他・デッド優先：デッドなら「デッド」、デッドでなく期限切迫なら「期限切迫」。
 #   （デッドかつ期限切迫の品は「デッド」に入れる。ただし期限切迫区分の値は各行に残し、
-#     Excelでは赤ハイライトを維持する。）
+#     Excelでは赤ハイライト（＝有効期限まで5ヶ月以内）を維持する。）
 def is_dead(row):
     """ デッド（不動）在庫か。
         不動区分が非空で、かつ CONFIG['dead_exclude_kubun_values'] に載っていない値なら True。
@@ -297,24 +310,32 @@ def is_dead(row):
     return v.upper() not in ng
 
 
-def is_expiry(row):
-    """ 期限切迫か：期限切迫区分が非空なら True """
-    return is_text_flag(g(row, '期限切迫区分'))
+def is_expiry(row, base_date):
+    """ 期限切迫か：有効期限が基準日から CONFIG['expiry_within_months']（既定5）ヶ月以内なら True。
+        有効期限が空欄・読めない品は False（＝期限切迫にしない＝提案に載せない）。
+        ★基準日（base_date）は店ごとに違い得るので引数で受け取る（A案・2026-08-04）。
+        ※薬VANの期限切迫区分（B/O/R）には頼らない：区分ではなく「有効期限までの実日数」で判定する。
+          （実データでは B＝6〜11ヶ月先／O＝3〜5ヶ月／R＝3ヶ月未満だが、将来値が変わっても
+            日付判定なら影響を受けないため。） """
+    exp = parse_date(g(row, '有効期限'))
+    if exp is None:
+        return False
+    return month_diff(base_date, exp) <= CONFIG['expiry_within_months']
 
 
-def is_supplier(row):
+def is_supplier(row, base_date):
     """ 出し手（融通候補）か：デッド または 期限切迫 なら True。
         ※ 純粋な過剰（過剰在庫区分だけ／過剰数>0だけで、不動でも期限切迫でもない品）は
           出し手に含めない（A案）。 """
-    return is_dead(row) or is_expiry(row)
+    return is_dead(row) or is_expiry(row, base_date)
 
 
-def supplier_category(row):
+def supplier_category(row, base_date):
     """ 出し手のカテゴリを返す（排他・デッド優先）：
         デッドなら 'デッド'、デッドでなく期限切迫なら '期限切迫'、どちらでもなければ ''（＝出し手でない）。 """
     if is_dead(row):
         return 'デッド'
-    if is_expiry(row):
+    if is_expiry(row, base_date):
         return '期限切迫'
     return ''
 
@@ -996,7 +1017,7 @@ def compute_matching(stores, excluded=None, reserved=None):
             ex = is_excluded(s['name'], row) or is_below_min_amount(row)
             sh = is_shortage(row)
             dead = is_dead(row) and not ex     # デッド（不動区分が非空）
-            expf = is_expiry(row) and not ex   # 期限切迫（期限切迫区分が非空）
+            expf = is_expiry(row, s['base_date']) and not ex  # 期限切迫（有効期限まで5ヶ月以内）
             supp = dead or expf                # 出し手（デッド or 期限切迫）
             he = holds_excess(row)   # 受け取り側の「過剰保有」（tier②適正/③参考の分かれ目）
             uq = usage_qty6(row)
@@ -1055,7 +1076,7 @@ def compute_matching(stores, excluded=None, reserved=None):
     small_by_store = {}
     for s in stores:
         for row in s['rows']:
-            if not is_supplier(row):
+            if not is_supplier(row, s['base_date']):
                 continue
             if is_excluded(s['name'], row):
                 # 店が「この品は出さない」と外したもの
@@ -1092,7 +1113,7 @@ def compute_matching(stores, excluded=None, reserved=None):
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
             remain = month_diff(s['base_date'], exp) if exp else None
             pr = {
-                '出し手店': s['name'], '種別': supplier_category(row),
+                '出し手店': s['name'], '種別': supplier_category(row, s['base_date']),
                 '薬品名': g(row, '薬品名'), '単位': g(row, '単位'),
                 'メーカ名': g(row, 'メーカ名'), '在庫数': round(over_qty, 2),
                 '在庫金額': round(over_amt, 2),
@@ -1112,7 +1133,11 @@ def compute_matching(stores, excluded=None, reserved=None):
                 '予約': _reserve_label(reserved, s['name'], exclusion_key(row)),
                 '_予約店': _reserved_by(reserved, s['name'], exclusion_key(row)),
                 '_予約受取': _reserved_pickup(reserved, s['name'], exclusion_key(row)),
-                '_expiry_flag': is_text_flag(g(row, '期限切迫区分')),
+                # 期限切迫フラグ（＝赤ハイライトの元）。有効期限が読めて、基準日から5ヶ月以内なら True。
+                #   ★is_expiry と同じ計算（remain＝基準日→有効期限の月数）に一本化しているので、
+                #     「載せる条件」と「赤の条件」がズレない（A案・2026-08-04）。
+                '_expiry_flag': (remain is not None
+                                 and remain <= CONFIG['expiry_within_months']),
                 # 滞留（何ヶ月つづけて載っているか）。ここでは「今月から」を初期値として置き、
                 #   過去の記録がある場合だけ app_logic.apply_stagnation が上書きする。
                 #   ★初期値を必ず入れておくのは、履歴が読めなかった月でも画面・Excelが
@@ -1234,11 +1259,11 @@ def compute_matching(stores, excluded=None, reserved=None):
         exp_amt = 0.0
         short_cnt = 0
         for row in s['rows']:
-            if (is_supplier(row) and not is_legal_excluded(row)
+            if (is_supplier(row, s['base_date']) and not is_legal_excluded(row)
                     and not is_excluded(s['name'], row)
                     and not is_below_min_amount(row)):
                 amt = stock_amount(row)
-                if supplier_category(row) == 'デッド':
+                if supplier_category(row, s['base_date']) == 'デッド':
                     dead_cnt += 1
                     dead_amt += amt
                 else:  # 期限切迫（デッドでない）
@@ -1255,7 +1280,7 @@ def compute_matching(stores, excluded=None, reserved=None):
     checkA = 0.0
     for s in stores:
         for row in s['rows']:
-            if (is_supplier(row) and not is_legal_excluded(row)
+            if (is_supplier(row, s['base_date']) and not is_legal_excluded(row)
                     and not is_excluded(s['name'], row)
                     and not is_below_min_amount(row)):
                 checkA += stock_amount(row)
@@ -1302,7 +1327,7 @@ def compute_matching(stores, excluded=None, reserved=None):
 #   一目で分かるようにする（本間部長への指摘より）。
 #
 # 【色の意味】★画面（Streamlit）とExcelで必ず同じ色・同じ言葉を使うため、ここに一本化する。
-#   ・行の色  … 期限のこと（既存。赤＝期限切迫／黄＝期限1年以内）
+#   ・行の色  … 期限のこと（既存。赤＝有効期限まで5ヶ月以内／黄＝期限1年以内）
 #   ・滞留列の色 … 動いていない期間のこと（ここで定義）
 #   この2つは別のことを表しているので、色の系統を分けている。
 #
@@ -1400,7 +1425,7 @@ def stagnation_view(months, has_candidate, was_reserved, now_reserved=False):
 # ============================================================================
 # Excel出力（コマンド版のExcelダウンロードと、アプリ版のExcelダウンロードで共用）
 # ============================================================================
-RED_FILL = PatternFill('solid', fgColor='FFC7CE')     # 期限切迫（赤系）
+RED_FILL = PatternFill('solid', fgColor='FFC7CE')     # 期限切迫＝有効期限まで5ヶ月以内（赤系）
 DEAD_FILL = PatternFill('solid', fgColor='FCE4D6')    # デッド（薄オレンジ系）※マトリクスの「デX」用
 YELLOW_FILL = PatternFill('solid', fgColor='FFEB9C')  # 期限1年以内（黄系）
 HEADER_FILL = PatternFill('solid', fgColor='D9E1F2')   # 見出し
@@ -1473,7 +1498,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
             # 在庫数（6列目）・在庫金額（7列目）は小数第2位まで表示する
             if ci in (6, 7):
                 cell.number_format = '#,##0.00'
-        # 塗り分け：期限切迫は赤、そうでなく1年以内は黄（ただし「参考」列は対象外）
+        # 塗り分け：有効期限まで5ヶ月以内は赤、そうでなく1年以内は黄（ただし「参考」列は対象外）
         fill = None
         if pr['_expiry_flag']:
             fill = RED_FILL
@@ -1538,7 +1563,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
         r += 1
     # 凡例
     ws3.cell(row=r + 1, column=1,
-             value='凡例：デX=デッド（6ヶ月以上出庫なし・数量X） ／ 限X=期限切迫（数量X） ／ '
+             value='凡例：デX=デッド（6ヶ月以上出庫なし・数量X） ／ 限X=期限切迫（有効期限まで5ヶ月以内・数量X） ／ '
                    '不=安全在庫割れ ／ 使=直近6ヶ月に出庫実績あり ／ 空欄=在庫なし')
     ws3.freeze_panes = 'C2'
     _auto_width(ws3, headers3, max_width=14)
