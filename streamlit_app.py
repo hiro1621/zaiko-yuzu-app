@@ -385,29 +385,45 @@ def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
         return df
 
 
-def stagnation_legend(rows):
+def stagnation_legend(rows, chips=True):
     """
-    「滞留」列の色の意味を、色チップつきで画面に出す（＝色を見ただけで意味が分かるように）。
+    「滞留」列の意味を画面に出す。
+      chips=True （既定）… 色チップつき（色を見ただけで意味が分かる）。★色つきの st.dataframe を
+                          使う④・予約中・除外中の表で使う（表の色とチップの色が対応する）。
+      chips=False        … 色チップをやめ、文字だけ（区分名＋件数）で出す。★②③は st.data_editor に
+                          切り替えて表に色が無いので、色チップだけ残すと表と対応が取れず誤解を招く。
+                          そのため文字だけの説明にする（2026-08-10・本間部長指示）。
       rows … いま表示している行リスト。実際に出ている区分だけを並べるので、
-             関係のない色の説明で画面がうるさくならない。
+             関係のない説明で画面がうるさくならない。
     1件も滞留が無い月は何も出さない。
     """
     counts = app_logic.stagnation_summary(rows)
     if not counts:
         return
-    chips = []
+    if not chips:
+        # ②③用：色を使わず、区分名＋件数の文字だけで出す。
+        parts = []
+        for lv in yuzu_core.STAGNATION_LEGEND_ORDER:
+            n = counts.get(lv)
+            if not n:
+                continue
+            _bg, _fg, _x, desc = yuzu_core.STAGNATION_STYLES[lv]
+            parts.append('%s：%d件' % (desc, n))
+        st.caption('「滞留」の意味　' + '／'.join(parts))
+        return
+    chips_html = []
     for lv in yuzu_core.STAGNATION_LEGEND_ORDER:
         n = counts.get(lv)
         if not n:
             continue
         bg, fg, _x, desc = yuzu_core.STAGNATION_STYLES[lv]
-        chips.append(
+        chips_html.append(
             '<span style="background-color:%s;color:%s;padding:2px 8px;'
             'border-radius:4px;border:1px solid #BBB;white-space:nowrap;">'
             '%s <b>%d件</b></span>' % (bg, fg, desc, n))
     st.markdown(
         '<div style="font-size:0.86rem;line-height:2.1;">'
-        '<b>「滞留」列の色の見方</b>　' + '　'.join(chips) + '</div>',
+        '<b>「滞留」列の色の見方</b>　' + '　'.join(chips_html) + '</div>',
         unsafe_allow_html=True)
 
 
@@ -467,24 +483,105 @@ def _save_exclusions_ui(checked, my_store, backend, exclusions):
     st.rerun()
 
 
-def _save_supply_qty_ui(checked, my_store, backend, desired, full):
-    """ 選ばれた品の『出せる数』を保存する（純関数 app_logic.plan_supply_qty を呼ぶ薄い皮）。
-        full=True なら『全量に戻す』＝在庫数と同じ値で保存＝指定を消す。
-        ★保存の直前に _提供数量 を読み直してから書く（Googleシートは同時書き込みを止められないため。
-          除外・予約の保存と同じ理由）。 """
+def _flash(level, text):
+    """ 保存直後の st.rerun をまたいでメッセージを見せるため、いったん session_state にためる。
+        Streamlit は st.rerun でその回の描画を捨てるので、rerun 前に出したメッセージは消える。
+        ためておき、次の描画の先頭で _render_flash が1回だけ出す。 """
+    st.session_state.setdefault('_supqty_flash', []).append((level, text))
+
+
+def _render_flash():
+    """ ためておいたメッセージ（_flash）を画面の先頭で1回だけ出して消す。 """
+    for level, text in st.session_state.pop('_supqty_flash', []):
+        getattr(st, level, st.info)(text)
+
+
+def _bump_editor(table_key):
+    """ 保存・取消のあと data_editor を作り直すため、版番号を1つ上げる（＝キーが変わる）。
+        ★これをしないと、除外で行が減った後も古い編集差分（行の位置で持つ）が残り、別の行へ
+          誤って適用される（st.data_editor の既知の落とし穴）。 """
+    k = 'supqty_ver_%s' % table_key
+    st.session_state[k] = st.session_state.get(k, 0) + 1
+
+
+def _validate_supply_desired(rows, desired, now=''):
+    """
+    セル直接編集された『出庫可能数』（desired: {_key: 編集後の数値}）を検証する純関数
+    （st に依存しない＝単体テスト可能）。NumberColumn の max_value は列に1つしか指定できず、
+    行ごとの在庫上限にできないので、その担保をここで行う。
+
+      戻り値 …
+        {'picked':  plan_supply_qty に渡す品のリスト（値が変わった品だけ）。各要素
+                    {'_key','薬品名','出せる数','在庫数','_予約店','_now'},
+         'clamped': [(薬品名, 在庫全量), ...]  在庫（全量）を超えたので全量まで下げた品,
+         'zero':    [薬品名, ...]              0以下で保存しなかった品}
+
+    ルール（本間部長指示 2026-08-10）：
+      ・値が変わっていない品は picked に入れない（無駄な保存・警告・rerun を避ける）。
+      ・予約が入っている品（_予約店 が非空）は、値が変わっていれば picked に入れる
+        （数量は plan_supply_qty が blocked にして変えない。0以下・在庫超過の判定はしない）。
+      ・0以下は保存しない＝zero に入れ、呼び出し側が「除外を使って」と案内する。
+      ・在庫（全量）を超える値は在庫（全量）まで自動で下げ、clamped に入れて知らせる
+        （全量と同値になるので plan_supply_qty 側で指定が消える＝全量に戻る）。
+    """
+    picked, clamped, zero = [], [], []
+    for r in (rows or []):
+        key = (r.get('_key', '') or '').strip()
+        if not key:
+            continue
+        stock = _to_float(r.get('在庫数', 0))               # 在庫数（全量）
+        cur = _to_float(r.get('出庫可能数', stock), stock)   # いまの実効数量（未指定なら全量）
+        q = _to_float(desired.get(key, cur), cur)
+        if q != q:            # NaN（セルを空にした等）は現在値に戻す
+            q = cur
+        reserved = (r.get('_予約店', '') or '').strip()
+        name = r.get('薬品名', '')
+        if reserved:
+            # 予約品：値が変わっていれば plan に渡して blocked にしてもらう（数量は変わらない）
+            if round(q, 2) != round(cur, 2):
+                picked.append({'_key': key, '薬品名': name, '出せる数': q,
+                               '在庫数': stock, '_予約店': reserved, '_now': now})
+            continue
+        if q <= 0:
+            zero.append(name)
+            continue
+        if stock > 0 and round(q, 2) > round(stock, 2):
+            clamped.append((name, stock))
+            q = stock
+        if round(q, 2) == round(cur, 2):
+            continue          # 変更なし
+        picked.append({'_key': key, '薬品名': name, '出せる数': q,
+                       '在庫数': stock, '_予約店': '', '_now': now})
+    return {'picked': picked, 'clamped': clamped, 'zero': zero}
+
+
+def _save_supply_qty_ui(rows, my_store, backend, desired):
+    """ セル直接編集された『出庫可能数』を保存する（純関数 app_logic.plan_supply_qty を呼ぶ薄い皮）。
+        ★2026-08-10（第3弾）：行選択＋number_input の2段方式から st.data_editor へ切り替えたのに伴い、
+          「編集後の数量マップ desired を検証してから保存する」形に作り替えた。
+        ・在庫超過の自動クランプ・0以下の拒否は _validate_supply_desired で行う（黙って直さない）。
+        ・予約が入っている品は plan_supply_qty の blocked の仕組みでそのまま守る（数量を変えない）。
+        ・メッセージは _flash にためてから（呼び出し側が）st.rerun する（rerun で消えないように）。
+        ・保存の直前に _提供数量 を読み直してから書く（同時書き込み対策・従来どおり）。 """
     now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
-    picked = []
-    for d in checked:
-        stock = _to_float(d.get('在庫数', 0))                       # 在庫数＝全量
-        qty = stock if full else _to_float(desired.get(d.get('_key', ''), stock), stock)
-        picked.append(dict(d, 出せる数=qty, 在庫数=stock, _now=now))
+    v = _validate_supply_desired(rows, desired, now=now)
+    # 在庫（全量）を超えた品は全量まで下げたことを知らせる（黙って直さない）
+    for name, stock in v['clamped']:
+        _flash('info', '「%s」は在庫%sを超えていたため%sにしました。'
+               % (name, _fmt_qty(stock), _fmt_qty(stock)))
+    # 0以下は保存しない案内
+    if v['zero']:
+        _flash('warning', '  \n'.join(
+            ['次の品は0以下のため保存しませんでした。'
+             '一切出さない品は「除外」にチェックを入れてください：']
+            + ['・%s' % n for n in v['zero']]))
     try:
         latest_rows = backend.load_supply_qty()   # ★書く直前に読み直す（同時書き込み対策）
     except Exception:
         latest_rows = []
-    plan = app_logic.plan_supply_qty(latest_rows, my_store, picked)
+    plan = app_logic.plan_supply_qty(latest_rows, my_store, v['picked'])
     if plan['blocked']:
-        st.warning('  \n'.join(
+        _flash('warning', '  \n'.join(
             ['次の品はすでに引取先が決まっているため、出庫可能数を変えませんでした。'
              '取りやめる場合は相手店に連絡してください：']
             + ['%s → %s が引取予定' % (b['薬品名'], b['予約店']) for b in plan['blocked']]))
@@ -498,109 +595,173 @@ def _save_supply_qty_ui(checked, my_store, backend, desired, full):
             parts.append('変更%d件' % plan['updated'])
         if plan['removed']:
             parts.append('全量に戻す%d件' % plan['removed'])
-        st.success('出庫可能数を保存しました（%s）。' % '／'.join(parts))
-        st.rerun()
-    elif not plan['blocked']:
-        st.info('出庫可能数の変更はありませんでした。')
+        _flash('success', '出庫可能数を保存しました（%s）。' % '／'.join(parts))
+    elif not (v['clamped'] or v['zero'] or plan['blocked']):
+        _flash('info', '出庫可能数の変更はありませんでした。')
 
 
-def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=True):
+def _clear_all_supply_qty_ui(my_store, backend):
+    """ この店の『出庫可能数』の指定を一括で消す（全品を在庫まるごと＝全量に戻す）。
+        ★行選択が無くなったため、旧「選んだ行を全量に戻す」の代わりに新設（2026-08-10）。
+          全量に戻すのは供給量を増やす向きなので、予約が入っている品があっても相手の不利にならない。 """
+    try:
+        latest_rows = backend.load_supply_qty()   # ★書く直前に読み直す（同時書き込み対策）
+    except Exception:
+        latest_rows = []
+    keep = [r for r in latest_rows if (r.get('店名', '') or '').strip() != my_store]
+    removed = len(latest_rows) - len(keep)
+    if removed:
+        backend.save_supply_qty(keep)
+        _flash('success', 'この店の出庫可能数の指定を%d件すべて取り消し、全品を在庫まるごとに戻しました。'
+               % removed)
+    else:
+        _flash('info', '取り消す出庫可能数の指定はありませんでした。')
+
+
+def _supply_reduced_caption(rows):
+    """ 出庫可能数を在庫（全量）より減らしている品を、表の下にキャプションで出す。
+        ★表に『在庫（全量）』列を足さない代わりの手当て（本間部長：2列並べると見づらい）。
+          指定が0件なら何も出さない。数値は _fmt_qty で末尾の .00 を落とす。 """
+    parts = []
+    for r in (rows or []):
+        stock = _to_float(r.get('在庫数', 0))
+        eff = _to_float(r.get('出庫可能数', stock), stock)
+        if stock > 0 and round(eff, 2) < round(stock, 2):
+            parts.append('%s（在庫 %s → %s）'
+                         % (r.get('薬品名', ''), _fmt_qty(stock), _fmt_qty(eff)))
+    if parts:
+        st.caption('出庫可能数を減らしている品：' + '、'.join(parts))
+
+
+def supply_editor(rows, my_store, backend, exclusions, table_key,
+                  paint_expiry=True, n_supply_specified=0):
     """
-    ②デッド品・③期限切迫品の表を「行選択方式」で描く。
-      rows          … app_logic.build_view_a / build_view_expiry の戻り
-      table_key     … 画面部品を区別するための名前（'dead' / 'expiry'）
-      paint_expiry  … 有効期限まで5ヶ月以内（＝期限切迫）の行を薄赤に塗るか（②=True／③=False）。
-                      ③は全行が期限切迫なので塗ると真っ赤になるだけ＝Falseで白のままにする。
-    表示は『出庫可能数』1列（＝実際に出す数・既定は在庫全量）にまとめてある。
-      ★2026-08-10（第2弾・本間部長指示）：以前は『在庫数』（全量）と『出せる数』（実効数量）を
-        2列で並べていたが、数量を指定していない品では必ず同じ値になり見づらかったため、
-        『出庫可能数』1列に統一した。全量は number_input の max_value と『全量に戻す』のため
-        内部（ビューの隠しキー『在庫数』）には保持している（画面に出さないだけ）。
-    ・②では有効期限まで5ヶ月以内の行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
-    ・数量（出庫可能数）は末尾の .00 を落として表示、金額（在庫金額）は小数第2位のまま（②③とも共通）。
-    ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える。
+    ②デッド品・③期限切迫品の表を「セル直接編集方式（st.data_editor）」で描く。
+      rows              … app_logic.build_view_a / build_view_expiry の戻り
+      table_key         … 画面部品を区別する名前（'dead' / 'expiry'）
+      paint_expiry      … ②かどうか（True＝②）。②のときだけ、有効期限まで5ヶ月以内の品の
+                          薬品名の先頭に ⚠ を付ける（③は全行が期限切迫なので付けない）。
+      n_supply_specified… この店で現在『出庫可能数』の指定が入っている件数
+                          （一括取消ボタンの表示・活性に使う）。
 
-    ★出せる数の指定は2段方式：上の表で行を選ぶ → 表の下の number_input で数量を入れる。
-      st.data_editor は使わない（pandas Styler の色＝期限切迫の薄赤・滞留色が全部消えるため。
-      2026-07-27 に一度この罠を踏んで行選択方式へ戻した経緯がある）。必ず
-      st.dataframe(..., on_select='rerun', selection_mode='multi-row') のままにする。
+    ★2026-08-10（第3弾・本間部長指示）★
+      「セルをクリックして数を直接書き換えたい」という指示に応え、行選択＋number_input の2段方式を
+      やめ、st.data_editor（表内で直接編集）に切り替えた。
+      ・st.data_editor は pandas Styler の色（期限切迫の薄赤・滞留色）を表示できない。
+        本間部長は「表を直接編集できるようにする（色は消える）」を選択済み（トレードオフ承知）。
+      ・色が消えるぶんの情報の代替：
+        - 期限切迫（②のみ）… 薬品名の先頭に ⚠（判定は yuzu_core の _expiry_flag をそのまま使う）
+        - 滞留             … 『滞留』列の文字（2ヶ月目など）はそのまま残る
+        - 滞留の色の意味   … stagnation_legend(..., chips=False) の文字だけの説明に切替
+      ・列は：除外／薬品名／滞留／単位／出庫可能数／在庫金額／有効期限／期限切迫区分／区分／引取候補店。
+        編集できるのは「除外」（チェック）と「出庫可能数」だけ。ほかは disabled で読み取り専用。
+      ・NumberColumn は printf 系ではカンマ区切りにできない（2026-07-27確認）ので、読み取り専用の
+        金額（在庫金額）はあらかじめ '20,759.20' の文字列にして TextColumn で出す。出庫可能数は
+        編集させたいので NumberColumn（format='localized'＝桁区切りが出て 77／1,234 が末尾 .00 なしで読める）。
+      ・NumberColumn の max_value は列に1つしか指定できず行ごとの在庫上限にできないので指定せず、
+        保存時に _validate_supply_desired で在庫（全量）まで自動クランプする。
+      ・★返り値からは _key などの内部キーを取らず、必ず「行の位置（0始まり）」で元の rows から引く
+        （column_config=None の隠し列が返るかは仕様依存で危険。2026-07-27 の記録）。
     """
+    # 直前の保存・取消でためたメッセージを、表の上で1回だけ出す（st.rerun で消えないように）
+    _render_flash()
+
     if not rows:
         st.info('該当する品目はありません。')
         return
 
-    # 「滞留」は薬品名のすぐ隣。『出庫可能数』は旧『在庫数』があった位置（単位の右・在庫金額の左）に置く。
-    #   （旧『在庫数』『出せる数』の2列を1列に統一。値＝実効数量。全量はビューの隠しキー『在庫数』に保持）
-    disp_cols = ['薬品名', '滞留', '単位', '出庫可能数', '在庫金額',
-                 '有効期限', '期限切迫区分', '区分', '引取候補店']
-    df = pd.DataFrame([{c: r.get(c, '') for c in disp_cols} for r in rows])
-    stag_levels = [r.get('_滞留区分', 'new') for r in rows]
-    # 行ごとの「有効期限まで5ヶ月以内か」フラグ（②の薄赤ハイライト用）。
-    #   yuzu_core が計算した _expiry_flag をそのまま並べるだけ＝判定の出どころを1つに保つ。
-    expiry_flags = [bool(r.get('_expiry_flag')) for r in rows]
+    # ---- 表示用 DataFrame（行の順番＝rows の順番。突き合わせは行の位置で行う）----
+    records = []
+    for r in rows:
+        name = r.get('薬品名', '')
+        # ②で期限切迫（有効期限まで5ヶ月以内）の品は薬品名の先頭に ⚠（行の薄赤の代替）
+        if paint_expiry and bool(r.get('_expiry_flag')):
+            name = '⚠ ' + name
+        records.append({
+            '除外': False,                                            # チェックで除外（編集可）
+            '薬品名': name,                                           # 読み取り専用
+            '滞留': r.get('滞留', ''),                                # 読み取り専用（色は無いが文字は残る）
+            '単位': r.get('単位', ''),                                # 読み取り専用
+            '出庫可能数': _to_float(r.get('出庫可能数', 0)),          # ★編集可（これが本命）
+            '在庫金額': '{:,.2f}'.format(_to_float(r.get('在庫金額', 0))),  # カンマ付き文字列（読み取り専用）
+            '有効期限': r.get('有効期限', ''),                        # 読み取り専用
+            '期限切迫区分': r.get('期限切迫区分', ''),                # 読み取り専用
+            '区分': r.get('区分', ''),                                # 読み取り専用
+            '引取候補店': r.get('引取候補店', ''),                    # 読み取り専用
+        })
+    df = pd.DataFrame(records, columns=[
+        '除外', '薬品名', '滞留', '単位', '出庫可能数', '在庫金額',
+        '有効期限', '期限切迫区分', '区分', '引取候補店'])
 
-    event = st.dataframe(
-        _style_expiry(df, paint=paint_expiry, stag_levels=stag_levels,
-                      expiry_flags=expiry_flags),
-        hide_index=True,
-        width='stretch',
-        on_select='rerun',
-        selection_mode='multi-row',
-        key='table_%s' % table_key)
-    stagnation_legend(rows)
+    col_cfg = {
+        '除外': st.column_config.CheckboxColumn(
+            '除外',
+            help='デッドストックリストから外す品にチェックを入れて「除外を保存」を押してください。'),
+        '出庫可能数': st.column_config.NumberColumn(
+            '出庫可能数',
+            help='この店から出す数量です。数字をクリックして直接書き換えられます。'
+                 '在庫（全量）と同じ数にすると「全量を出す」に戻ります'
+                 '（在庫を超える数を入れると自動で全量まで下げます）。',
+            min_value=0.01, step=0.01, format='localized'),
+        '在庫金額': st.column_config.TextColumn('在庫金額'),
+    }
+    # 除外・出庫可能数だけ編集可。ほかは読み取り専用にする。
+    disabled = ['薬品名', '滞留', '単位', '在庫金額', '有効期限', '期限切迫区分', '区分', '引取候補店']
 
-    # 選択された行を「行の位置」で拾い、位置で元の rows から引く（隠し列の値に頼らない確実な方法）
-    picked = _selected_rows(event)
-    checked = [rows[i] for i in picked if 0 <= i < len(rows)]
-    n = len(checked)
+    # 保存・取消のたびに版番号でキーを変え、data_editor を作り直す（古い編集差分の誤適用を防ぐ）
+    ver = st.session_state.get('supqty_ver_%s' % table_key, 0)
+    editor_key = 'editor_%s_%d' % (table_key, ver)
+    edited = st.data_editor(
+        df, column_config=col_cfg, disabled=disabled,
+        hide_index=True, width='stretch', num_rows='fixed', key=editor_key)
 
-    # ---- 出せる数の入力（2段方式の2段目：選んだ行のぶんだけ number_input を並べる）----
-    #   予約が入っている品は数量を変えられない（相手が引き取る約束をしているため）ので入力欄を出さない。
-    editable = [d for d in checked if not (d.get('_予約店', '') or '').strip()]
-    reserved_sel = [d for d in checked if (d.get('_予約店', '') or '').strip()]
-    desired = {}
-    if editable:
-        st.caption('「出庫可能数」＝この店から出す数量です。選んだ品ごとに数を入れて'
-                   '「出庫可能数を保存」を押してください。'
-                   '在庫数と同じ数にすると「全量を出す」に戻ります（指定が消えます）。'
-                   '一切出さないときは代わりに「除外を保存」を使ってください（0は入れられません）。')
-        for d in editable:
-            key = d.get('_key', '')
-            stock = _to_float(d.get('在庫数', 0))         # 在庫数（隠しキー）＝全量。max_value に使う
-            if stock < 0.01 or not key:
-                continue
-            # 既定＝現在の出庫可能数（未指定なら全量）。旧『出せる数』の値と同じ。
-            cur = min(max(_to_float(d.get('出庫可能数', stock), stock), 0.01), stock)
-            # ラベルに全量を添える（表から全量列が消えたので「元の在庫がいくつか」をここで示す）。
-            #   _fmt_qty で .00 を落とす（在庫 77.00 → 在庫 77）。カンマ区切りは維持。
-            desired[key] = st.number_input(
-                '%s（在庫 %s）' % (d.get('薬品名', ''), _fmt_qty(stock)),
-                min_value=0.01, max_value=float(stock), value=float(cur),
-                step=0.01, format='%.10g', key='supqty_%s_%s' % (table_key, key))
-    # ★予約が入っている品を選んだときは、数量を変えられないことをはっきり知らせる（黙って絞らない）。
-    if reserved_sel:
-        st.warning('  \n'.join(
-            ['次の品はすでに引取先が決まっているため、出庫可能数は変えられません。'
-             '取りやめる場合は相手店に連絡してください：']
-            + ['%s → %s が引取予定' % (d.get('薬品名', ''), d.get('_予約店', '')) for d in reserved_sel]))
+    # 滞留の色の意味は、色チップをやめて文字だけで出す（表に色が無いのにチップだけ色付きは誤解のもと）
+    stagnation_legend(rows, chips=False)
 
-    # ---- ボタン3つを横並び：除外を保存／出せる数を保存／全量に戻す ----
+    # ---- 編集結果を「行の位置」で元の rows と突き合わせる（隠し列の値に頼らない）----
+    checked = []       # 除外にチェックが入った品（元の rows の辞書）
+    desired = {}       # {_key: 編集後の出庫可能数}
+    for i, r in enumerate(rows):
+        try:
+            row_e = edited.iloc[i]
+        except Exception:
+            continue
+        if bool(row_e.get('除外', False)):
+            checked.append(r)
+        key = (r.get('_key', '') or '').strip()
+        if key:
+            # セルを空にすると NaN が返るので、その品は現在値のまま（変更なし扱い）にする
+            fallback = _to_float(r.get('出庫可能数', 0))
+            val = _to_float(row_e.get('出庫可能数'), fallback)
+            desired[key] = fallback if val != val else val
+    n_checked = len(checked)
+
+    # 全量から減らしている品を表の下にキャプションで出す（在庫全量列を足さない代わりの手当て）
+    _supply_reduced_caption(rows)
+
+    # ---- ボタン3つ：除外を保存／出庫可能数を保存／指定をすべて取り消す ----
     b1, b2, b3 = st.columns(3)
     with b1:
-        do_excl = st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0))
+        do_excl = st.button('除外を保存（%d件）' % n_checked,
+                            key='btn_%s' % table_key, disabled=(n_checked == 0))
     with b2:
-        do_qty = st.button('出庫可能数を保存（%d件）' % len(editable),
-                           key='btnqty_%s' % table_key, disabled=(len(editable) == 0))
+        do_qty = st.button('出庫可能数を保存', key='btnqty_%s' % table_key)
     with b3:
-        do_reset = st.button('全量に戻す（%d件）' % len(editable),
-                             key='btnrst_%s' % table_key, disabled=(len(editable) == 0))
+        do_clear = st.button('出庫可能数の指定をすべて取り消す（%d件）' % n_supply_specified,
+                            key='btnrst_%s' % table_key, disabled=(n_supply_specified == 0))
+        st.caption('この店で指定している出庫可能数をすべて取り消し、全品を在庫まるごとに戻します。')
 
     if do_excl:
+        _bump_editor(table_key)   # 除外で行が減るので、古い編集差分を残さないよう作り直す
         _save_exclusions_ui(checked, my_store, backend, exclusions)
     elif do_qty:
-        _save_supply_qty_ui(editable, my_store, backend, desired, full=False)
-    elif do_reset:
-        _save_supply_qty_ui(editable, my_store, backend, desired, full=True)
+        _save_supply_qty_ui(rows, my_store, backend, desired)
+        _bump_editor(table_key)
+        st.rerun()
+    elif do_clear:
+        _clear_all_supply_qty_ui(my_store, backend)
+        _bump_editor(table_key)
+        st.rerun()
 
 
 # ============================================================================
@@ -1253,6 +1414,11 @@ def results_section(backend, stores, latest, index):
             # 自店が押さえている品（予約中）。④の下に折りたたみで出し、ここから取り消せる。
             view_reserved = app_logic.build_view_reserved(result, my_store, reservations, latest)
 
+            # この店で現在『出庫可能数』の指定が入っている件数（②③の一括取消ボタン用）。
+            #   supply_rows は apply_supply_cap 後でも行数は変わらない＝取り消す件数と一致する。
+            n_supply_mine = sum(1 for r in supply_rows
+                                if (r.get('店名', '') or '').strip() == my_store)
+
             # ---- ②③④の切替ボタン。選ばれた1つだけを下に描く ----
             #   ④のボタンには「引き取れる薬の件数」を出す。予約中の件数は④の中で別に出す。
             chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive))
@@ -1266,10 +1432,11 @@ def results_section(backend, stores, latest, index):
                 min_amt = result.get('min_supply_amount', 0)
                 sbs = result.get('small_by_store', {}).get(my_store, {'count': 0, 'amt': 0.0})
                 cap = ('デッド＝直近6ヶ月以上、出庫（払い出し）がない在庫です。'
-                       '行が薄赤の品は有効期限まで5ヶ月以内です（期限切迫を兼ねています）。'
+                       '薬品名に ⚠ が付いた品は有効期限まで5ヶ月以内です（期限切迫を兼ねています）。'
+                       '『出庫可能数』のセルをクリックすると、その場で数量を書き換えられます。'
                        '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
-                       '（色の意味は表の下に出ます）。'
-                       'デッドストックリストに載せない医薬品は左端の□にチェックを入れて'
+                       '（意味は表の下に出ます）。'
+                       'デッドストックリストに載せない医薬品は左端の『除外』にチェックを入れて'
                        '「除外を保存」を押してください。'
                        '／在庫金額%s円以上のものだけを載せています。'
                        % '{:,}'.format(min_amt))
@@ -1277,7 +1444,8 @@ def results_section(backend, stores, latest, index):
                     cap += '（少額のため非表示：%d件・計%s円）' % (
                         sbs['count'], '{:,.0f}'.format(sbs.get('amt', 0.0)))
                 st.caption(cap)
-                supply_editor(view_a, my_store, backend, exclusions, table_key='dead')
+                supply_editor(view_a, my_store, backend, exclusions, table_key='dead',
+                              n_supply_specified=n_supply_mine)
                 excluded_section(my_store, backend, exclusions)
 
             elif chosen == VIEW_EXPIRY:
@@ -1285,11 +1453,12 @@ def results_section(backend, stores, latest, index):
                 st.subheader('③（%s）の期限切迫品' % my_store)
                 st.caption('自店の期限切迫在庫（有効期限まで5ヶ月以内・デッドではないもの）と、その引取候補店。'
                            '期限が近い在庫なので、使ってくれる店へ早めに動かすのが有効です。'
+                           '『出庫可能数』のセルをクリックすると、その場で数量を書き換えられます。'
                            '『滞留』の欄は、その品が何ヶ月つづけてこの表に載っているかです'
-                           '（色の意味は表の下に出ます）。'
-                           '（③は全行が期限切迫のため、背景は白のままにしています）')
+                           '（意味は表の下に出ます）。'
+                           '（③は全行が期限切迫のため、薬品名の ⚠ は付けていません）')
                 supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
-                              paint_expiry=False)
+                              paint_expiry=False, n_supply_specified=n_supply_mine)
                 excluded_section(my_store, backend, exclusions)
 
             else:
