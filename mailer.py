@@ -111,12 +111,15 @@ def get_app_url(secrets):
 # 文面の組み立て（純関数＝テストしやすい）
 # ============================================================================
 def _disp_store(name):
-    """ 店名を件名・本文用の表示名にする。末尾が『店／薬局／堂』でなければ『店』を足す
-        （例：東立石→東立石店。鈴木薬局→鈴木薬局のまま。柏駅前→柏駅前店）。 """
-    n = str(name or '').strip()
-    if not n:
-        return ''
-    return n if (n.endswith('店') or n.endswith('薬局') or n.endswith('堂')) else (n + '店')
+    """ 店名を件名・本文用の表示名にする。★アプリの画面と同じ呼び方をそのまま使う。
+
+        いったん「末尾が店／薬局／堂でなければ『店』を足す」実装にしたが、
+        本間部長の指示で『店』は付けないことにした（2026-08-10）。
+        理由：アプリの画面はどこも「東立石」「さと和光」と呼んでいるので、
+        メールだけ呼び方が変わると、メールと画面を突き合わせにくくなる。
+        （「さと和光店」のような据わりの悪い表記も出てしまう。）
+        前後の空白だけ落として、そのまま返す。 """
+    return str(name or '').strip()
 
 
 def _excerpt(text, n=_EXCERPT_LEN):
@@ -178,9 +181,18 @@ def build_notification(kind, actor_store, recipient_store, drugs, body_excerpt, 
     if kind == 'reserved':
         subject = '【デッドストックリスト】%sが予約しました' % disp_actor
         head = '%s が、%sのデッドストックを予約しました。' % (disp_actor, disp_recipient)
-    else:  # 'cancelled'
+    elif kind == 'cancelled':
         subject = '【デッドストックリスト】%sが予約を取り消しました' % disp_actor
         head = '%s が、%sへのデッドストックの予約を取り消しました。' % (disp_actor, disp_recipient)
+    else:
+        # ★知らない種類は、黙って何かを送らずにここで止める。
+        #   以前は else が『取り消しました』の文面になっていたため、
+        #   呼び出し側の綴り違い1つで「予約されていないのに取消の通知が飛ぶ」
+        #   という、いちばん困る間違いが起こり得た（2026-08-10 に塞いだ）。
+        #   呼び出し元（send_notifications）は例外を握って画面に警告を出すだけなので、
+        #   ここで止めても投稿・予約・取消そのものは必ず残る。
+        raise ValueError('お知らせメールの種類が不明です：%r'
+                         '（message／reserved／cancelled のどれかにしてください）' % (kind,))
 
     parts = [head, '']
     if drugs:
