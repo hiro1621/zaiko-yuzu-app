@@ -55,6 +55,8 @@ PREV_PREFIX = '前月_'   # 前月_YYYYMM
 EXCLUDE_TAB = '_除外'   # 店が「この品は融通に出さない」と外した品目
 RESERVE_TAB = '_予約'   # 受け手の店が「この品はうちが引き取ります」と押さえた品目
 SUPPLY_QTY_TAB = '_提供数量'  # 出し手の店が「この品はN錠だけ出す」と決めた数量
+MESSAGE_TAB = '_やり取り'        # 店舗間の掲示板（相手店ごとに1本のスレッド）。1行＝1投稿。
+MESSAGE_READ_TAB = '_やり取り既読'  # 「どの店が・どのスレッドを・いつまで読んだか」（未読件数の判定用）
 
 # _index の見出し（列順）
 INDEX_HEADERS = ['店名', '対象年月', 'アップ日時', '行数', '様式', 'ファイル名']
@@ -79,6 +81,19 @@ RESERVE_HEADERS = ['予約した店', '出し手店', '対象年月', '受取予
 #   ★年月列は持たせない＝除外と同じく持ち越す（月が変わっても指定は生き続ける。在庫が
 #     減った品は読み込み時に在庫数まで自動で頭打ち＝app_logic.apply_supply_cap）。
 SUPPLY_QTY_HEADERS = ['店名', '品目キー', '薬品名', '出せる数', '更新日時']
+
+# _やり取り の見出し（列順）
+#   1行＝1投稿。店A・店B は「相手店ごとに1本」のスレッドキー（thread_pair で sorted 済み）。
+#   ・薬品名 … その投稿がどの薬の話かを任意で添える（空＝薬を特定しない全般の話）。
+#   ・投稿店 … 実際に書いた店（店A/店Bのどちらか）。未読判定は「自分以外の店の投稿か」で使う。
+#   ★このタブは append_rows（追記）だけで増やす。clear+update は絶対に使わない
+#     （行が増え続けるうえ、clear+update だと他店の投稿を巻き込んで消す事故になる）。
+MESSAGE_HEADERS = ['投稿日時', '店A', '店B', '薬品名', '投稿店', '本文']
+
+# _やり取り既読 の見出し（列順）
+#   1行＝(店名, 店A, 店B) の1つのスレッドを、その店がいつまで読んだか。
+#   行数が少ない（店数×スレッド数）ので、除外・予約と同じく clear+update で丸ごと書き直す。
+MSG_READ_HEADERS = ['店名', '店A', '店B', '最終確認日時']
 
 
 # ============================================================================
@@ -381,6 +396,89 @@ def write_supply_qty(sh, rows):
         body.append([r.get('店名', ''), r.get('品目キー', ''),
                      r.get('薬品名', ''), r.get('出せる数', ''),
                      r.get('更新日時', '')])
+    _update(ws, body)
+
+
+# ============================================================================
+# _やり取り（店舗間の掲示板）／_やり取り既読 の読み書き
+#   ・スレッドは「相手店ごとに1本」。店A・店B は app_logic.thread_pair で sorted 済みの2店名。
+#   ・_やり取り は行が増え続けるため、書き込みは append_rows（追記）だけにする。
+#     clear+update だと他店の投稿ごと消す事故になるので絶対に使わない（第2弾の設計・本間部長確定）。
+#   ・_やり取り既読 は行数が少ないので、除外・予約と同じく clear+update で丸ごと書き直す。
+#   ・列は必ず見出し名で引く（位置固定にしない）。タブがまだ無ければ空リストを返す。
+# ============================================================================
+def read_messages(sh):
+    """ _やり取り タブを読んで
+        [{'投稿日時','店A','店B','薬品名','投稿店','本文'}, ...] を返す。
+        タブがまだ無ければ空リスト。投稿店・本文がどちらも空の行（見出し・空行）は読み飛ばす。 """
+    ws = _find_ws(sh, MESSAGE_TAB)
+    if ws is None:
+        return []
+    values = _values(ws)
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        if not cell('投稿店') and not cell('本文'):
+            continue
+        out.append({'投稿日時': cell('投稿日時'), '店A': cell('店A'), '店B': cell('店B'),
+                    '薬品名': cell('薬品名'), '投稿店': cell('投稿店'), '本文': cell('本文')})
+    return out
+
+
+def append_message(sh, row):
+    """ _やり取り タブへ1投稿だけ追記する（★append_rows による追記のみ。clear+update は使わない）。
+        row は read_messages と同じ形の辞書（見出し名で引いて列順に並べ替える）。
+        タブが無ければ作り、まだ空なら見出し行も一緒に書く。429は _call のリトライに乗せる。 """
+    ws = _get_or_create_ws(sh, MESSAGE_TAB, rows=5000, cols=len(MESSAGE_HEADERS) + 2)
+    values = _values(ws)
+    body = []
+    if not values:                       # まだ空＝いちばん最初は見出し行を先に置く
+        body.append(list(MESSAGE_HEADERS))
+    body.append([str(row.get(h, '') or '') for h in MESSAGE_HEADERS])
+    _call(ws.append_rows, body, value_input_option='RAW')
+
+
+def read_msg_reads(sh):
+    """ _やり取り既読 タブを読んで [{'店名','店A','店B','最終確認日時'}, ...] を返す。
+        タブがまだ無ければ空リスト。店名が欠けた行は読み飛ばす。 """
+    ws = _find_ws(sh, MESSAGE_READ_TAB)
+    if ws is None:
+        return []
+    values = _values(ws)
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        if not cell('店名'):
+            continue
+        out.append({'店名': cell('店名'), '店A': cell('店A'), '店B': cell('店B'),
+                    '最終確認日時': cell('最終確認日時')})
+    return out
+
+
+def write_msg_reads(sh, rows):
+    """ 既読リストを丸ごと書き直す（rows は read_msg_reads と同じ形の辞書リスト・write_exclusions の写経）。 """
+    ws = _get_or_create_ws(sh, MESSAGE_READ_TAB, rows=max(2000, len(rows) + 10), cols=8)
+    _clear(ws)
+    body = [list(MSG_READ_HEADERS)]
+    for r in rows:
+        body.append([r.get('店名', ''), r.get('店A', ''),
+                     r.get('店B', ''), r.get('最終確認日時', '')])
     _update(ws, body)
 
 

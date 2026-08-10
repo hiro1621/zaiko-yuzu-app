@@ -751,6 +751,154 @@ def pickup_request_bytes(result, my_store, reservations, ym):
 
 
 # ============================================================================
+# 店舗間のやり取り（掲示板）… 第2弾・本間部長確定 2026-08-10
+#   ・スレッドの単位は「相手店ごとに1本」。予約1件ごとではない
+#     （東立石⇄みずほ台 は、みずほ台のデッド品を4件予約していても会話の場は1つ）。
+#   ・スレッドのキーは店名2つを sorted() で固定（店A／店B）。どちらが出し手／受け手かでは分けない。
+#   ・個別の薬の話は、投稿ごとに任意で『薬品名』を添えて解決する。
+#   ・ここは Streamlit に依存しない純関数だけ（品質管理部がテストしやすいように）。
+# ============================================================================
+def thread_pair(a, b):
+    """ 店名2つを sorted() して (店A, 店B) の順に固定して返す。
+        同じ相手との会話を必ず1本のスレッドにまとめるためのキー。前後の空白は落とす。 """
+    pair = sorted([str(a or '').strip(), str(b or '').strip()])
+    return (pair[0], pair[1])
+
+
+def _last_read_at(my_store, store_a, store_b, msg_reads):
+    """ 自店(my_store)が、(店A,店B)のスレッドを最後に確認した日時を返す。無ければ空文字。 """
+    a, b = thread_pair(store_a, store_b)
+    my = str(my_store or '').strip()
+    for r in (msg_reads or []):
+        if (str(r.get('店名', '') or '').strip() == my
+                and str(r.get('店A', '') or '').strip() == a
+                and str(r.get('店B', '') or '').strip() == b):
+            return str(r.get('最終確認日時', '') or '')
+    return ''
+
+
+def unread_count(my_store, thread, msg_reads):
+    """ スレッドの未読件数を返す純関数。
+        未読＝その投稿が『自分以外の店』のもので、かつ『自分の既読日時より新しい』もの。
+          my_store  … 自店名
+          thread    … build_threads が返すスレッド辞書（'messages' に投稿のリストを持つ）
+          msg_reads … _やり取り既読 の行リスト（read_msg_reads と同じ形）
+        ★日時は 'YYYY/MM/DD HH:MM:SS'（ゼロ詰め固定幅）なので、文字列の大小比較でそのまま時系列になる。 """
+    my = str(my_store or '').strip()
+    last_read = _last_read_at(my, thread.get('店A', ''), thread.get('店B', ''), msg_reads)
+    n = 0
+    for m in thread.get('messages', []):
+        if str(m.get('投稿店', '') or '').strip() == my:
+            continue                                  # 自分の投稿は未読にならない
+        if str(m.get('投稿日時', '') or '') > last_read:
+            n += 1
+    return n
+
+
+def mark_thread_read(msg_reads, my_store, store_a, store_b, now):
+    """ (店名=my_store, 店A, 店B) の既読日時を now に更新した新しい行リストを返す純関数。
+        既存の自分の行があれば更新、無ければ追加する。ほかの店・ほかのスレッドの行は一切触らない。 """
+    a, b = thread_pair(store_a, store_b)
+    my = str(my_store or '').strip()
+    out = []
+    replaced = False
+    for r in (msg_reads or []):
+        if (str(r.get('店名', '') or '').strip() == my
+                and str(r.get('店A', '') or '').strip() == a
+                and str(r.get('店B', '') or '').strip() == b):
+            out.append({'店名': my, '店A': a, '店B': b, '最終確認日時': now})
+            replaced = True
+        else:
+            out.append(dict(r))
+    if not replaced:
+        out.append({'店名': my, '店A': a, '店B': b, '最終確認日時': now})
+    return out
+
+
+def build_threads(my_store, messages, reservations):
+    """
+    自店(my_store)が関わるスレッド（相手店ごとに1本）の一覧を返す純関数。
+
+      messages     … _やり取り の行リスト（read_messages と同じ形）
+      reservations … _予約 の行リスト（read_reservations と同じ形）
+
+    スレッドが一覧に出る条件（本間部長確定）：
+      「自店が関わる予約が1件以上ある相手店」または「過去に1件でも投稿がある相手店」。
+      → 予約が取り消されても、月をまたいでも、投稿さえ残っていれば会話は消えない
+        （言った言わないの元になるため、会話ログは残す）。
+
+    各要素（スレッド辞書）が持つもの：
+      '相手店名'／'予約中の品'（薬品名のリスト・重複除去）／'最終投稿日時'／'最終投稿店'／
+      '件数'（投稿数）／'店A'・'店B'（sorted 済みのスレッドキー）／'messages'（時系列の投稿リスト）
+    """
+    my = str(my_store or '').strip()
+    messages = messages or []
+    reservations = reservations or []
+
+    # 相手店 → 予約中の品・投稿 をためる箱
+    others = {}   # 相手店名 → {'reserved_names':[], 'reserved_seen':set(), 'messages':[]}
+
+    def _box(other):
+        o = str(other or '').strip()
+        if not o or o == my:
+            return None
+        if o not in others:
+            others[o] = {'reserved_names': [], 'reserved_seen': set(), 'messages': []}
+        return o
+
+    # (1) 予約から「相手店」と「予約中の品（薬品名）」を集める（出し手／受け手の両方向）
+    for r in reservations:
+        booker = str(r.get('予約した店', '') or '').strip()      # 予約した店（受け手）
+        supplier = str(r.get('出し手店', '') or '').strip()      # 出し手店
+        if my == booker:
+            other = supplier
+        elif my == supplier:
+            other = booker
+        else:
+            continue
+        o = _box(other)
+        if o is None:
+            continue
+        name = str(r.get('薬品名', '') or '').strip()
+        if name and name not in others[o]['reserved_seen']:
+            others[o]['reserved_seen'].add(name)
+            others[o]['reserved_names'].append(name)
+
+    # (2) 投稿から「相手店」と「その相手との投稿」を集める（店A/店Bは sorted 済み）
+    for m in messages:
+        a = str(m.get('店A', '') or '').strip()
+        b = str(m.get('店B', '') or '').strip()
+        if my != a and my != b:
+            continue
+        other = b if my == a else a
+        o = _box(other)
+        if o is None:
+            continue
+        others[o]['messages'].append(m)
+
+    threads = []
+    for other, info in others.items():
+        # 投稿は時系列（投稿日時の昇順）に並べる。日時が同じ・空でも安定するよう元の順を保つ
+        msgs = sorted(info['messages'], key=lambda x: str(x.get('投稿日時', '') or ''))
+        a, b = thread_pair(my, other)
+        last_at = msgs[-1].get('投稿日時', '') if msgs else ''
+        last_by = msgs[-1].get('投稿店', '') if msgs else ''
+        threads.append({
+            '相手店名': other,
+            '予約中の品': list(info['reserved_names']),
+            '最終投稿日時': last_at,
+            '最終投稿店': last_by,
+            '件数': len(msgs),
+            '店A': a, '店B': b,
+            'messages': msgs,
+        })
+    # 並び：最終投稿が新しい順（投稿の無いスレッドは末尾）→ 相手店名の五十音
+    threads.sort(key=lambda t: t['相手店名'])
+    threads.sort(key=lambda t: t['最終投稿日時'], reverse=True)
+    return threads
+
+
+# ============================================================================
 # 「○/N店 アップ済み」の集計
 # ============================================================================
 def uploaded_status(index, latest, all_store_names):
@@ -806,6 +954,8 @@ class LocalBackend:
         state.setdefault('exclusions', [])   # 店が「出さない」と外した品目
         state.setdefault('reservations', [])  # 受け手の店が「うちが引き取る」と押さえた品目
         state.setdefault('supply_qty', [])   # 出し手の店が「この品はN錠だけ出す」と決めた数量
+        state.setdefault('messages', [])     # 店舗間のやり取り（掲示板）＝1件1投稿
+        state.setdefault('msg_reads', [])    # どの店がどのスレッドをいつまで読んだか（未読判定用）
         self.state = state
 
     # --- gsheet_store と同じメソッド名・戻り値でそろえる ---
@@ -892,3 +1042,19 @@ class LocalBackend:
     def save_supply_qty(self, rows):
         """ 提供数量リストを丸ごと入れ替える（Gシート版と同じ挙動）。 """
         self.state['supply_qty'] = list(rows)
+
+    def load_messages(self):
+        """ 店舗間のやり取り（掲示板）を全部返す（Gシート版 read_messages と同じ形）。 """
+        return list(self.state['messages'])
+
+    def append_message(self, row):
+        """ やり取りを1件だけ追記する（★追記のみ＝過去の投稿を消さない・Gシート版と同じ挙動）。 """
+        self.state['messages'].append(dict(row))
+
+    def load_msg_reads(self):
+        """ どの店がどのスレッドをいつまで読んだかを返す（Gシート版 read_msg_reads と同じ形）。 """
+        return list(self.state['msg_reads'])
+
+    def save_msg_reads(self, rows):
+        """ 既読リストを丸ごと入れ替える（Gシート版 write_msg_reads と同じ挙動）。 """
+        self.state['msg_reads'] = list(rows)

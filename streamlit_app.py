@@ -190,6 +190,61 @@ def clear_stores_cache():
 
 
 # ============================================================================
+# やり取り（掲示板）のセッションキャッシュ（2026-08-10 第2弾）
+#   ★★背景：Google Sheets API はサービスアカウント合計で1分60回が上限。ふつうの操作
+#     （行を選ぶ・画面を切り替える）のたびに _やり取り と _やり取り既読 を読むと上限に近づき、
+#     「予約するとフリーズする」類の不具合が再発する。
+#   → この2タブは 60秒のセッションキャッシュ越しに読む（load_prev_cached と同じ型）。
+#     ふだんの再描画では読み直さず（＝+0回）、投稿・既読更新の直後だけキャッシュを捨てて読み直す。
+#     待てないときのために ⑤の上に「最新に更新」ボタンを置き、手で読み直せるようにする。
+# ============================================================================
+# 投稿日時・既読日時の形式。ゼロ詰め固定幅なので文字列比較でそのまま時系列になる。
+#   秒まで持つのは、同じ分に届いた投稿を「既読にした瞬間より後」と正しく判定できるようにするため。
+MSG_TS_FMT = '%Y/%m/%d %H:%M:%S'
+_MSG_CACHE_TTL = 60   # 秒
+
+
+def load_messages_cached(backend, force=False):
+    """ _やり取り・_やり取り既読 を 60秒のセッションキャッシュ越しに読む。
+        force=True でキャッシュを無視して読み直す（「最新に更新」ボタン・投稿/既読更新の直後）。
+        戻り値：(messages, msg_reads)。読めないタブは（あれば）前回値、無ければ空リストで返す。 """
+    import time as _time
+    if not hasattr(backend, 'load_messages'):
+        return [], []      # 古い保管庫でも落ちない
+    now = _time.time()
+    cache = st.session_state.get('messages_cache')
+    if (not force) and cache and (now - cache.get('t', 0) < _MSG_CACHE_TTL):
+        return cache['messages'], cache['reads']
+    prev = cache or {}
+    try:
+        messages = backend.load_messages()
+    except Exception as e:
+        show_gsheet_error(e, 'やり取りを読めませんでした', 'warning')
+        messages = prev.get('messages', [])
+    try:
+        reads = backend.load_msg_reads()
+    except Exception as e:
+        show_gsheet_error(e, 'やり取りの既読情報を読めませんでした', 'warning')
+        reads = prev.get('reads', [])
+    st.session_state['messages_cache'] = {'t': now, 'messages': messages, 'reads': reads}
+    return messages, reads
+
+
+def clear_messages_cache():
+    """ 投稿・既読更新の直後に呼ぶ（次の描画でやり取りを必ず読み直させる）。 """
+    st.session_state.pop('messages_cache', None)
+
+
+def _fmt_msg_time(s):
+    """ 投稿日時（YYYY/MM/DD HH:MM:SS 等）を画面用の『MM/DD HH:MM』にする。
+        形式が違う・短い値はそのまま返す（黙って落とさない）。 """
+    s = str(s or '')
+    if len(s) >= 16 and s[4:5] == '/':
+        return s[5:16]      # 'MM/DD HH:MM'
+    return s
+
+
+# ============================================================================
 # 保管庫バックエンド（Gシート or ローカル）を用意する
 #   ・両者は同じメソッド名（save_store_upload / load_current_month_stores）を持つ。
 # ============================================================================
@@ -225,6 +280,18 @@ class _GSheetAdapter:
 
     def save_supply_qty(self, rows):
         gsheet_store.write_supply_qty(self.sh, rows)
+
+    def load_messages(self):
+        return gsheet_store.read_messages(self.sh)
+
+    def append_message(self, row):
+        gsheet_store.append_message(self.sh, row)
+
+    def load_msg_reads(self):
+        return gsheet_store.read_msg_reads(self.sh)
+
+    def save_msg_reads(self, rows):
+        gsheet_store.write_msg_reads(self.sh, rows)
 
     def load_index(self):
         """ _index だけを読む（1タブ）。在庫本体（raw_）を読み直すかどうかの判定に使う。 """
@@ -634,7 +701,7 @@ def _supply_reduced_caption(rows):
 
 
 def supply_editor(rows, my_store, backend, exclusions, table_key,
-                  paint_expiry=True, n_supply_specified=0):
+                  paint_expiry=True, n_supply_specified=0, msg_by_store=None):
     """
     ②デッド品・③期限切迫品の表を「セル直接編集方式（st.data_editor）」で描く。
       rows              … app_logic.build_view_a / build_view_expiry の戻り
@@ -643,6 +710,9 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
                           薬品名の先頭に ⚠ を付ける（③は全行が期限切迫なので付けない）。
       n_supply_specified… この店で現在『出庫可能数』の指定が入っている件数
                           （一括取消ボタンの表示・活性に使う）。
+      msg_by_store      … {相手店名: 'N件 ●'} のやり取り早見表（2026-08-10 第2弾）。
+                          予約が入っている品は、予約した店とのやり取り件数を『やり取り』列に出す。
+                          ★この列は読み取り専用（disabled）＝表示だけで、編集は「除外」「出庫可能数」だけ。
 
     ★2026-08-10（第3弾・本間部長指示）★
       「セルをクリックして数を直接書き換えたい」という指示に応え、行選択＋number_input の2段方式を
@@ -676,12 +746,15 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
         return
 
     # ---- 表示用 DataFrame（行の順番＝rows の順番。突き合わせは行の位置で行う）----
+    msg_by_store = msg_by_store or {}
     records = []
     for r in rows:
         name = r.get('薬品名', '')
         # ②で期限切迫（有効期限まで5ヶ月以内）の品は薬品名の先頭に ⚠（行の薄赤の代替）
         if paint_expiry and bool(r.get('_expiry_flag')):
             name = '⚠ ' + name
+        # 予約が入っている品は、その予約店とのやり取り件数を出す（無ければ空）
+        talk = msg_by_store.get((r.get('_予約店', '') or '').strip(), '')
         records.append({
             '除外': False,                                            # チェックで除外（編集可）
             '薬品名': name,                                           # 読み取り専用
@@ -692,11 +765,12 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
             '有効期限': r.get('有効期限', ''),                        # 読み取り専用
             '期限切迫区分': r.get('期限切迫区分', ''),                # 読み取り専用
             '区分': r.get('区分', ''),                                # 読み取り専用
+            'やり取り': talk,                                         # 読み取り専用（予約店とのやり取り件数）
             '引取候補店': r.get('引取候補店', ''),                    # 読み取り専用
         })
     df = pd.DataFrame(records, columns=[
         '除外', '薬品名', '滞留', '単位', '出庫可能数', '在庫金額',
-        '有効期限', '期限切迫区分', '区分', '引取候補店'])
+        '有効期限', '期限切迫区分', '区分', 'やり取り', '引取候補店'])
 
     col_cfg = {
         '除外': st.column_config.CheckboxColumn(
@@ -709,9 +783,14 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
                  '（在庫を超える数を入れると自動で全量まで下げます）。',
             min_value=0.01, step=0.01, format='%.10g'),
         '在庫金額': st.column_config.TextColumn('在庫金額'),
+        'やり取り': st.column_config.TextColumn(
+            'やり取り',
+            help='予約が入っている品は、その相手店とのやり取り件数を出します（● は自店の未読あり）。'
+                 '会話は⑤「やり取り」で見られます。'),
     }
-    # 除外・出庫可能数だけ編集可。ほかは読み取り専用にする。
-    disabled = ['薬品名', '滞留', '単位', '在庫金額', '有効期限', '期限切迫区分', '区分', '引取候補店']
+    # 除外・出庫可能数だけ編集可。ほかは読み取り専用にする（やり取り列も必ず読み取り専用）。
+    disabled = ['薬品名', '滞留', '単位', '在庫金額', '有効期限', '期限切迫区分', '区分',
+                'やり取り', '引取候補店']
 
     # 保存・取消のたびに版番号でキーを変え、data_editor を作り直す（古い編集差分の誤適用を防ぐ）
     ver = st.session_state.get('supqty_ver_%s' % table_key, 0)
@@ -778,7 +857,8 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
 VIEW_DEAD = 'dead'        # ②自店のデッド品
 VIEW_EXPIRY = 'expiry'    # ③自店の期限切迫品
 VIEW_RECEIVE = 'receive'  # ④自店が引き取れる薬
-VIEW_ORDER = [VIEW_DEAD, VIEW_EXPIRY, VIEW_RECEIVE]
+VIEW_MESSAGE = 'message'  # ⑤店舗間のやり取り（掲示板）
+VIEW_ORDER = [VIEW_DEAD, VIEW_EXPIRY, VIEW_RECEIVE, VIEW_MESSAGE]
 
 # ④の予約で選ぶ「受取時期」（今すぐ／1〜3ヶ月後の4択・最大3ヶ月・本間部長確定）。
 #   実際に予約する月は、品ごとの有効期限キャップ（app_logic.pickup_cap）で頭打ちにする。
@@ -795,13 +875,15 @@ def _pickup_offset_selector(key):
              '有効期限が近い品は、期限の月より先は選べません（自動で早めます）。')
 
 
-def view_switcher(n_dead, n_expiry, n_receive):
+def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
     """
-    ②③④を切り替えるボタンを描き、選ばれた画面の記号（VIEW_*）を返す。
+    ②③④⑤を切り替えるボタンを描き、選ばれた画面の記号（VIEW_*）を返す。
       ・件数をボタンに入れて、開く前に中身があるかどうか分かるようにする。
+        ⑤は投稿数ではなく『新着（未読）件数』を出す（0件のときは「（新着…）」を付けない）。
       ・★選択肢そのものは VIEW_* の記号にして、見た目の文字は format_func で作る。
         ボタンの文字（件数入り）を選択肢にしてしまうと、除外を保存して件数が変わった瞬間に
         「保存されている選択」が選択肢の中から消えて、③④を見ていても②に戻されてしまう。
+        ⑤の新着件数も未読が0になると変わるので、記号を選択肢にするこの作りが必須（設計の肝）。
       ・★segmented_control は選択中のボタンをもう一度押すと「選択なし（None）」を返すので、
         そのときは②に戻す（画面が空になるのを防ぐ）。
       ・segmented_control が無い古いStreamlitでは st.radio（横並び）に自動で切り替える。
@@ -810,6 +892,7 @@ def view_switcher(n_dead, n_expiry, n_receive):
         VIEW_DEAD:    '②  デッド品（%d件）' % n_dead,
         VIEW_EXPIRY:  '③  期限切迫品（%d件）' % n_expiry,
         VIEW_RECEIVE: '④  引き取れる薬（%d件）' % n_receive,
+        VIEW_MESSAGE: ('⑤  やり取り（新着%d件）' % n_unread) if n_unread else '⑤  やり取り',
     }
     st.caption('見たい表のボタンを押してください（選んだものだけを表示します）。')
     picker = getattr(st, 'segmented_control', None)
@@ -824,13 +907,23 @@ def view_switcher(n_dead, n_expiry, n_receive):
     return chosen or VIEW_DEAD
 
 
-def receive_section(view_receive, my_store, backend, reservations, ym):
+def _receive_view_with_talk(r, hidden, msg_by_store):
+    """ ④受け手側の行 r を画面表示用の辞書に整える（隠し列を除き、末尾に『やり取り』列を足す）。
+        『やり取り』＝その品の出し手店とのやり取り件数（'N件 ●' 形式・無ければ空）。会話は⑤で見る。
+        ★④本体・別枠・予約中の3つの表で同じ整え方をする（同じ列を2通りに作らないため）。 """
+    d = {k: v for k, v in r.items() if k not in hidden}
+    d['やり取り'] = (msg_by_store or {}).get((r.get('出し手店', '') or '').strip(), '')
+    return d
+
+
+def receive_section(view_receive, my_store, backend, reservations, ym, msg_by_store=None):
     """
     ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧。
       ・2026-07-28に「予約」を付けた。左端の□で選んで「予約する」を押すと、その品は
         ほかの店の④から消え、出し手の②③には「◯◯が引取予定」と出る。
       ・予約は品目まるごと。数量の相談は従来どおり電話・デスクネッツ。
       ・★保存の直前に予約表を読み直して重複を止める（下の _save_reservations 参照）。
+      ・2026-08-10 第2弾：出し手店ごとのやり取り件数を『やり取り』列で出す（会話は⑤で見る）。
     """
     st.subheader('④（%s）が引き取れる薬（他店のデッド・期限切迫）' % my_store)
     st.caption('他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品です。'
@@ -846,7 +939,7 @@ def receive_section(view_receive, my_store, backend, reservations, ym):
 
     # 内部用の列（_出し手店・_key・滞留区分・有効期限キャップ用など）は画面に出さない
     hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数', '_有効期限')
-    df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_receive])
+    df = pd.DataFrame([_receive_view_with_talk(r, hidden, msg_by_store) for r in view_receive])
     stag_levels = [r.get('_滞留区分', 'new') for r in view_receive]
     event = st.dataframe(
         _style_expiry(df, paint=False, stag_levels=stag_levels),
@@ -922,7 +1015,7 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
         st.rerun()
 
 
-def receive_ref_section(view_ref, my_store, backend, reservations, ym):
+def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_store=None):
     """
     ④の別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修・2026-08-01）。
       ・自店もその薬を使っているが、いま在庫を余らせている品（tier③参考）。今すぐ引き取ると
@@ -941,7 +1034,7 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym):
             return
         # ④本体と同じ隠し列
         hidden = ('_出し手店', '_key', '_予約店', '_滞留区分', '_滞留月数', '_有効期限')
-        df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden} for r in view_ref])
+        df = pd.DataFrame([_receive_view_with_talk(r, hidden, msg_by_store) for r in view_ref])
         stag_levels = [r.get('_滞留区分', 'new') for r in view_ref]
         event = st.dataframe(
             _style_expiry(df, paint=False, stag_levels=stag_levels),
@@ -957,9 +1050,11 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym):
             _save_reservations(backend, my_store, ym, checked, reservations, offset)
 
 
-def reserved_section(view_reserved, my_store, backend, reservations, result, latest):
+def reserved_section(view_reserved, my_store, backend, reservations, result, latest,
+                     msg_by_store=None):
     """ 「予約中の品」を折りたたみで出し、選んで取り消せるようにする（②③の除外と同じ操作感）。
-        ★2026-08-01：一番下に「引取依頼書（出し手店ごとのExcel）」を作るボタンを足した（④の改修）。 """
+        ★2026-08-01：一番下に「引取依頼書（出し手店ごとのExcel）」を作るボタンを足した（④の改修）。
+        ★2026-08-10 第2弾：出し手店ごとのやり取り件数を『やり取り』列で出す（会話は⑤で見る）。 """
     with st.expander('予約中の品（%d件）＝自店が引き取ると押さえている薬' % len(view_reserved)):
         if not view_reserved:
             st.write('いまは1件もありません。')
@@ -967,7 +1062,7 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
         st.caption('予約をやめる品を左端の□で選び、下のボタンを押してください。'
                    '取り消すと、その品はまたほかの店の一覧にも出るようになります。')
         hidden = ('_出し手店', '_key', '_受取予定月')
-        df = pd.DataFrame([{k: v for k, v in r.items() if k not in hidden}
+        df = pd.DataFrame([_receive_view_with_talk(r, hidden, msg_by_store)
                            for r in view_reserved])
         event = st.dataframe(
             _style_expiry(df, paint=False), hide_index=True, width='stretch',
@@ -1008,6 +1103,122 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
                 data=st.session_state['pickup_xls'], file_name=pk_name,
                 mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 key='dl_pickup')
+
+
+# ============================================================================
+# ⑤ 店舗間のやり取り（掲示板）＝第2弾・本間部長確定 2026-08-10
+#   ・スレッドは「相手店ごとに1本」。同じ相手との会話は必ず1つにまとまる（予約1件ごとではない）。
+#   ・上段で相手店を選び、下段でその相手との会話を時系列で見て投稿する。
+#   ・スレッドを開いたら既読日時を「いま」に更新する（未読が消える）。
+#   ・API節約：やり取りは60秒のセッションキャッシュ越しに読む。投稿・既読更新の直後だけ捨てる。
+# ============================================================================
+def message_section(my_store, backend, threads, msg_reads):
+    """
+    ⑤ 店舗間のやり取り。threads は app_logic.build_threads の戻り（自店が関わるスレッド一覧）。
+      ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を st.dataframe の行選択で選ぶ。
+        ★一覧の並びは相手店名の五十音で固定する（投稿しても順番が変わらない＝選んだ行がずれない）。
+          未読のあるスレッドは相手店名の左に ● を付けて目立たせる（並べ替えでは動かさない）。
+      ・下段：選んだ相手との会話を時系列で表示し、任意で『どの薬の話』を添えて投稿できる。
+    """
+    st.subheader('⑤（%s）店舗間のやり取り' % my_store)
+
+    # 「最新に更新」：60秒キャッシュを捨てて読み直す（他店の新着をすぐ見たいとき用）
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button('最新に更新', key='btn_msg_refresh'):
+            clear_messages_cache()
+            st.rerun()
+    with c2:
+        st.caption('相手ごとに会話は1本にまとまります（予約が入ると、その相手とやり取りできます）。'
+                   '他店の新着は最大60秒ほど遅れて出ます。すぐ見たいときは「最新に更新」を押してください。')
+
+    if not threads:
+        st.info('やり取りできる相手店がまだありません。'
+                '他店のデッド品を予約するか、他店から自店の品を予約されると、その相手との会話が始まります。')
+        return
+
+    # --- 並びは相手店名の五十音で固定（投稿で順番が変わらない＝行選択がずれない）---
+    threads = sorted(threads, key=lambda t: t['相手店名'])
+
+    rows = []
+    for t in threads:
+        ur = app_logic.unread_count(my_store, t, msg_reads)
+        rows.append({
+            '相手店': ('● ' if ur else '　') + t['相手店名'],
+            '新着': ('%d件' % ur) if ur else '',
+            '予約中': ('%d品' % len(t['予約中の品'])) if t['予約中の品'] else '',
+            'やり取り': ('%d件' % t['件数']) if t['件数'] else '',
+        })
+    tdf = pd.DataFrame(rows, columns=['相手店', '新着', '予約中', 'やり取り'])
+    event = st.dataframe(tdf, hide_index=True, width='stretch',
+                         on_select='rerun', selection_mode='single-row',
+                         key='table_threads')
+
+    # 選んだ相手店を覚える（＝順番が固定なので、行の位置＝スレッドの対応が崩れない）。
+    #   何も選んでいない初回は先頭（＝五十音の最初）のスレッドを既定で開く。
+    picked = _selected_rows(event)
+    if picked and 0 <= picked[0] < len(threads):
+        st.session_state['msg_sel_idx'] = picked[0]
+    sel_idx = st.session_state.get('msg_sel_idx', 0)
+    if not (0 <= sel_idx < len(threads)):
+        sel_idx = 0
+    sel = threads[sel_idx]
+
+    st.divider()
+    st.markdown('#### %s とのやり取り' % sel['相手店名'])
+    if sel['予約中の品']:
+        st.caption('予約中：' + '　'.join(sel['予約中の品']))
+
+    if not sel['messages']:
+        st.write('まだ投稿はありません。下の欄から最初のひとことをどうぞ。')
+    else:
+        for m in sel['messages']:
+            st.markdown('**%s　%s**'
+                        % (_fmt_msg_time(m.get('投稿日時', '')), m.get('投稿店', '')))
+            st.write(m.get('本文', ''))
+            drug = str(m.get('薬品名', '') or '').strip()
+            if drug:
+                st.caption('（%s の話）' % drug)
+
+    # --- 投稿フォーム（送信後は入力欄を空に戻すため、版番号でキーを作り直す）---
+    pair_key = '%s__%s' % (sel['店A'], sel['店B'])
+    ver = st.session_state.get('msgver_%s' % pair_key, 0)
+    drug_opts = [''] + list(sel['予約中の品'])
+    drug = st.selectbox(
+        'どの薬の話（任意）', drug_opts,
+        format_func=lambda x: x if x else '（薬を特定しない）',
+        key='msgdrug_%s_%d' % (pair_key, ver))
+    body = st.text_area('本文', key='msgbody_%s_%d' % (pair_key, ver),
+                        placeholder='例）4件まとめてお願いできますか。火曜に取りに伺います。')
+    if st.button('送信', type='primary', key='msgsend_%s' % pair_key):
+        text = (body or '').strip()
+        if not text:
+            st.warning('本文が空です。ひとこと書いてから送信してください。')
+        else:
+            now = datetime.datetime.now().strftime(MSG_TS_FMT)
+            row = {'投稿日時': now, '店A': sel['店A'], '店B': sel['店B'],
+                   '薬品名': drug, '投稿店': my_store, '本文': text}
+            try:
+                backend.append_message(row)
+            except Exception as e:
+                show_gsheet_error(e, '投稿の保存に失敗しました', 'error')
+            else:
+                clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
+                st.session_state['msgver_%s' % pair_key] = ver + 1   # 入力欄を空に戻す
+                st.rerun()
+
+    # --- スレッドを開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
+    if app_logic.unread_count(my_store, sel, msg_reads) > 0:
+        now = datetime.datetime.now().strftime(MSG_TS_FMT)
+        new_reads = app_logic.mark_thread_read(
+            msg_reads, my_store, sel['店A'], sel['店B'], now)
+        try:
+            backend.save_msg_reads(new_reads)
+        except Exception as e:
+            show_gsheet_error(e, '既読の更新に失敗しました', 'warning')
+        else:
+            clear_messages_cache()   # 既読を書いた直後だけキャッシュを捨てて読み直す
+            st.rerun()
 
 
 def excluded_section(my_store, backend, exclusions):
@@ -1424,9 +1635,24 @@ def results_section(backend, stores, latest, index):
             n_supply_mine = sum(1 for r in supply_rows
                                 if (r.get('店名', '') or '').strip() == my_store)
 
-            # ---- ②③④の切替ボタン。選ばれた1つだけを下に描く ----
-            #   ④のボタンには「引き取れる薬の件数」を出す。予約中の件数は④の中で別に出す。
-            chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive))
+            # ---- ⑤やり取り（掲示板）の下ごしらえ（第2弾）----
+            #   ★60秒キャッシュ越しに読む＝ふだんの再描画ではAPIを増やさない（load_messages_cached）。
+            #   スレッドは「相手店ごとに1本」。各表の『やり取り』列と⑤の新着バッジに使う早見表を作る。
+            messages, msg_reads = load_messages_cached(backend)
+            threads = app_logic.build_threads(my_store, messages, reservations)
+            #   相手店 → 'N件 ●'（自店の未読があれば ●）。②③の予約店・④の出し手店で引く。
+            msg_by_store = {}
+            total_unread = 0
+            for t in threads:
+                ur = app_logic.unread_count(my_store, t, msg_reads)
+                total_unread += ur
+                if t['件数'] > 0:
+                    msg_by_store[t['相手店名']] = '%d件%s' % (t['件数'], ' ●' if ur else '')
+
+            # ---- ②③④⑤の切替ボタン。選ばれた1つだけを下に描く ----
+            #   ④のボタンには「引き取れる薬の件数」、⑤には「新着（未読）件数」を出す。
+            chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive),
+                                   n_unread=total_unread)
 
             if chosen == VIEW_DEAD:
                 # ---- ②（自店）のデッド品 ----
@@ -1450,7 +1676,7 @@ def results_section(backend, stores, latest, index):
                         sbs['count'], '{:,.0f}'.format(sbs.get('amt', 0.0)))
                 st.caption(cap)
                 supply_editor(view_a, my_store, backend, exclusions, table_key='dead',
-                              n_supply_specified=n_supply_mine)
+                              n_supply_specified=n_supply_mine, msg_by_store=msg_by_store)
                 excluded_section(my_store, backend, exclusions)
 
             elif chosen == VIEW_EXPIRY:
@@ -1463,16 +1689,24 @@ def results_section(backend, stores, latest, index):
                            '（意味は表の下に出ます）。'
                            '（③は全行が期限切迫のため、薬品名の ⚠ は付けていません）')
                 supply_editor(view_expiry, my_store, backend, exclusions, table_key='expiry',
-                              paint_expiry=False, n_supply_specified=n_supply_mine)
+                              paint_expiry=False, n_supply_specified=n_supply_mine,
+                              msg_by_store=msg_by_store)
                 excluded_section(my_store, backend, exclusions)
 
-            else:
+            elif chosen == VIEW_RECEIVE:
                 # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
-                receive_section(view_receive, my_store, backend, reservations, latest)
+                receive_section(view_receive, my_store, backend, reservations, latest,
+                                msg_by_store=msg_by_store)
                 # ④の下に別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修）
-                receive_ref_section(view_receive_ref, my_store, backend, reservations, latest)
+                receive_ref_section(view_receive_ref, my_store, backend, reservations, latest,
+                                    msg_by_store=msg_by_store)
                 # さらに下に「予約中の品」＋引取依頼書ボタン（④の改修）
-                reserved_section(view_reserved, my_store, backend, reservations, result, latest)
+                reserved_section(view_reserved, my_store, backend, reservations, result, latest,
+                                 msg_by_store=msg_by_store)
+
+            else:
+                # ---- ⑤ 店舗間のやり取り（掲示板）＝第2弾 ----
+                message_section(my_store, backend, threads, msg_reads)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     st.divider()
