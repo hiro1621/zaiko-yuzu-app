@@ -657,7 +657,12 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
         編集できるのは「除外」（チェック）と「出庫可能数」だけ。ほかは disabled で読み取り専用。
       ・NumberColumn は printf 系ではカンマ区切りにできない（2026-07-27確認）ので、読み取り専用の
         金額（在庫金額）はあらかじめ '20,759.20' の文字列にして TextColumn で出す。出庫可能数は
-        編集させたいので NumberColumn（format='localized'＝桁区切りが出て 77／1,234 が末尾 .00 なしで読める）。
+        編集させたいので NumberColumn。
+        ★書式は format='%.10g'（77／12.5 のように末尾の .00 が出ない）。
+          いったん format='localized' にしたが、localized は step（=0.01）から小数桁を決めるため
+          「35.00」のように必ず2桁付いてしまい、本間部長の「.00は表示しない」指示に反した
+          （2026-08-10 実機で確認して差し戻し）。桁区切りのカンマは出なくなるが、
+          数量は3桁以下がほとんどで実害が小さいため、.00 を消す方を優先する。
       ・NumberColumn の max_value は列に1つしか指定できず行ごとの在庫上限にできないので指定せず、
         保存時に _validate_supply_desired で在庫（全量）まで自動クランプする。
       ・★返り値からは _key などの内部キーを取らず、必ず「行の位置（0始まり）」で元の rows から引く
@@ -702,7 +707,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key,
             help='この店から出す数量です。数字をクリックして直接書き換えられます。'
                  '在庫（全量）と同じ数にすると「全量を出す」に戻ります'
                  '（在庫を超える数を入れると自動で全量まで下げます）。',
-            min_value=0.01, step=0.01, format='localized'),
+            min_value=0.01, step=0.01, format='%.10g'),
         '在庫金額': st.column_config.TextColumn('在庫金額'),
     }
     # 除外・出庫可能数だけ編集可。ほかは読み取り専用にする。
