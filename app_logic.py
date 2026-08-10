@@ -815,12 +815,19 @@ def mark_thread_read(msg_reads, my_store, store_a, store_b, now):
     return out
 
 
-def build_threads(my_store, messages, reservations):
+def build_threads(my_store, messages, reservations, qty_by_key=None):
     """
     自店(my_store)が関わるスレッド（相手店ごとに1本）の一覧を返す純関数。
 
       messages     … _やり取り の行リスト（read_messages と同じ形）
       reservations … _予約 の行リスト（read_reservations と同じ形）
+      qty_by_key   … {(出し手店, 予約キー): '20錠'} の早見表（2026-08-10 追加・②の改修）。
+                     渡すと『予約中の品』の各薬品名に数量＋単位を添える（例『ワイドシリン… 20錠』）。
+                     ★既定 None なら今までどおり薬品名だけ（純関数のテストが壊れないように）。
+                     ★引けなかった品（出し手が除外した／当月の提案から消えた）は薬品名だけにする
+                       ＝勝手に「0錠」等と表示して誤解させない（本間部長指示）。
+                     予約キーは reservations 行の『予約キー』＝提案行の yuzu_core.exclusion_key(row)
+                     （除外・予約と共通の規則）。
 
     スレッドが一覧に出る条件（本間部長確定）：
       「自店が関わる予約が1件以上ある相手店」または「過去に1件でも投稿がある相手店」。
@@ -828,22 +835,27 @@ def build_threads(my_store, messages, reservations):
         （言った言わないの元になるため、会話ログは残す）。
 
     各要素（スレッド辞書）が持つもの：
-      '相手店名'／'予約中の品'（薬品名のリスト・重複除去）／'最終投稿日時'／'最終投稿店'／
-      '件数'（投稿数）／'店A'・'店B'（sorted 済みのスレッドキー）／'messages'（時系列の投稿リスト）
+      '相手店名'／'予約中の品'（薬品名＋数量のリスト・重複除去）／
+      '予約中の品名'（数量を付けない“素の薬品名”のリスト。★『どの薬の話』の投稿タグに使うので
+                      数量を混ぜない＝ログに数量が残らないようにするため）／
+      '最終投稿日時'／'最終投稿店'／'件数'（投稿数）／
+      '店A'・'店B'（sorted 済みのスレッドキー）／'messages'（時系列の投稿リスト）
     """
     my = str(my_store or '').strip()
     messages = messages or []
     reservations = reservations or []
+    qty_by_key = qty_by_key or {}
 
     # 相手店 → 予約中の品・投稿 をためる箱
-    others = {}   # 相手店名 → {'reserved_names':[], 'reserved_seen':set(), 'messages':[]}
+    others = {}   # 相手店名 → {'reserved_names':[],'reserved_clean':[],'reserved_seen':set(),'messages':[]}
 
     def _box(other):
         o = str(other or '').strip()
         if not o or o == my:
             return None
         if o not in others:
-            others[o] = {'reserved_names': [], 'reserved_seen': set(), 'messages': []}
+            others[o] = {'reserved_names': [], 'reserved_clean': [],
+                         'reserved_seen': set(), 'messages': []}
         return o
 
     # (1) 予約から「相手店」と「予約中の品（薬品名）」を集める（出し手／受け手の両方向）
@@ -862,7 +874,12 @@ def build_threads(my_store, messages, reservations):
         name = str(r.get('薬品名', '') or '').strip()
         if name and name not in others[o]['reserved_seen']:
             others[o]['reserved_seen'].add(name)
-            others[o]['reserved_names'].append(name)
+            others[o]['reserved_clean'].append(name)        # 素の薬品名（投稿タグ用）
+            # 数量が引ければ『薬品名 20錠』、引けなければ薬品名だけ（0錠と誤解させない）
+            qkey = (supplier, str(r.get('予約キー', '') or '').strip())
+            qty = qty_by_key.get(qkey)
+            others[o]['reserved_names'].append(
+                ('%s %s' % (name, qty)) if qty else name)
 
     # (2) 投稿から「相手店」と「その相手との投稿」を集める（店A/店Bは sorted 済み）
     for m in messages:
@@ -885,7 +902,8 @@ def build_threads(my_store, messages, reservations):
         last_by = msgs[-1].get('投稿店', '') if msgs else ''
         threads.append({
             '相手店名': other,
-            '予約中の品': list(info['reserved_names']),
+            '予約中の品': list(info['reserved_names']),      # 数量つき（画面『予約中：』用）
+            '予約中の品名': list(info['reserved_clean']),    # 素の薬品名（投稿タグ『どの薬の話』用）
             '最終投稿日時': last_at,
             '最終投稿店': last_by,
             '件数': len(msgs),

@@ -70,7 +70,25 @@ import pandas as pd   # ※ streamlit に同梱されるので requirements へ�
 import yuzu_core
 import app_logic
 import gsheet_store
+import mailer
 from stores_config import STORE_NAMES, STORE_COUNT, COMPANY_OF
+
+# ⑤やり取りの相手店の並び順を『店番順（STORE_NAMES の並び）』に固定するための順位表。
+#   ★並びを固定にするのが要件：未読件数や投稿で順番が変わると、st.dataframe の行選択が
+#     「行の位置」で効くため、選んだ行がずれて別の店を開いてしまう事故になる（本間部長指示 2026-08-10）。
+#   STORE_NAMES に無い店名（将来の追加漏れ・表記ゆれ）は末尾へまとめ、その中は五十音順にする
+#   （黙って消さない）。
+_STORE_ORDER_RANK = {name: i for i, name in enumerate(STORE_NAMES)}
+
+
+def _thread_sort_key(thread):
+    """ ⑤の相手店スレッドを『店番順（STORE_NAMES）』で並べるためのキー。
+        STORE_NAMES にある店は (0, 店番順位, '')、無い店は (1, 0, 相手店名) を返す
+        ＝登録店を先に店番順、未登録店は末尾で五十音順（黙って消さない）。 """
+    name = thread.get('相手店名', '')
+    if name in _STORE_ORDER_RANK:
+        return (0, _STORE_ORDER_RANK[name], '')
+    return (1, 0, name)
 
 # ドロップダウンの先頭に置く「未選択」の選択肢
 SENTINEL_STORE = '選択してください'
@@ -587,6 +605,28 @@ def _render_flash():
         getattr(st, level, st.info)(text)
 
 
+# ============================================================================
+# メール通知（mailer.py）との橋渡し … 2026-08-10（③の改修）
+#   ・掲示板・予約の保存が成功した“直後”に1回だけ呼ぶ（下の各セクション参照）。
+#     st.rerun をまたぐと画面メッセージが消えるので、_flash にためて次の描画で出す
+#     （＝メール結果の案内・警告が確実に見える）。
+#   ・メールはおまけ。送れなくても投稿・予約は必ず残す（例外は外へ出さない）。
+# ============================================================================
+def _mail_secrets():
+    """ Secrets を安全に取り出す（無い環境でも落ちない）。中身の判定は mailer 側が行う。 """
+    try:
+        return st.secrets
+    except Exception:
+        return {}
+
+
+def _mail_flush(res):
+    """ mailer の戻り（{'messages': [(レベル, 文言), ...]}）を _flash に流す。
+        [smtp] 未設定なら 'メール通知は未設定です。' が1行入っている。 """
+    for level, text in ((res or {}).get('messages') or []):
+        _flash(level, text)
+
+
 def _bump_editor(table_key):
     """ 保存・取消のあと data_editor を作り直すため、版番号を1つ上げる（＝キーが変わる）。
         ★これをしないと、除外で行が減った後も古い編集差分（行の位置で持つ）が残り、別の行へ
@@ -1021,6 +1061,12 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
 
     if plan['added']:
         backend.save_reservations(plan['keep'])
+        # 新しく予約できた行だけを出し手店へメール通知（保存後・rerun 前に1回だけ＝二重送信しない）。
+        #   plan['keep'] のうち、読み直した latest_rows に無かった (出し手店, 予約キー) が新規。
+        before_keys = {(r.get('出し手店', ''), r.get('予約キー', '')) for r in latest_rows}
+        added_rows = [r for r in plan['keep']
+                      if (r.get('出し手店', ''), r.get('予約キー', '')) not in before_keys]
+        _mail_flush(mailer.notify_reservation(_mail_secrets(), my_store, added_rows))
     if plan['conflicts']:
         st.error('  \n'.join(
             ['次の品は、ひと足先にほかの店が予約していました（予約できていません）：']
@@ -1098,6 +1144,8 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
             keep = app_logic.cancel_reservations(reservations, my_store, checked, latest)
             backend.save_reservations(keep)
             st.session_state.pop('pickup_xls', None)   # 予約が変わったので作りかけの帳票は捨てる
+            # 取り消した品を出し手店へメール通知（保存後・rerun 前に1回だけ＝二重送信しない）。
+            _mail_flush(mailer.notify_cancellation(_mail_secrets(), my_store, checked))
             st.success('%d件の予約を取り消しました。' % (len(reservations) - len(keep)))
             st.rerun()
 
@@ -1140,7 +1188,8 @@ def message_section(my_store, backend, threads, msg_reads):
     """
     ⑤ 店舗間のやり取り。threads は app_logic.build_threads の戻り（自店が関わるスレッド一覧）。
       ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を st.dataframe の行選択で選ぶ。
-        ★一覧の並びは相手店名の五十音で固定する（投稿しても順番が変わらない＝選んだ行がずれない）。
+        ★一覧の並びは店番順（STORE_NAMES の並び）で固定する（投稿・未読で順番が変わらない
+          ＝選んだ行がずれない）。STORE_NAMES に無い店名は末尾へ五十音順でまとめる（黙って消さない）。
           未読のあるスレッドは相手店名の左に ● を付けて目立たせる（並べ替えでは動かさない）。
       ・下段：選んだ相手との会話を時系列で表示し、任意で『どの薬の話』を添えて投稿できる。
         ★★相手店を選ぶまでは下段そのものを出さない（誤送信を防ぐため）。
@@ -1166,8 +1215,10 @@ def message_section(my_store, backend, threads, msg_reads):
                 '他店のデッド品を予約するか、他店から自店の品を予約されると、その相手との会話が始まります。')
         return
 
-    # --- 並びは相手店名の五十音で固定（投稿で順番が変わらない＝行選択がずれない）---
-    threads = sorted(threads, key=lambda t: t['相手店名'])
+    # --- 並びは店番順（STORE_NAMES の並び）で固定。投稿・未読で順番が変わらない
+    #     ＝行選択の位置がずれて別の店を開く事故を防ぐ（本間部長指示 2026-08-10）。
+    #     STORE_NAMES に無い店名は末尾へまとめ、その中は五十音順にする（黙って消さない）。---
+    threads = sorted(threads, key=_thread_sort_key)
 
     rows = []
     for t in threads:
@@ -1214,7 +1265,10 @@ def message_section(my_store, backend, threads, msg_reads):
     # --- 投稿フォーム（送信後は入力欄を空に戻すため、版番号でキーを作り直す）---
     pair_key = '%s__%s' % (sel['店A'], sel['店B'])
     ver = st.session_state.get('msgver_%s' % pair_key, 0)
-    drug_opts = [''] + list(sel['予約中の品'])
+    # ★『どの薬の話』のタグには“素の薬品名”（数量を付けない）を使う。
+    #   予約中の品（数量つき）を使うと『20錠』などの数量が投稿ログに残り、
+    #   翌月に数量が変わっても古い数量が残って紛らわしいため（②の改修・2026-08-10）。
+    drug_opts = [''] + list(sel.get('予約中の品名', sel['予約中の品']))
     drug = st.selectbox(
         'どの薬の話（任意）', drug_opts,
         format_func=lambda x: x if x else '（薬を特定しない）',
@@ -1236,6 +1290,10 @@ def message_section(my_store, backend, threads, msg_reads):
             else:
                 clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
                 st.session_state['msgver_%s' % pair_key] = ver + 1   # 入力欄を空に戻す
+                # メール通知（相手店へ）。保存後・rerun 前に1回だけ＝二重送信しない。
+                #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
+                _mail_flush(mailer.notify_new_message(
+                    _mail_secrets(), my_store, sel['相手店名'], drug, text))
                 st.rerun()
 
     # --- スレッドを開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
@@ -1553,6 +1611,9 @@ def _upload_form(backend, my_store):
 def results_section(backend, stores, latest, index):
     # ※保管庫の読み込み（load_current_month_stores）は main() で1回だけ行い、
     #   アップロード欄と結果表示で使い回す（Gシートへの往復を増やさないため）。
+    #   ★ためておいた通知（メール結果・出庫可能数の保存結果など）を画面の先頭で1回だけ出す。
+    #     投稿・予約・取消は保存後に st.rerun するため、その回のメッセージは消える。ここで拾って見せる。
+    _render_flash()
     status = app_logic.uploaded_status(index, latest, STORE_NAMES)
 
     st.subheader('現在の状況')
@@ -1670,7 +1731,19 @@ def results_section(backend, stores, latest, index):
             #   ★60秒キャッシュ越しに読む＝ふだんの再描画ではAPIを増やさない（load_messages_cached）。
             #   スレッドは「相手店ごとに1本」。各表の『やり取り』列と⑤の新着バッジに使う早見表を作る。
             messages, msg_reads = load_messages_cached(backend)
-            threads = app_logic.build_threads(my_store, messages, reservations)
+            # ⑤『予約中：』に数量を添えるための早見表（②の改修・2026-08-10）。
+            #   当月の提案行から (出し手店, 予約キー) で引く。数量＝提案行の『在庫数』
+            #   （＝実効値＝画面の出庫可能数）、単位＝『単位』。表示は _fmt_qty で末尾の .00 を落とす。
+            #   ★引けない品（出し手が除外した／当月の提案から消えた）は辞書に入れない
+            #     ＝薬品名だけになる（0錠などと誤解させない）。予約キー＝提案行の _ex_key。
+            qty_by_key = {}
+            for pr in result.get('proposal_rows', []):
+                q = _fmt_qty(pr.get('在庫数', ''))
+                if str(q).strip() == '':
+                    continue
+                unit = pr.get('単位', '') or ''
+                qty_by_key[(pr.get('出し手店', ''), pr.get('_ex_key', ''))] = '%s%s' % (q, unit)
+            threads = app_logic.build_threads(my_store, messages, reservations, qty_by_key)
             #   相手店 → 'N件 ●'（自店の未読があれば ●）。②③の予約店・④の出し手店で引く。
             msg_by_store = {}
             total_unread = 0
