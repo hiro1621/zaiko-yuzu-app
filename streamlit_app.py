@@ -485,7 +485,7 @@ def _save_supply_qty_ui(checked, my_store, backend, desired, full):
     plan = app_logic.plan_supply_qty(latest_rows, my_store, picked)
     if plan['blocked']:
         st.warning('  \n'.join(
-            ['次の品はすでに引取先が決まっているため、出せる数を変えませんでした。'
+            ['次の品はすでに引取先が決まっているため、出庫可能数を変えませんでした。'
              '取りやめる場合は相手店に連絡してください：']
             + ['%s → %s が引取予定' % (b['薬品名'], b['予約店']) for b in plan['blocked']]))
     changed = plan['added'] + plan['updated'] + plan['removed']
@@ -498,10 +498,10 @@ def _save_supply_qty_ui(checked, my_store, backend, desired, full):
             parts.append('変更%d件' % plan['updated'])
         if plan['removed']:
             parts.append('全量に戻す%d件' % plan['removed'])
-        st.success('出せる数を保存しました（%s）。' % '／'.join(parts))
+        st.success('出庫可能数を保存しました（%s）。' % '／'.join(parts))
         st.rerun()
     elif not plan['blocked']:
-        st.info('出せる数の変更はありませんでした。')
+        st.info('出庫可能数の変更はありませんでした。')
 
 
 def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=True):
@@ -560,8 +560,8 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     reserved_sel = [d for d in checked if (d.get('_予約店', '') or '').strip()]
     desired = {}
     if editable:
-        st.caption('「出せる数」＝この店から出す数量です。選んだ品ごとに数を入れて'
-                   '「出せる数を保存」を押してください。'
+        st.caption('「出庫可能数」＝この店から出す数量です。選んだ品ごとに数を入れて'
+                   '「出庫可能数を保存」を押してください。'
                    '在庫数と同じ数にすると「全量を出す」に戻ります（指定が消えます）。'
                    '一切出さないときは代わりに「除外を保存」を使ってください（0は入れられません）。')
         for d in editable:
@@ -580,7 +580,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     # ★予約が入っている品を選んだときは、数量を変えられないことをはっきり知らせる（黙って絞らない）。
     if reserved_sel:
         st.warning('  \n'.join(
-            ['次の品はすでに引取先が決まっているため、出せる数は変えられません。'
+            ['次の品はすでに引取先が決まっているため、出庫可能数は変えられません。'
              '取りやめる場合は相手店に連絡してください：']
             + ['%s → %s が引取予定' % (d.get('薬品名', ''), d.get('_予約店', '')) for d in reserved_sel]))
 
@@ -589,7 +589,7 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     with b1:
         do_excl = st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0))
     with b2:
-        do_qty = st.button('出せる数を保存（%d件）' % len(editable),
+        do_qty = st.button('出庫可能数を保存（%d件）' % len(editable),
                            key='btnqty_%s' % table_key, disabled=(len(editable) == 0))
     with b3:
         do_reset = st.button('全量に戻す（%d件）' % len(editable),
