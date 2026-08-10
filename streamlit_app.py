@@ -297,15 +297,37 @@ def _df(rows, columns=None):
     return df
 
 
-# 小数第2位まで表示する数値列（在庫数・在庫金額など）
-#   ★2026-08-01：④の列を「出し手の在庫数／自店の在庫数」に分けたので、その2列も同じ体裁にする。
-#   ★2026-08-10：②③に『出せる数』列、④は『出し手の在庫数』→『出し手が出せる数』へ改名したので追随する。
-_NUM2_COLS = ['在庫数', '出せる数', '在庫金額', '安全在庫数', '不足数', '出し手が出せる数', '自店の在庫数']
+# 表の数値列の体裁。★2026-08-10（第2弾）で「数量系」と「金額系」を分けた（本間部長指示）。
+#   ・数量系（_QTY_COLS）… 末尾の .00 を落として表示する（77.00→77／12.50→12.5）。カンマ区切りは維持。
+#       ほとんどが整数なので「.00」が並ぶと見づらい、という指摘への対応。フォーマッタは _fmt_qty。
+#   ・金額系（_AMOUNT_COLS）… 従来どおり小数第2位のまま（例 20,759.20）。金額は小数2桁が自然なため据え置き。
+#   ※どちらも【画面表示だけ】の体裁。Excel の number_format（#,##0.00）は一切変更していない。
+_QTY_COLS = ['在庫数', '出庫可能数', '安全在庫数', '不足数', '出し手の出庫可能数', '自店の在庫数']
+_AMOUNT_COLS = ['在庫金額']
+
+
+def _fmt_qty(v):
+    """ 数量の表示。末尾の .00 は落とす（77.00→77／12.50→12.5／12.25→12.25）。カンマ区切りは維持する。
+        ・整数（77.0 など）は小数点以下を付けずカンマ区切りで返す（1234.0→1,234）。
+        ・端数がある値は小数2桁にしてから末尾の 0 だけ落とす（12.50→12.5）。
+          整数は上の分岐で処理済みなので、ここに「12.00」が来ることはなく、rstrip('0') だけで足りる
+          （末尾の『.』が残る心配がない）。
+        ・数値に直せない値（空文字など）はそのまま返す。 """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v
+    if f != f:                              # NaN はそのまま返す（int(NaN) で落ちるのを防ぐ）
+        return v
+    if f == int(f):
+        return '{:,}'.format(int(f))
+    return '{:,.2f}'.format(f).rstrip('0')
 
 
 def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
     """ 表を見やすく整えた pandas Styler を返す。
-          ・数値列（在庫数・在庫金額など）は小数第2位まで（例 7.00 / 49,630.00・カンマ区切り）
+          ・数量列（出庫可能数など）は末尾の .00 を落として表示（例 77／12.5・カンマ区切り）。
+            金額列（在庫金額）は従来どおり小数第2位のまま（例 49,630.20・カンマ区切り）
           ・paint=True のとき、「有効期限まで5ヶ月以内」の行を【薄赤の背景＋黒文字】で行ごと目立たせる
             （②デッド一覧の中で"期限が近いデッド"が一目で分かるように）。
             どの行が5ヶ月以内かは expiry_flags（行ごとの True/False の配列。滞留色の stag_levels と
@@ -344,7 +366,13 @@ def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
 
     try:
         sty = df.style
-        fmt = {c: '{:,.2f}' for c in _NUM2_COLS if c in df.columns}
+        # 数量系は _fmt_qty（.00 を落とす）／金額系は '{:,.2f}'（小数第2位のまま）で分けて整える。
+        fmt = {}
+        for c in df.columns:
+            if c in _QTY_COLS:
+                fmt[c] = _fmt_qty
+            elif c in _AMOUNT_COLS:
+                fmt[c] = '{:,.2f}'
         if fmt:
             sty = sty.format(fmt)
         if paint and expiry_flags:
@@ -483,9 +511,13 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
       table_key     … 画面部品を区別するための名前（'dead' / 'expiry'）
       paint_expiry  … 有効期限まで5ヶ月以内（＝期限切迫）の行を薄赤に塗るか（②=True／③=False）。
                       ③は全行が期限切迫なので塗ると真っ赤になるだけ＝Falseで白のままにする。
-    表示は『在庫数』（＝その店が持っている全量）と『出せる数』（＝実際に出す数・既定は全量）を並べる。
+    表示は『出庫可能数』1列（＝実際に出す数・既定は在庫全量）にまとめてある。
+      ★2026-08-10（第2弾・本間部長指示）：以前は『在庫数』（全量）と『出せる数』（実効数量）を
+        2列で並べていたが、数量を指定していない品では必ず同じ値になり見づらかったため、
+        『出庫可能数』1列に統一した。全量は number_input の max_value と『全量に戻す』のため
+        内部（ビューの隠しキー『在庫数』）には保持している（画面に出さないだけ）。
     ・②では有効期限まで5ヶ月以内の行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
-    ・数値（在庫数・出せる数・在庫金額）はカンマ区切り＋小数第2位で表示する（②③とも共通）。
+    ・数量（出庫可能数）は末尾の .00 を落として表示、金額（在庫金額）は小数第2位のまま（②③とも共通）。
     ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える。
 
     ★出せる数の指定は2段方式：上の表で行を選ぶ → 表の下の number_input で数量を入れる。
@@ -497,8 +529,9 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
         st.info('該当する品目はありません。')
         return
 
-    # 「滞留」は薬品名のすぐ隣。『出せる数』は『在庫数』の隣（在庫数＝全量／出せる数＝実際に出す数）。
-    disp_cols = ['薬品名', '滞留', '単位', '在庫数', '出せる数', '在庫金額',
+    # 「滞留」は薬品名のすぐ隣。『出庫可能数』は旧『在庫数』があった位置（単位の右・在庫金額の左）に置く。
+    #   （旧『在庫数』『出せる数』の2列を1列に統一。値＝実効数量。全量はビューの隠しキー『在庫数』に保持）
+    disp_cols = ['薬品名', '滞留', '単位', '出庫可能数', '在庫金額',
                  '有効期限', '期限切迫区分', '区分', '引取候補店']
     df = pd.DataFrame([{c: r.get(c, '') for c in disp_cols} for r in rows])
     stag_levels = [r.get('_滞留区分', 'new') for r in rows]
@@ -533,14 +566,17 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
                    '一切出さないときは代わりに「除外を保存」を使ってください（0は入れられません）。')
         for d in editable:
             key = d.get('_key', '')
-            stock = _to_float(d.get('在庫数', 0))         # 在庫数＝全量
+            stock = _to_float(d.get('在庫数', 0))         # 在庫数（隠しキー）＝全量。max_value に使う
             if stock < 0.01 or not key:
                 continue
-            cur = min(max(_to_float(d.get('出せる数', stock), stock), 0.01), stock)  # 既定＝全量
+            # 既定＝現在の出庫可能数（未指定なら全量）。旧『出せる数』の値と同じ。
+            cur = min(max(_to_float(d.get('出庫可能数', stock), stock), 0.01), stock)
+            # ラベルに全量を添える（表から全量列が消えたので「元の在庫がいくつか」をここで示す）。
+            #   _fmt_qty で .00 を落とす（在庫 77.00 → 在庫 77）。カンマ区切りは維持。
             desired[key] = st.number_input(
-                '%s（在庫 %s）' % (d.get('薬品名', ''), yuzu_core.fmt_qty(stock)),
+                '%s（在庫 %s）' % (d.get('薬品名', ''), _fmt_qty(stock)),
                 min_value=0.01, max_value=float(stock), value=float(cur),
-                step=0.01, format='%.2f', key='supqty_%s_%s' % (table_key, key))
+                step=0.01, format='%.10g', key='supqty_%s_%s' % (table_key, key))
     # ★予約が入っている品を選んだときは、数量を変えられないことをはっきり知らせる（黙って絞らない）。
     if reserved_sel:
         st.warning('  \n'.join(
@@ -726,7 +762,7 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym):
       ・自店もその薬を使っているが、いま在庫を余らせている品（tier③参考）。今すぐ引き取ると
         移した先で新しいデッドを作りかねないので、本来の④からは外している。
       ・ここから「1〜3ヶ月後」の受取予定月つきで予約できる（本命の狙い）。
-      ・④本体と同じ方式（st.dataframe + 行選択）・同じ2列構成（出し手の在庫数＋自店の在庫数）。
+      ・④本体と同じ方式（st.dataframe + 行選択）・同じ2列構成（出し手の出庫可能数＋自店の在庫数）。
         ★本来の④に出る品目は1件も変えない（増えるのはこの別枠だけ）。
     """
     with st.expander('いまは在庫があるが、先になら引き取れる薬（%d件）' % len(view_ref)):
