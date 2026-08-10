@@ -1143,6 +1143,7 @@ def message_section(my_store, backend, threads, msg_reads):
         ★一覧の並びは相手店名の五十音で固定する（投稿しても順番が変わらない＝選んだ行がずれない）。
           未読のあるスレッドは相手店名の左に ● を付けて目立たせる（並べ替えでは動かさない）。
       ・下段：選んだ相手との会話を時系列で表示し、任意で『どの薬の話』を添えて投稿できる。
+        ★★相手店を選ぶまでは下段そのものを出さない（誤送信を防ぐため）。
     """
     st.subheader('⑤（%s）店舗間のやり取り' % my_store)
 
@@ -1182,15 +1183,17 @@ def message_section(my_store, backend, threads, msg_reads):
                          on_select='rerun', selection_mode='single-row',
                          key='table_threads')
 
-    # 選んだ相手店を覚える（＝順番が固定なので、行の位置＝スレッドの対応が崩れない）。
-    #   何も選んでいない初回は先頭（＝五十音の最初）のスレッドを既定で開く。
+    # 選んだ相手店（＝並びが固定なので、行の位置＝スレッドの対応が崩れない）。
+    #   ★★左端の□にチェックを入れるまでは、会話も投稿欄もいっさい出さない。
+    #     以前は先頭（五十音の最初）のスレッドを既定で開いていたが、
+    #     ⑤に切り替えただけで相手店が選ばれている状態になり、
+    #     **選んだつもりのない店へ送ってしまう**危険があった（2026-08-10 本間部長の指摘）。
+    #     チェックを外したときも同じ理由で閉じる（session_state に覚えさせない）。
     picked = _selected_rows(event)
-    if picked and 0 <= picked[0] < len(threads):
-        st.session_state['msg_sel_idx'] = picked[0]
-    sel_idx = st.session_state.get('msg_sel_idx', 0)
-    if not (0 <= sel_idx < len(threads)):
-        sel_idx = 0
-    sel = threads[sel_idx]
+    if not picked or not (0 <= picked[0] < len(threads)):
+        st.info('やり取りする相手店を、上の表のいちばん左の□で選んでください。')
+        return
+    sel = threads[picked[0]]
 
     st.divider()
     st.markdown('#### %s とのやり取り' % sel['相手店名'])
@@ -1198,7 +1201,7 @@ def message_section(my_store, backend, threads, msg_reads):
         st.caption('予約中：' + '　'.join(sel['予約中の品']))
 
     if not sel['messages']:
-        st.write('まだ投稿はありません。下の欄から最初のひとことをどうぞ。')
+        st.write('まだ投稿はありません。')
     else:
         for m in sel['messages']:
             st.markdown('**%s　%s**'
