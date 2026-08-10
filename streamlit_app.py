@@ -220,6 +220,12 @@ class _GSheetAdapter:
     def save_reservations(self, rows):
         gsheet_store.write_reservations(self.sh, rows)
 
+    def load_supply_qty(self):
+        return gsheet_store.read_supply_qty(self.sh)
+
+    def save_supply_qty(self, rows):
+        gsheet_store.write_supply_qty(self.sh, rows)
+
     def load_index(self):
         """ _index だけを読む（1タブ）。在庫本体（raw_）を読み直すかどうかの判定に使う。 """
         return gsheet_store.read_index(self.sh)
@@ -293,8 +299,8 @@ def _df(rows, columns=None):
 
 # 小数第2位まで表示する数値列（在庫数・在庫金額など）
 #   ★2026-08-01：④の列を「出し手の在庫数／自店の在庫数」に分けたので、その2列も同じ体裁にする。
-#     これらの列名は④（と別枠）にしか出ないので、②③の見た目には影響しない。
-_NUM2_COLS = ['在庫数', '在庫金額', '安全在庫数', '不足数', '出し手の在庫数', '自店の在庫数']
+#   ★2026-08-10：②③に『出せる数』列、④は『出し手の在庫数』→『出し手が出せる数』へ改名したので追随する。
+_NUM2_COLS = ['在庫数', '出せる数', '在庫金額', '安全在庫数', '不足数', '出し手が出せる数', '自店の在庫数']
 
 
 def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
@@ -396,6 +402,80 @@ def _selected_rows(event):
             return []
 
 
+def _to_float(v, default=0.0):
+    """ 文字列・数値を float にする（桁区切りカンマ・前後空白は無視）。変換できなければ default。 """
+    try:
+        return float(str(v).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _save_exclusions_ui(checked, my_store, backend, exclusions):
+    """ 選ばれた品を除外（デッドストックから外す）に保存する。従来の「除外を保存」の中身。
+        ★予約が入っている品は除外しない（引き取るつもりの店の予約が理由も分からず消えるため）。 """
+    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    keep = list(exclusions)
+    have = {(r['店名'], r['除外キー']) for r in keep}
+    # ★予約が入っている品は除外しない。品名と相手店を出して、話を付けてもらう。
+    booked = [d for d in checked if d.get('_予約店')]
+    if booked:
+        st.warning('  \n'.join(
+            ['次の品はすでに引取先が決まっているため、除外しませんでした。'
+             '取りやめる場合は相手店に連絡してください：']
+            + ['%s → %s が引取予定' % (d['薬品名'], d['_予約店']) for d in booked]))
+    added = 0
+    for d in checked:
+        if d.get('_予約店'):
+            continue
+        pair = (my_store, d['_key'])
+        if pair in have:
+            continue
+        keep.append({'店名': my_store, '除外キー': d['_key'],
+                     '薬品名': d['薬品名'], '除外日時': now})
+        have.add(pair)
+        added += 1
+    backend.save_exclusions(keep)
+    st.success('%d件をデッドストックから外しました。' % added)
+    st.rerun()
+
+
+def _save_supply_qty_ui(checked, my_store, backend, desired, full):
+    """ 選ばれた品の『出せる数』を保存する（純関数 app_logic.plan_supply_qty を呼ぶ薄い皮）。
+        full=True なら『全量に戻す』＝在庫数と同じ値で保存＝指定を消す。
+        ★保存の直前に _提供数量 を読み直してから書く（Googleシートは同時書き込みを止められないため。
+          除外・予約の保存と同じ理由）。 """
+    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    picked = []
+    for d in checked:
+        stock = _to_float(d.get('在庫数', 0))                       # 在庫数＝全量
+        qty = stock if full else _to_float(desired.get(d.get('_key', ''), stock), stock)
+        picked.append(dict(d, 出せる数=qty, 在庫数=stock, _now=now))
+    try:
+        latest_rows = backend.load_supply_qty()   # ★書く直前に読み直す（同時書き込み対策）
+    except Exception:
+        latest_rows = []
+    plan = app_logic.plan_supply_qty(latest_rows, my_store, picked)
+    if plan['blocked']:
+        st.warning('  \n'.join(
+            ['次の品はすでに引取先が決まっているため、出せる数を変えませんでした。'
+             '取りやめる場合は相手店に連絡してください：']
+            + ['%s → %s が引取予定' % (b['薬品名'], b['予約店']) for b in plan['blocked']]))
+    changed = plan['added'] + plan['updated'] + plan['removed']
+    if changed:
+        backend.save_supply_qty(plan['keep'])
+        parts = []
+        if plan['added']:
+            parts.append('新規%d件' % plan['added'])
+        if plan['updated']:
+            parts.append('変更%d件' % plan['updated'])
+        if plan['removed']:
+            parts.append('全量に戻す%d件' % plan['removed'])
+        st.success('出せる数を保存しました（%s）。' % '／'.join(parts))
+        st.rerun()
+    elif not plan['blocked']:
+        st.info('出せる数の変更はありませんでした。')
+
+
 def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=True):
     """
     ②デッド品・③期限切迫品の表を「行選択方式」で描く。
@@ -403,21 +483,22 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
       table_key     … 画面部品を区別するための名前（'dead' / 'expiry'）
       paint_expiry  … 有効期限まで5ヶ月以内（＝期限切迫）の行を薄赤に塗るか（②=True／③=False）。
                       ③は全行が期限切迫なので塗ると真っ赤になるだけ＝Falseで白のままにする。
-    表示は8列（薬品名／単位／在庫数／在庫金額／有効期限／期限切迫区分／区分／引取候補店）。
+    表示は『在庫数』（＝その店が持っている全量）と『出せる数』（＝実際に出す数・既定は全量）を並べる。
     ・②では有効期限まで5ヶ月以内の行を pandas Styler で薄赤（背景 #FFE3E6・黒文字）に塗る。
-      チェック欄つきの旧方式では行の色を付けられず ⚠ 記号で代替していたが、
-      行選択方式なら Styler の背景色と左端の選択チェックが両立するので色を戻した。
-    ・数値（在庫数・在庫金額）はカンマ区切り＋小数第2位で表示する（②③とも共通）。
-    ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える
-      （自店の表・全店一覧・他店の参考ビュー・Excel・Gシートのすべてから）。
+    ・数値（在庫数・出せる数・在庫金額）はカンマ区切り＋小数第2位で表示する（②③とも共通）。
+    ・左端の□で行を選び「除外を保存」を押すと、その品目は融通提案から完全に消える。
+
+    ★出せる数の指定は2段方式：上の表で行を選ぶ → 表の下の number_input で数量を入れる。
+      st.data_editor は使わない（pandas Styler の色＝期限切迫の薄赤・滞留色が全部消えるため。
+      2026-07-27 に一度この罠を踏んで行選択方式へ戻した経緯がある）。必ず
+      st.dataframe(..., on_select='rerun', selection_mode='multi-row') のままにする。
     """
     if not rows:
         st.info('該当する品目はありません。')
         return
 
-    # 「滞留」は薬品名のすぐ隣に置く。★いちばん右に足すと横スクロールの先に隠れて
-    #   気づかれないため、品名と並べて必ず目に入る位置にしている。
-    disp_cols = ['薬品名', '滞留', '単位', '在庫数', '在庫金額',
+    # 「滞留」は薬品名のすぐ隣。『出せる数』は『在庫数』の隣（在庫数＝全量／出せる数＝実際に出す数）。
+    disp_cols = ['薬品名', '滞留', '単位', '在庫数', '出せる数', '在庫金額',
                  '有効期限', '期限切迫区分', '区分', '引取候補店']
     df = pd.DataFrame([{c: r.get(c, '') for c in disp_cols} for r in rows])
     stag_levels = [r.get('_滞留区分', 'new') for r in rows]
@@ -439,32 +520,51 @@ def supply_editor(rows, my_store, backend, exclusions, table_key, paint_expiry=T
     picked = _selected_rows(event)
     checked = [rows[i] for i in picked if 0 <= i < len(rows)]
     n = len(checked)
-    if st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0)):
-        now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
-        keep = list(exclusions)
-        have = {(r['店名'], r['除外キー']) for r in keep}
-        added = 0
-        # ★予約が入っている品は除外しない。黙って外すと、引き取るつもりでいる店の
-        #   予約が理由も分からず消えるため。品名と相手店を出して、話を付けてもらう。
-        booked = [d for d in checked if d.get('_予約店')]
-        if booked:
-            st.warning('  \n'.join(
-                ['次の品はすでに引取先が決まっているため、除外しませんでした。'
-                 '取りやめる場合は相手店に連絡してください：']
-                + ['%s → %s が引取予定' % (d['薬品名'], d['_予約店']) for d in booked]))
-        for d in checked:
-            if d.get('_予約店'):
+
+    # ---- 出せる数の入力（2段方式の2段目：選んだ行のぶんだけ number_input を並べる）----
+    #   予約が入っている品は数量を変えられない（相手が引き取る約束をしているため）ので入力欄を出さない。
+    editable = [d for d in checked if not (d.get('_予約店', '') or '').strip()]
+    reserved_sel = [d for d in checked if (d.get('_予約店', '') or '').strip()]
+    desired = {}
+    if editable:
+        st.caption('「出せる数」＝この店から出す数量です。選んだ品ごとに数を入れて'
+                   '「出せる数を保存」を押してください。'
+                   '在庫数と同じ数にすると「全量を出す」に戻ります（指定が消えます）。'
+                   '一切出さないときは代わりに「除外を保存」を使ってください（0は入れられません）。')
+        for d in editable:
+            key = d.get('_key', '')
+            stock = _to_float(d.get('在庫数', 0))         # 在庫数＝全量
+            if stock < 0.01 or not key:
                 continue
-            pair = (my_store, d['_key'])
-            if pair in have:
-                continue
-            keep.append({'店名': my_store, '除外キー': d['_key'],
-                         '薬品名': d['薬品名'], '除外日時': now})
-            have.add(pair)
-            added += 1
-        backend.save_exclusions(keep)
-        st.success('%d件をデッドストックから外しました。' % added)
-        st.rerun()
+            cur = min(max(_to_float(d.get('出せる数', stock), stock), 0.01), stock)  # 既定＝全量
+            desired[key] = st.number_input(
+                '%s（在庫 %s）' % (d.get('薬品名', ''), yuzu_core.fmt_qty(stock)),
+                min_value=0.01, max_value=float(stock), value=float(cur),
+                step=0.01, format='%.2f', key='supqty_%s_%s' % (table_key, key))
+    # ★予約が入っている品を選んだときは、数量を変えられないことをはっきり知らせる（黙って絞らない）。
+    if reserved_sel:
+        st.warning('  \n'.join(
+            ['次の品はすでに引取先が決まっているため、出せる数は変えられません。'
+             '取りやめる場合は相手店に連絡してください：']
+            + ['%s → %s が引取予定' % (d.get('薬品名', ''), d.get('_予約店', '')) for d in reserved_sel]))
+
+    # ---- ボタン3つを横並び：除外を保存／出せる数を保存／全量に戻す ----
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        do_excl = st.button('除外を保存（%d件）' % n, key='btn_%s' % table_key, disabled=(n == 0))
+    with b2:
+        do_qty = st.button('出せる数を保存（%d件）' % len(editable),
+                           key='btnqty_%s' % table_key, disabled=(len(editable) == 0))
+    with b3:
+        do_reset = st.button('全量に戻す（%d件）' % len(editable),
+                             key='btnrst_%s' % table_key, disabled=(len(editable) == 0))
+
+    if do_excl:
+        _save_exclusions_ui(checked, my_store, backend, exclusions)
+    elif do_qty:
+        _save_supply_qty_ui(editable, my_store, backend, desired, full=False)
+    elif do_reset:
+        _save_supply_qty_ui(editable, my_store, backend, desired, full=True)
 
 
 # ============================================================================
@@ -1045,10 +1145,28 @@ def results_section(backend, stores, latest, index):
         reservations = []
     reserved = app_logic.reservation_map(reservations, latest)
 
+    # 提供数量（出し手が「この品はN錠だけ出す」と決めた数）を読む。
+    #   ★年月列を持たない＝除外と同じく持ち越す。月替わりで在庫が減った品は、その在庫数まで
+    #     自動で頭打ち（apply_supply_cap）してから計算に渡す＝在庫20錠なら20錠＝実質全量。
+    try:
+        supply_rows = backend.load_supply_qty()
+    except Exception as e:
+        show_gsheet_error(e, '提供数量を読めませんでした（全量で表示します）', 'warning')
+        supply_rows = []
+    # 当月の (店名, 品目キー) → 在庫数（全量・ロット合算）を作り、その数まで頭打ちにする
+    stock_by_key = {}
+    for s in stores:
+        for row in s['rows']:
+            k = (s['name'], yuzu_core.exclusion_key(row))
+            stock_by_key[k] = stock_by_key.get(k, 0.0) + yuzu_core.stock_qty(row)
+    supply_rows = app_logic.apply_supply_cap(supply_rows, stock_by_key)
+    supply = app_logic.supply_qty_map(supply_rows)
+
     # 全店ぶんを毎回まとめて再計算
     #   ※予約は出し手から品を取り除かない（件数・金額・自己検算は動かない）。印を付けるだけ。
+    #   ※出せる数（supply）が空なら、compute_matching は改修前とまったく同じ計算になる（既定 None 相当）。
     result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions),
-                                        reserved=reserved)
+                                        reserved=reserved, supply_qty=supply)
 
     # 滞留（同じ品が何ヶ月つづけて載っているか）を書き込む。
     #   ★compute_matching の直後・ビューを作る前に済ませる。ここで result に書き込むので、

@@ -964,6 +964,73 @@ def build_candidate_entries_ref(by_key, key, source_store, supply_qty, exp_date,
 
 
 # ============================================================================
+# 出せる数（提供数量）の前処理 … 行ごとの「実効数量」を決める（2026-08-10 追加）
+# ----------------------------------------------------------------------------
+# 出し手（出す側の店）は「在庫100錠のうち60錠だけ出す」と数量を指定できる。
+# その指定は (店名, 品目キー) 単位で入るが、提案行は「薬VANの1行＝1行」で作られるため、
+# 同じ品がロット別に複数行になる店では、(店,キー) 単位の指定を各行へ割り振る必要がある。
+#   ・出し手候補になる行（＝提案行になる4条件を満たす行）を (店,キー) ごとに集める。
+#   ・有効期限が近い行から順に「出せる数」を割り当てる（先に無くしたい在庫を先に出す）。
+#   ・割り当てが 0 になった行は提案から落とす（eff に残さない）。
+#   ・結果は eff[(店名, 行の位置index)] の形で持つ（rowは辞書なので id ではなく enumerate の index）。
+# ★supply_qty が空（既定）のときは、全ての出し手行に stock_qty(row) をそのまま入れる
+#   ＝いまと1ビットも変わらない（これが最重要の制約）。
+# ============================================================================
+def _effective_supply_qty(stores, supply_qty, excluded):
+    """ 各出し手行の『実効数量』（出せる数）を決める前処理。
+        supply_qty … {(店名, 品目キー): 出せる数(float)}。空なら指定なし＝全量。
+        excluded   … 店が「出さない」と外した品目の集合 {(店名, 品目キー), ...}。
+        戻り値 eff … {(店名, 行の位置index): 実効数量(float)}。
+        ※対象は「提案行になる4条件（出し手＝デッド/期限切迫・除外でない・少額でない・法規制でない）」を
+          満たす行だけ。この4条件は compute_matching 本体の提案ループと完全に同じにする
+          （eff が提案行と過不足なく一致するので、既定 None のとき値がズレない）。 """
+    supply_qty = dict(supply_qty or {})
+    excluded = set(excluded or ())
+    eff = {}
+    # (店名, 品目キー) ごとに、出し手候補の行を index つきで集める（ロット別の割り当てに使う）
+    groups = defaultdict(list)   # (店名, キー) -> [(index, row), ...]
+    for s in stores:
+        bd = s['base_date']
+        for ri, row in enumerate(s['rows']):
+            # 提案ループと同じ4条件で絞る（順番は本体と同じ意味）
+            if not is_supplier(row, bd):
+                continue
+            if (s['name'], exclusion_key(row)) in excluded:
+                continue
+            if is_below_min_amount(row):
+                continue
+            if is_legal_excluded(row):
+                continue
+            eff[(s['name'], ri)] = stock_qty(row)          # 既定＝在庫数まるごと
+            groups[(s['name'], exclusion_key(row))].append((ri, row))
+    if not supply_qty:
+        return eff   # 指定なし＝そのまま返す（1ビットも変わらない）
+    # 指定がある (店,キー) だけ、有効期限が近い行から順に配分し直す
+    for (store, key), budget in supply_qty.items():
+        items = groups.get((store, key))
+        if not items:
+            continue
+        try:
+            budget = float(budget)
+        except (TypeError, ValueError):
+            continue
+        # 有効期限が近い行から（期限不明＝None は最後）。index を混ぜて安定ソート＆比較の一意化。
+        ordered = []
+        for ri, row in items:
+            d = parse_date(g(row, '有効期限'))
+            ordered.append((d is None, d or datetime.date.max, ri, row))
+        ordered.sort(key=lambda t: (t[0], t[1], t[2]))
+        for _none, _d, ri, row in ordered:
+            give = min(stock_qty(row), max(0.0, budget))
+            budget -= give
+            if give <= 0:
+                eff.pop((store, ri), None)   # 0 になった行は提案から落とす
+            else:
+                eff[(store, ri)] = give
+    return eff
+
+
+# ============================================================================
 # 全店一括計算 compute_matching(stores)
 #   入力 stores = [{'name': 店名, 'ym': 'YYYYMM'|None, 'base_date': date, 'rows': [dict,...]}, ...]
 #        （rows は前処理 preprocess_keep 済みの行。列名→文字列の辞書。）
@@ -971,7 +1038,7 @@ def build_candidate_entries_ref(by_key, key, source_store, supply_qty, exp_date,
 #   ※ 現在 create_yuzu_list.main() にベタ書きされていた計算を、そのまま関数化したものです。
 #     計算内容は一切変えていません（回帰で1円も変わらないことを保証する目的）。
 # ============================================================================
-def compute_matching(stores, excluded=None, reserved=None):
+def compute_matching(stores, excluded=None, reserved=None, supply_qty=None):
     """ excluded … 店が「融通に出さない」と外した品目の集合。
         {(店名, exclusion_key(row)), ...} の形。ここで出し手から完全に取り除くので、
         自店の②③だけでなく全店一覧・マトリクス・受け手の供給元・Excel・サマリ・
@@ -987,9 +1054,33 @@ def compute_matching(stores, excluded=None, reserved=None):
             ・出し手の②③  … 引取候補店の欄が「◯◯が引取予定（受取：3ヶ月後）」に変わる（誰にいつ渡すか分かる）
             ・受け手の④    … 予約した店だけに残り、ほかの店の④からは消える
             ・Excel／Gシート… 融通提案シートの『予約』列に「店名 日時（受取：◯）」が入る
-          そのため予約キーは除外キー（exclusion_key）と同じものを使う＝品目の呼び名を1つに保つ。 """
+          そのため予約キーは除外キー（exclusion_key）と同じものを使う＝品目の呼び名を1つに保つ。
+
+        supply_qty … 出し手の店が「この品はN錠だけ出す」と決めた数量。{(店名, 品目キー): 出せる数(float)} の形。
+          品目キーは exclusion_key（除外・予約と同一のキー）。指定がある品は、提案行の『在庫数』＝実効数量、
+          『在庫金額』＝出せる数×薬価 になり、引取候補店の消化目安・店舗別サマリ・自己検算もこの実効数量で動く。
+          ★既定 None（指定なし）のときは、在庫数まるごとを出す＝いまと1ビットも変わらない（最重要の制約）。
+          ★指定が無い品の『在庫金額』は stock_amount(row) をそのまま返す（薬価×数量で再計算しない）。
+            実データに薬VAN側の丸めで 0.52円 ずれる行が1行あり、再計算すると指定していない品まで差が出るため。
+          ※ 少額カット（is_below_min_amount）は元の在庫金額のまま判定する＝出せる数を減らして
+            1,500円を割っても一覧から黙って消えない（「黙って絞らない」原則）。 """
     excluded = set(excluded or ())
     reserved = dict(reserved or {})
+    supply_qty = dict(supply_qty or {})
+
+    # --- 行ごとの実効数量（出せる数）を先に決める。既定（指定なし）なら在庫数まるごとが入る ---
+    eff_qty = _effective_supply_qty(stores, supply_qty, excluded)
+
+    def _eff_qty_of(store_name, ri, row):
+        """ その行の実効数量（出せる数）。eff_qty に無ければ在庫数まるごと（＝指定なし）。 """
+        v = eff_qty.get((store_name, ri))
+        return v if v is not None else stock_qty(row)
+
+    def _eff_amt_of(store_name, ri, row):
+        """ その行の実効金額。指定がある品は 出せる数×薬価、指定が無い品は stock_amount（薬VANの丸めを保つ）。 """
+        if (store_name, exclusion_key(row)) in supply_qty:
+            return eff_qty.get((store_name, ri), 0.0) * parse_num(g(row, '薬価'))
+        return stock_amount(row)
 
     def is_excluded(store_name, row):
         return bool(excluded) and (store_name, exclusion_key(row)) in excluded
@@ -1075,7 +1166,7 @@ def compute_matching(stores, excluded=None, reserved=None):
     #   全店合計の small_excluded_count / small_excluded_amt は従来どおり別に持つ（変更しない）。
     small_by_store = {}
     for s in stores:
-        for row in s['rows']:
+        for ri, row in enumerate(s['rows']):
             if not is_supplier(row, s['base_date']):
                 continue
             if is_excluded(s['name'], row):
@@ -1083,7 +1174,7 @@ def compute_matching(stores, excluded=None, reserved=None):
                 user_excluded_count += 1
                 continue
             if is_below_min_amount(row):
-                # 少額（既定1,500円未満）で載せない品
+                # 少額（既定1,500円未満）で載せない品。★元の在庫金額で判定する（出せる数で再判定しない）
                 small_excluded_count += 1
                 small_excluded_amt += stock_amount(row)
                 # 店別内訳にも同じ品を足す（全店合計は上の2変数のまま・二重管理しない）
@@ -1095,11 +1186,18 @@ def compute_matching(stores, excluded=None, reserved=None):
                 legal_excluded_count += 1
                 legal_excluded_amt += stock_amount(row)
                 continue
+            # 実効数量（出せる数）。ロット別で先の期限の行に配り切って 0 になった行は提案に載せない。
+            #   ★既定（指定なし）では在庫数まるごと（>0）なので、ここで落ちる行は無い。
+            eff_here = eff_qty.get((s['name'], ri))
+            if eff_here is None or eff_here <= 0:
+                continue
             key, _ = row_key(row)
             if key is None:
                 nokey_overstock += 1
-            over_qty = stock_qty(row)      # 在庫数
-            over_amt = stock_amount(row)   # 在庫金額
+            specified = (s['name'], exclusion_key(row)) in supply_qty  # 出せる数の指定があるか
+            over_qty = eff_here                              # 在庫数＝実効数量（出せる数）
+            over_amt = _eff_amt_of(s['name'], ri, row)      # 在庫金額＝実効金額
+            full_qty = stock_qty(row)                        # 在庫数（全量）＝元の在庫数
             exp = parse_date(g(row, '有効期限'))
             cand_main, cand_ref = build_candidates(
                 by_key, key, s['name'], over_qty, exp, s['base_date'])
@@ -1116,6 +1214,11 @@ def compute_matching(stores, excluded=None, reserved=None):
                 '出し手店': s['name'], '種別': supplier_category(row, s['base_date']),
                 '薬品名': g(row, '薬品名'), '単位': g(row, '単位'),
                 'メーカ名': g(row, 'メーカ名'), '在庫数': round(over_qty, 2),
+                # 在庫数（全量）＝その店がいま持っている全部の数。『在庫数』が実効数量（出せる数）に
+                #   なったので、元の在庫数を別キーで残す。指定が無ければ『在庫数』と同じ値になる。
+                '在庫数（全量）': round(full_qty, 2),
+                # 出せる数の指定があるか（bool）。★文字列を見て判定しない＝真偽値で持つ。
+                '_数量指定': specified,
                 '在庫金額': round(over_amt, 2),
                 '過剰在庫区分': g(row, '過剰在庫区分'), '不動区分': g(row, '不動区分'),
                 '期限切迫区分': g(row, '期限切迫区分'), '有効期限': fmt_date(exp),
@@ -1258,11 +1361,11 @@ def compute_matching(stores, excluded=None, reserved=None):
         exp_cnt = 0
         exp_amt = 0.0
         short_cnt = 0
-        for row in s['rows']:
+        for ri, row in enumerate(s['rows']):
             if (is_supplier(row, s['base_date']) and not is_legal_excluded(row)
                     and not is_excluded(s['name'], row)
                     and not is_below_min_amount(row)):
-                amt = stock_amount(row)
+                amt = _eff_amt_of(s['name'], ri, row)   # 在庫金額＝実効金額（出せる数×薬価／指定なしは元の金額）
                 if supplier_category(row, s['base_date']) == 'デッド':
                     dead_cnt += 1
                     dead_amt += amt
@@ -1279,11 +1382,11 @@ def compute_matching(stores, excluded=None, reserved=None):
     # --- 自己検算：出し手（デッド＋期限切迫・法規制除外後）の在庫金額合計 と 融通提案シートの合計 ---
     checkA = 0.0
     for s in stores:
-        for row in s['rows']:
+        for ri, row in enumerate(s['rows']):
             if (is_supplier(row, s['base_date']) and not is_legal_excluded(row)
                     and not is_excluded(s['name'], row)
                     and not is_below_min_amount(row)):
-                checkA += stock_amount(row)
+                checkA += _eff_amt_of(s['name'], ri, row)   # 実効金額（提案行の在庫金額と同じ出どころ）
     checkB = sum(r['_amt_raw'] for r in proposal_rows)
     diff = abs(checkA - checkB)
     check_ok = diff < 0.01
@@ -1470,7 +1573,10 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     #   ※末尾の『滞留』は2026-07-30に追加した列（何ヶ月つづけて載っているか）。
     #   既存の列は順番も中身も変えていないので、旧版との照合は追加2列を除いて行える。
     #   ★新しい列を末尾に足すのは、途中に差し込むと過去のExcelとの列位置が合わなくなるため。
-    headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫金額',
+    #   ※『在庫数（全量）』は2026-08-10に追加した列（出せる数の指定に伴い新設）。
+    #     『在庫数』＝実効数量（出せる数）／『在庫数（全量）』＝その店が持っている全部の数。
+    #     指定が無い品では両者は同じ値になる。★『在庫数』のすぐ隣に置く（末尾ではない）。
+    headers = ['出し手店', '種別', '薬品名', '単位', 'メーカ名', '在庫数', '在庫数（全量）', '在庫金額',
                '過剰在庫区分', '不動区分', '期限切迫区分', '有効期限', 'ロットNO',
                '最終出庫日', '区分', '引取候補店', '参考:過剰だが使用中の店',
                '6ヶ月出庫回数', '医薬品CD', '予約', '滞留']
@@ -1487,6 +1593,7 @@ def write_excel(path, base_ym_disp, csv_base_disp,
     r = hr + 1
     for pr in proposal_rows:
         vals = [pr['出し手店'], pr['種別'], pr['薬品名'], pr['単位'], pr['メーカ名'], pr['在庫数'],
+                pr.get('在庫数（全量）', pr['在庫数']),
                 pr['在庫金額'], pr['過剰在庫区分'], pr['不動区分'], pr['期限切迫区分'],
                 pr['有効期限'], pr['ロットNO'], pr['最終出庫日'], pr['区分'],
                 pr['引取候補店'], pr['参考:過剰だが使用中の店'],
@@ -1495,8 +1602,8 @@ def write_excel(path, base_ym_disp, csv_base_disp,
         for ci, v in enumerate(vals, start=1):
             cell = ws.cell(row=r, column=ci, value=v)
             cell.border = BORDER
-            # 在庫数（6列目）・在庫金額（7列目）は小数第2位まで表示する
-            if ci in (6, 7):
+            # 在庫数（6列目）・在庫数（全量）（7列目）・在庫金額（8列目）は小数第2位まで表示する
+            if ci in (6, 7, 8):
                 cell.number_format = '#,##0.00'
         # 塗り分け：有効期限まで5ヶ月以内は赤、そうでなく1年以内は黄（ただし「参考」列は対象外）
         fill = None

@@ -15,6 +15,9 @@ input/
 *.xls
 *.xlsx
 
+# 改修前バックアップ（*_backup_YYYYMMDD.py）はコミット対象外
+*_backup_*.py
+
 # Python の一時ファイル
 __pycache__/
 *.pyc

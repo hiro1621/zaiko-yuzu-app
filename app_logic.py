@@ -96,7 +96,14 @@ def _view_supply(result, store_name, category):
         else:
             taker_label = r['引取候補店（店名のみ）']
         out.append({
-            '薬品名': r['薬品名'], '単位': r['単位'], '在庫数': r['在庫数'],
+            '薬品名': r['薬品名'], '単位': r['単位'],
+            # ★『在庫数』＝その店が持っている全部（在庫数（全量））、『出せる数』＝実際に出す数（実効数量）。
+            #   proposal_rows の『在庫数』は実効数量（出せる数）になったので、全量は在庫数（全量）から取る。
+            #   これで店は「手持ち何錠のうち何錠出すか」を1つの表で見られる（既定は出せる数＝全量）。
+            '在庫数': r.get('在庫数（全量）', r['在庫数']),
+            '出せる数': r['在庫数'],
+            # 出せる数の指定が入っているか（bool）。画面には出さないが将来の絞り込み等に使える。
+            '_数量指定': r.get('_数量指定', False),
             '在庫金額': r['在庫金額'], '有効期限': r['有効期限'],
             '期限切迫区分': r['期限切迫区分'], '区分': r['区分'],
             '引取候補店': taker_label,
@@ -104,7 +111,7 @@ def _view_supply(result, store_name, category):
             #   ★判定は yuzu_core（compute_matching）で1度だけ行い、画面へはその結果を運ぶだけにして
             #     判定の出どころを一本化する（画面側で期限切迫区分の非空を見ると定義がズレるため）。
             '_expiry_flag': r.get('_expiry_flag', False),
-            # 除外チェック欄で使う内部キー（画面には出さない）
+            # 除外・出せる数の指定で使う内部キー（画面には出さない）
             '_key': r['_ex_key'],
             # 予約済みの品を誤って除外しないよう、店名を持たせておく（画面には出さない）
             '_予約店': taker,
@@ -169,12 +176,13 @@ def build_view_receive(result, store_name):
           （不足中の品が上に来る優先順位はそのまま）。
 
       画面用の列に整えて返す（内部用の _tier_order・_remain・引取候補店 は返さない）：
-        出し手店／薬品名／滞留／単位／出し手の在庫数／自店の在庫数／在庫金額／有効期限／消化目安／区分／医薬品CD
+        出し手店／薬品名／滞留／単位／出し手が出せる数／自店の在庫数／在庫金額／有効期限／消化目安／区分／医薬品CD
       ※2026-07-28 本間部長指示で『なぜ候補か』（不足中／使用中）列を削除した。
       ※2026-08-01（本間部長確定）に列を2つ整理した（①の改修）：
         ・既存の『在庫数』（＝出し手がいま持っている数）を『出し手の在庫数』に改名（取り違え防止）。
         ・その隣に『自店の在庫数』（＝自店がいまその品を何個持っているか）を新設。
-        ★この改名は【④の画面表示だけ】。Excel／Gシートの列名『在庫数』には一切触っていない。
+      ※2026-08-10：『出し手の在庫数』を『出し手が出せる数』に再改名（値＝出し手の実効数量）。
+        ★これらの改名は【④の画面表示だけ】。Excel／Gシートの列名『在庫数』には一切触っていない。
     """
     rows = []
     for r in result.get('candidate_rows', []):
@@ -203,13 +211,16 @@ def build_view_receive(result, store_name):
 
 def _receive_row_to_view(r):
     """ ④（および別枠）の候補行 r を、画面表示用の辞書に整える共通処理。
-        ★『在庫数』→『出し手の在庫数』の改名と『自店の在庫数』の追加はここで一元的に行う
-          （④本体と別枠 build_view_receive_ref で同じ整え方を使い、二重管理しないため）。 """
+        ★『在庫数』→『出し手が出せる数』の改名と『自店の在庫数』の追加はここで一元的に行う
+          （④本体と別枠 build_view_receive_ref で同じ整え方を使い、二重管理しないため）。
+        ★2026-08-10：列名を『出し手の在庫数』→『出し手が出せる数』に改名した（値＝出し手の実効数量。
+          出し手が「N錠だけ出す」と指定していればその数になる）。これは【④の画面表示だけ】の改名で、
+          Excel／Gシートの列名『在庫数』には一切触っていない。 """
     return {
         '出し手店': r.get('出し手店', ''), '薬品名': r.get('薬品名', ''),
         '滞留': r.get('滞留', ''), '単位': r.get('単位', ''),
-        # ①の改修：既存『在庫数』を『出し手の在庫数』に改名（値は同じ）＋『自店の在庫数』を新設
-        '出し手の在庫数': r.get('在庫数', ''), '自店の在庫数': r.get('自店の在庫数', ''),
+        # 既存『在庫数』を『出し手が出せる数』に改名（値＝出し手の実効数量）＋『自店の在庫数』を新設
+        '出し手が出せる数': r.get('在庫数', ''), '自店の在庫数': r.get('自店の在庫数', ''),
         '在庫金額': r.get('在庫金額', ''), '有効期限': r.get('有効期限', ''),
         '消化目安': r.get('消化目安', ''), '区分': r.get('区分', ''),
         '医薬品CD': r.get('医薬品CD', ''),
@@ -237,7 +248,7 @@ def build_view_receive_ref(result, store_name):
       ★突き合わせは完全一致（==）のみ（和光／さと和光は別会社なので in は使わない）。
       ★別枠の行にも _出し手店・_key を必ず持たせる（予約が空キーで消える過去の不具合を再発させない）。
 
-      列は④本体とまったく同じ（出し手の在庫数＋自店の在庫数の2列構成）。
+      列は④本体とまったく同じ（出し手が出せる数＋自店の在庫数の2列構成）。
     """
     rows = []
     for r in result.get('candidate_rows_ref', []):
@@ -537,6 +548,126 @@ def build_view_reserved(result, store_name, reservations, ym):
 
 
 # ============================================================================
+# 出せる数（提供数量）… 出し手の店が「この品はN錠だけ出す」と決めた数量
+#   2026-08-10 追加（第1弾）。保管庫の _提供数量 タブ（辞書のリスト）と、
+#   compute_matching が欲しい形（辞書）を橋渡しする。品目キーは exclusion_key（除外・予約と同一）。
+# ============================================================================
+def supply_qty_map(rows):
+    """ _提供数量 の行リストを compute_matching(supply_qty=...) に渡す形へ変換する。
+          {(店名, 品目キー): 出せる数(float)}
+        数値に直せない・0以下の行は無視する（＝指定なし＝全量扱い）。 """
+    out = {}
+    for r in (rows or []):
+        store = (r.get('店名', '') or '').strip()
+        key = (r.get('品目キー', '') or '').strip()
+        if not store or not key:
+            continue
+        try:
+            q = float(str(r.get('出せる数', '')).replace(',', '').strip())
+        except (TypeError, ValueError):
+            continue
+        if q <= 0:
+            continue
+        out[(store, key)] = q
+    return out
+
+
+def apply_supply_cap(rows, stock_by_key):
+    """ 月替わりの頭打ち。_提供数量 の各行の『出せる数』を、その品の当月在庫数まで自動で下げる。
+          rows         … _提供数量 の行リスト（read_supply_qty と同じ形）
+          stock_by_key … {(店名, 品目キー): 当月の在庫数(float)}
+        ・在庫数を超える指定は在庫数まで下げる（「60錠出す」と決めた品の在庫が翌月20錠なら20錠＝実質全量）。
+        ・当月の在庫が分からない品（stock_by_key に無い）はそのまま残す（勝手に消さない）。
+        戻り値 … 頭打ち後の新しい行リスト（元は変更しない）。 """
+    out = []
+    for r in (rows or []):
+        nr = dict(r)
+        stock = stock_by_key.get((nr.get('店名', ''), nr.get('品目キー', '')))
+        if stock is not None:
+            try:
+                qty = float(str(nr.get('出せる数', '')).replace(',', '').strip())
+            except (TypeError, ValueError):
+                qty = None
+            if qty is not None and qty > stock:
+                nr['出せる数'] = yuzu_core.fmt_qty(stock)
+        out.append(nr)
+    return out
+
+
+def plan_supply_qty(current_rows, my_store, picked):
+    """
+    「選んだ品の『出せる数』を保存する」ときの結果を計算する純関数（画面部品に依存しない＝テスト可能）。
+
+      current_rows … いま保管庫に入っている _提供数量 の行リスト（★保存直前に読み直したもの）
+      my_store     … 自店名
+      picked       … 保存したい品のリスト。各要素は
+                     {'_key': 品目キー, '薬品名': 薬品名, '出せる数': float(出す数),
+                      '在庫数': float(その品の在庫数＝全量), '_予約店': 予約店(あれば), '_now': 日時}
+      戻り値 …
+        {'keep':    保存すべき新しい行リスト（_提供数量 タブへ丸ごと書き戻す形）,
+         'added':   新しく指定した件数,
+         'updated': 指定を変更した件数,
+         'removed': 指定を消した（＝全量に戻した）件数,
+         'blocked': [{'薬品名','予約店'}, ...]（予約が入っていて数量を変えなかった品）}
+
+    ルール：
+      ・予約が入っている品（_予約店 が非空）は数量を変えない（blocked に入れて呼び出し側が知らせる）。
+        黙って変えると、引き取るつもりの店の見込みが理由も分からず狂うため。
+      ・『出せる数』が『在庫数（全量）』以上なら指定を削除する＝全量に戻す
+        （在庫まるごと出すなら指定を持たない。月替わりで在庫が減っても自動で全量に追随できる）。
+      ・それ以外は追加（無ければ）または更新（値が変わったら）。同じ値なら何もしない。
+    """
+    keep = list(current_rows or [])
+
+    def _find(store, key):
+        for i, r in enumerate(keep):
+            if r.get('店名', '') == store and r.get('品目キー', '') == key:
+                return i
+        return -1
+
+    added = updated = removed = 0
+    blocked = []
+    for d in (picked or []):
+        key = (d.get('_key', '') or '').strip()
+        if not key:
+            continue
+        # 予約が入っている品は触らない
+        if (d.get('_予約店', '') or '').strip():
+            blocked.append({'薬品名': d.get('薬品名', ''), '予約店': d.get('_予約店', '')})
+            continue
+        try:
+            qty = float(str(d.get('出せる数', 0)).replace(',', '').strip() or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            stock = float(str(d.get('在庫数', 0)).replace(',', '').strip() or 0)
+        except (TypeError, ValueError):
+            stock = 0.0
+        i = _find(my_store, key)
+        # 在庫数（全量）以上＝全量に戻す → 指定を消す
+        if stock > 0 and round(qty, 2) >= round(stock, 2):
+            if i >= 0:
+                keep.pop(i)
+                removed += 1
+            continue
+        if qty <= 0:
+            # 0以下は指定しない（画面側で 0.01 以上に制限しているが、念のためここでも無視）
+            continue
+        new_row = {'店名': my_store, '品目キー': key, '薬品名': d.get('薬品名', ''),
+                   '出せる数': yuzu_core.fmt_qty(qty), '更新日時': d.get('_now', '')}
+        if i >= 0:
+            old = (keep[i].get('出せる数', '') or '').strip()
+            if old != new_row['出せる数']:
+                keep[i] = new_row
+                updated += 1
+        else:
+            keep.append(new_row)
+            added += 1
+    return {'keep': keep, 'added': added, 'updated': updated,
+            'removed': removed, 'blocked': blocked}
+
+
+# ============================================================================
 # 引取依頼書（帳票）＝受け手（引き取る側）が予約した品を、出し手店ごとにまとめる
 #   2026-08-01 追加（④の改修）。デスクネッツ貼付・FAX・電話しながらの参照用。
 #   ・build_view_reserved（《予約の記録そのもの》から作る既存関数）を土台にする。
@@ -669,6 +800,7 @@ class LocalBackend:
         state.setdefault('results', None)
         state.setdefault('exclusions', [])   # 店が「出さない」と外した品目
         state.setdefault('reservations', [])  # 受け手の店が「うちが引き取る」と押さえた品目
+        state.setdefault('supply_qty', [])   # 出し手の店が「この品はN錠だけ出す」と決めた数量
         self.state = state
 
     # --- gsheet_store と同じメソッド名・戻り値でそろえる ---
@@ -747,3 +879,11 @@ class LocalBackend:
     def save_reservations(self, rows):
         """ 予約リストを丸ごと入れ替える（Gシート版と同じ挙動）。 """
         self.state['reservations'] = list(rows)
+
+    def load_supply_qty(self):
+        """ 出し手の店が「N錠だけ出す」と決めた数量の一覧を返す（Gシート版と同じ形）。 """
+        return list(self.state['supply_qty'])
+
+    def save_supply_qty(self, rows):
+        """ 提供数量リストを丸ごと入れ替える（Gシート版と同じ挙動）。 """
+        self.state['supply_qty'] = list(rows)
