@@ -391,6 +391,28 @@ def _fmt_qty(v):
     return '{:,.2f}'.format(f).rstrip('0')
 
 
+def _fmt_amount(v):
+    """ 金額の表示。カンマ区切りの小数第2位（例 20,759.20）。空欄はそのまま空欄で返す。
+
+        ★以前はフォーマット文字列 '{:,.2f}' を Styler に直接渡していたが、それだと画面が落ちた。
+          再現手順：予約された品を、出し手の店が一覧から外す
+                  → 受け手の④「予約中の品」で在庫金額が空文字になる
+                  → '{:,.2f}'.format('') が ValueError で落ちて、画面ごと真っ白になる。
+          このエラーは _style_expiry の try/except では拾えない。Styler.format は
+          その場では計算せず、表を描くときに初めて動くので、例外が try の外で起きるため。
+          だからフォーマッタ側で空欄を受け止める（2026-08-10 品質管理部が再現・裏取り済み）。
+          ※この不具合は掲示板の改修より前から存在していた（改修前のファイルでも再現）。 """
+    if v is None:
+        return ''
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return v                            # 空文字や文字列はそのまま返す
+    if f != f:                              # NaN はそのまま返す
+        return v
+    return '{:,.2f}'.format(f)
+
+
 def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
     """ 表を見やすく整えた pandas Styler を返す。
           ・数量列（出庫可能数など）は末尾の .00 を落として表示（例 77／12.5・カンマ区切り）。
@@ -433,13 +455,15 @@ def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
 
     try:
         sty = df.style
-        # 数量系は _fmt_qty（.00 を落とす）／金額系は '{:,.2f}'（小数第2位のまま）で分けて整える。
+        # 数量系は _fmt_qty（.00 を落とす）／金額系は _fmt_amount（小数第2位のまま）で分けて整える。
+        # ★どちらも「数値に直せない値はそのまま返す」フォーマッタにしてある。
+        #   表の一部が空欄でも画面を落とさないため（_fmt_amount の説明を参照）。
         fmt = {}
         for c in df.columns:
             if c in _QTY_COLS:
                 fmt[c] = _fmt_qty
             elif c in _AMOUNT_COLS:
-                fmt[c] = '{:,.2f}'
+                fmt[c] = _fmt_amount
         if fmt:
             sty = sty.format(fmt)
         if paint and expiry_flags:
