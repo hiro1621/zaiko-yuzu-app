@@ -1151,6 +1151,10 @@ def message_section(my_store, backend, threads, msg_reads):
     with c1:
         if st.button('最新に更新', key='btn_msg_refresh'):
             clear_messages_cache()
+            # ★タブの目次キャッシュも捨てる。まだ `_やり取り` タブが無い状態では
+            #   _find_ws の空振り抑制（30秒）が効いていて、他店が今まさに作ったタブを
+            #   見落とすことがあるため。手で押したときだけは必ず取り直す。
+            gsheet_store.reset_ws_cache()
             st.rerun()
     with c2:
         st.caption('相手ごとに会話は1本にまとまります（予約が入ると、その相手とやり取りできます）。'

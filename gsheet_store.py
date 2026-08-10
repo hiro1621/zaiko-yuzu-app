@@ -128,6 +128,10 @@ def open_spreadsheet(sa_info, spreadsheet_id):
 # ============================================================================
 _WS_CACHE = {}   # {ブックのID: {タブ名: ワークシート}}
 
+# 目次を最後に取り直した時刻 {ブックのID: 時刻}。空振りの取り直しを抑えるために使う（_find_ws 参照）。
+_WS_REFRESH_AT = {}
+_WS_REFRESH_MIN_INTERVAL = 30   # 秒。無いタブを探しても、これより短い間隔では目次を取り直さない。
+
 # 上限（429）に当たったときに待つ秒数。3回までやり直す。
 _RETRY_WAITS = [2, 5, 10]
 
@@ -171,27 +175,45 @@ def _ws_map(sh, refresh=False):
     key = _book_key(sh)
     if refresh or key not in _WS_CACHE:
         _WS_CACHE[key] = {ws.title: ws for ws in _call(sh.worksheets)}
+        _WS_REFRESH_AT[key] = time.time()
     return _WS_CACHE[key]
 
 
 def reset_ws_cache():
     """ タブの目次キャッシュを捨てる（タブを新しく作った直後などに呼ぶ）。 """
     _WS_CACHE.clear()
+    _WS_REFRESH_AT.clear()
 
 
-def _find_ws(sh, title):
+def _find_ws(sh, title, force_refresh=False):
     """ 指定名のタブを返す。無ければ None。
-        キャッシュに無いときだけ目次を1回取り直す（新しく作られたタブを拾うため）。 """
+        キャッシュに無いときだけ目次を1回取り直す（新しく作られたタブを拾うため）。
+
+        ★★ただし「まだ存在しないタブ」を探すと、毎回かならず目次の取り直しが走ってしまう。
+          `_やり取り` / `_やり取り既読` は最初の投稿があるまで存在しないので、
+          画面を1回描くたびにAPIを2回ぶんムダに使っていた（2026-08-10 本番で判明）。
+          Googleシートは1分60回が上限（サービスアカウント全体で共有）で、
+          上限に当たると _call が 2秒→5秒→10秒 と待つため、
+          **エラーは出ないまま画面が固まったように見える**。実際に本間部長の画面が止まった。
+          → 空振りの取り直しは 30秒に1回までに抑える。
+             取り直しを飛ばした間は「まだ無い」とみなして None を返す。
+        ※タブを作る側（_get_or_create_ws）は force_refresh=True で必ず取り直す。
+          抑制のせいで「本当はある」のに二重に作ってしまう事故を防ぐため。 """
     m = _ws_map(sh)
     if title in m:
         return m[title]
+    key = _book_key(sh)
+    if (not force_refresh) and (time.time() - _WS_REFRESH_AT.get(key, 0.0) < _WS_REFRESH_MIN_INTERVAL):
+        return None
     m = _ws_map(sh, refresh=True)
     return m.get(title)
 
 
 def _get_or_create_ws(sh, title, rows=2000, cols=40):
-    """ 指定名のタブを取得。無ければ作る。 """
-    ws = _find_ws(sh, title)
+    """ 指定名のタブを取得。無ければ作る。
+        ★ここだけは force_refresh=True で必ず目次を取り直す。
+          「実は他の店がさっき作っていた」タブを見落として二重に作るのを防ぐため。 """
+    ws = _find_ws(sh, title, force_refresh=True)
     if ws is not None:
         return ws
     ws = _call(sh.add_worksheet, title=title, rows=str(rows), cols=str(cols))
