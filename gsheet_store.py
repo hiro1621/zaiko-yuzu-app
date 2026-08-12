@@ -456,16 +456,38 @@ def read_messages(sh):
 
 
 def append_message(sh, row):
-    """ _やり取り タブへ1投稿だけ追記する（★append_rows による追記のみ。clear+update は使わない）。
+    """ _やり取り タブへ1投稿だけ追記する（★追記のみ。clear+update は絶対に使わない）。
         row は read_messages と同じ形の辞書（見出し名で引いて列順に並べ替える）。
-        タブが無ければ作り、まだ空なら見出し行も一緒に書く。429は _call のリトライに乗せる。 """
+        タブが無ければ作り、まだ空なら見出し行も一緒に置く。429は _call のリトライに乗せる。
+
+    ★★★ここで ws.append_rows（Google の values.append）を使ってはいけない（2026-08-12 の障害）★★★
+      values.append は「書き込む場所を Google 側が推測する」API で、渡した範囲の中から
+      “表”を探し、その次の行に足す。ところが**行の途中に空セルがあると、そこで表が切れたと
+      判断され、次の追記が空セルの右側から始まる**。
+      ⑤やり取りでは『薬品名』が空（＝「薬を特定しない」で投稿）になり得るため、これに当たった。
+      本番で実際に起きた壊れ方（保管庫を直接読んで確認）：
+          1件目 … A列から  [投稿日時, 店A, 店B, (空), 投稿店, 本文]
+          2件目 … E列から  ← 1件目の空セル（D列＝薬品名）より右が“表”とみなされた
+          3件目 … I列から  ← さらに4列ずれる
+      しかも見出し行が無い状態だったため、read_messages が列名で列を引けず
+      **投稿3件が1件も画面に出ない**（保存はされているのに「まだ投稿はありません。」）。
+
+      → 書き込む行を**こちらで決めて**その場所に直接書く。Google に推測させない。
+        `_update` は指定した範囲だけを上書きするので、ほかの行には触らない
+        ＝「追記のみ・過去の投稿を消さない」という約束はこれまでどおり守られる。
+
+    ★同時書き込みについて：2店がまったく同時に投稿すると、同じ行番号を計算して
+      片方が上書きされる可能性がある（append_rows にはこの弱点が無かった）。
+      それでも append_rows に戻さないのは、上のとおり**ふだんから確実に壊れる**ほうが
+      よほど実害が大きいため。掲示板の投稿が同一秒に重なる頻度は極めて低い。 """
     ws = _get_or_create_ws(sh, MESSAGE_TAB, rows=5000, cols=len(MESSAGE_HEADERS) + 2)
     values = _values(ws)
     body = []
+    start = len(values) + 1              # 既にある行の次の行（1始まり）
     if not values:                       # まだ空＝いちばん最初は見出し行を先に置く
         body.append(list(MESSAGE_HEADERS))
     body.append([str(row.get(h, '') or '') for h in MESSAGE_HEADERS])
-    _call(ws.append_rows, body, value_input_option='RAW')
+    _update(ws, body, range_name='A%d' % start)
 
 
 def read_msg_reads(sh):
