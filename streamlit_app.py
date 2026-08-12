@@ -67,6 +67,7 @@ import hashlib
 import streamlit as st
 import pandas as pd   # ※ streamlit に同梱されるので requirements への追記は不要
 
+import jst   # 日本時間の「いま」「今日」（Streamlit Cloud の UTC ずれ対策）
 import yuzu_core
 import app_logic
 import gsheet_store
@@ -626,7 +627,7 @@ def _to_float(v, default=0.0):
 def _save_exclusions_ui(checked, my_store, backend, exclusions):
     """ 選ばれた品を除外（デッドストックから外す）に保存する。従来の「除外を保存」の中身。
         ★予約が入っている品は除外しない（引き取るつもりの店の予約が理由も分からず消えるため）。 """
-    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    now = jst.now().strftime('%Y/%m/%d %H:%M')   # 日本時間（UTCずれ対策）
     # ★★保存の直前に、除外リストを保管庫から“直接”読み直してから足す（2026-08-12）。
     #   表示は60秒キャッシュ（load_lists_cached）越しだが、書き込みの土台は必ず最新にする。
     #   これをしないと、直前60秒の間にほかの店が入れた除外を、丸ごと上書きで消してしまう。
@@ -762,7 +763,7 @@ def _save_supply_qty_ui(rows, my_store, backend, desired):
         ・予約が入っている品は plan_supply_qty の blocked の仕組みでそのまま守る（数量を変えない）。
         ・メッセージは _flash にためてから（呼び出し側が）st.rerun する（rerun で消えないように）。
         ・保存の直前に _提供数量 を読み直してから書く（同時書き込み対策・従来どおり）。 """
-    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    now = jst.now().strftime('%Y/%m/%d %H:%M')   # 日本時間（UTCずれ対策）
     v = _validate_supply_desired(rows, desired, now=now)
     # 在庫（全量）を超えた品は全量まで下げたことを知らせる（黙って直さない）
     for name, stock in v['clamped']:
@@ -1050,7 +1051,8 @@ def _receive_view_with_talk(r, hidden, msg_by_store):
     return d
 
 
-def receive_section(view_receive, my_store, backend, reservations, ym, msg_by_store=None):
+def receive_section(view_receive, my_store, backend, reservations, ym, msg_by_store=None,
+                    sched=None):
     """
     ④受け手ビュー：他店がデッド・期限切迫で持っていて、自店が引き取れば活かせる品の一覧。
       ・2026-07-28に「予約」を付けた。左端の□で選んで「予約する」を押すと、その品は
@@ -1089,8 +1091,16 @@ def receive_section(view_receive, my_store, backend, reservations, ym, msg_by_st
     checked = [view_receive[i] for i in picked if 0 <= i < len(view_receive)]
     n = len(checked)
     offset = _pickup_offset_selector('pickup_offset_receive')
-    if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve', disabled=(n == 0)):
+    # ★集計中（1〜10日）は予約ボタンを押せなくする。ボタンは消さず「押せない状態＋理由」で出す
+    #   （ボタンごと消すと「予約機能が壊れた」という問い合わせになるため）。
+    can_reserve = (sched or {}).get('can_reserve', True)
+    if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve',
+                 disabled=(n == 0) or (not can_reserve)):
         _save_reservations(backend, my_store, ym, checked, reservations, offset)
+    if not can_reserve:
+        st.caption('いまは集計期間です。予約は毎月%d日から押せます'
+                   '（それまでは自店のデッド確認・除外・出庫可能数の調整をしてください）。'
+                   % (sched or {}).get('open_day', 11))
 
 
 def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
@@ -1113,7 +1123,7 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
     except Exception:
         latest_rows = list(reservations)   # 読み直せなければ画面の内容で進む
 
-    now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    now = jst.now().strftime('%Y/%m/%d %H:%M')   # 日本時間（UTCずれ対策）
     picked = []
     clamped = []   # 有効期限が近く、受取時期を早めた品（薬品名, 実際の受取ラベル）
     for d in checked:
@@ -1156,7 +1166,8 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
         st.rerun()
 
 
-def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_store=None):
+def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_store=None,
+                        sched=None):
     """
     ④の別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修・2026-08-01）。
       ・自店もその薬を使っているが、いま在庫を余らせている品（tier③参考）。今すぐ引き取ると
@@ -1187,8 +1198,14 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_st
         checked = [view_ref[i] for i in picked if 0 <= i < len(view_ref)]
         n = len(checked)
         offset = _pickup_offset_selector('pickup_offset_ref')
-        if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve_ref', disabled=(n == 0)):
+        # ★集計中（1〜10日）は予約ボタンを押せなくする（本体の④と同じ扱い）。理由も1行そえる。
+        can_reserve = (sched or {}).get('can_reserve', True)
+        if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve_ref',
+                     disabled=(n == 0) or (not can_reserve)):
             _save_reservations(backend, my_store, ym, checked, reservations, offset)
+        if not can_reserve:
+            st.caption('いまは集計期間です。予約は毎月%d日から押せます。'
+                       % (sched or {}).get('open_day', 11))
 
 
 def reserved_section(view_reserved, my_store, backend, reservations, result, latest,
@@ -1407,7 +1424,7 @@ def message_section(my_store, backend, threads, msg_reads):
         if not text:
             st.warning('本文が空です。ひとこと書いてから送信してください。')
         else:
-            now = datetime.datetime.now().strftime(MSG_TS_FMT)
+            now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
             row = {'投稿日時': now, '店A': sel['店A'], '店B': sel['店B'],
                    '薬品名': drug, '投稿店': my_store, '本文': text}
             try:
@@ -1428,7 +1445,7 @@ def message_section(my_store, backend, threads, msg_reads):
 
     # --- スレッドを開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
     if app_logic.unread_count(my_store, sel, msg_reads) > 0:
-        now = datetime.datetime.now().strftime(MSG_TS_FMT)
+        now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
         new_reads = app_logic.mark_thread_read(
             msg_reads, my_store, sel['店A'], sel['店B'], now)
         try:
@@ -1668,7 +1685,7 @@ def _upload_form(backend, my_store):
         type=['xls', 'csv', 'xlsx'], accept_multiple_files=False)
 
     # 対象年月：ファイル名に _YYYYMM があればそれを初期値に、無ければ当月
-    default_ym = datetime.date.today().strftime('%Y%m')
+    default_ym = jst.today().strftime('%Y%m')   # 日本時間の今日（UTCずれ対策）
     if up is not None:
         _, ym_from_name = yuzu_core.parse_filename(up.name)
         if ym_from_name:
@@ -1710,6 +1727,14 @@ def _upload_form(backend, my_store):
                 key='confirm_unknown_store_%s' % up.name)
 
     can_upload = (up is not None) and (my_store is not None) and guard_ok
+    # ---- 締切（毎月10日）を過ぎているときの黄色の警告（ボタンは押せるままにする）----
+    #   遅れて上げても止めはしないが、すでに予約が始まっている一覧が作り直される旨を知らせる。
+    #   「今日」は日本時間（UTCずれ対策）。判定は純関数 schedule_state に任せる。
+    upload_sched = app_logic.schedule_state(jst.today())
+    if upload_sched['is_upload_late']:
+        st.warning('アップロードの締切（毎月%d日）を過ぎています。'
+                   'いま上げると、すでに予約が始まっている一覧が作り直されます。'
+                   % upload_sched['deadline_day'])
     if st.button('この内容でアップロードする', type='primary', disabled=not can_upload):
         if my_store is None:
             st.warning('先に店舗名を選んでください。')
@@ -1754,6 +1779,17 @@ def results_section(backend, stores, latest, index):
     _render_flash()
     status = app_logic.uploaded_status(index, latest, STORE_NAMES)
 
+    # ---- 月次スケジュール（10日締切・11日予約開始）の判定 ----
+    #   ★「今日」は日本時間（jst.today）で“ここで1回だけ”取り、純関数 schedule_state に渡す。
+    #     以降はこの sched を予約ボタンの可否まで持ち回る（画面のあちこちで today を呼ばない）。
+    #   1〜10日は集計中の帯を出す。予約は11日から（下の④の予約ボタンで押せるようにする）。
+    sched = app_logic.schedule_state(jst.today())
+    if sched['phase'] == 'collecting':
+        st.info('いまは集計中です（%d/%d店がアップ済み）。引取候補店はこれから増えます。'
+                '**予約は%d日から**です。'
+                'いまのうちに自店のデッド確認・除外・出庫可能数の調整をしてください。'
+                % (status['n'], STORE_COUNT, sched['open_day']))
+
     st.subheader('現在の状況')
     show_upload_status(status, latest)
 
@@ -1789,7 +1825,7 @@ def results_section(backend, stores, latest, index):
     supply_rows = app_logic.apply_supply_cap(supply_rows_raw, stock_by_key)
 
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
-    csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
+    csv_base_disp = jst.today().strftime('%Y/%m/%d')   # 日本時間の今日（UTCずれ対策）
 
     # ============================================================================
     # 案1（2026-08-12）：材料が前回と同じなら「照合もExcelもまるごと作り直さない」
@@ -1951,10 +1987,10 @@ def results_section(backend, stores, latest, index):
             elif chosen == VIEW_RECEIVE:
                 # ---- ④（自店）が引き取れる薬（他店のデッド・期限切迫）＝受け手ビュー ----
                 receive_section(view_receive, my_store, backend, reservations, latest,
-                                msg_by_store=msg_by_store)
+                                msg_by_store=msg_by_store, sched=sched)
                 # ④の下に別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修）
                 receive_ref_section(view_receive_ref, my_store, backend, reservations, latest,
-                                    msg_by_store=msg_by_store)
+                                    msg_by_store=msg_by_store, sched=sched)
                 # さらに下に「予約中の品」＋引取依頼書ボタン（④の改修）
                 reserved_section(view_reserved, my_store, backend, reservations, result, latest,
                                  msg_by_store=msg_by_store)

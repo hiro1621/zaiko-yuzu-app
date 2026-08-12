@@ -26,8 +26,56 @@ import io
 import hashlib
 import datetime
 
+import jst
 import yuzu_core
 from yuzu_core import REQUIRED_COLS, KEEP_COLS
+
+
+# ============================================================================
+# 月次スケジュール（10日締切・11日予約開始）… 本間部長確定 2026-08-12
+#   月を2つに割る：
+#     1〜10日  … 集める期間（全店がアップし、自店のデッド確認・除外・出庫可能数の調整をする）。
+#                新規予約はできない。
+#     11日〜月末 … 予約する期間（全店そろった一覧に対して、同じスタートラインから予約する）。
+#
+#   ★締切日（10日）と解禁日（11日）を別々の定数で持つのは、あとで「締切15日・解禁20日」の
+#     ように離したくなったとき、この1か所を直すだけで済むようにするため。
+#   ★月の日数は見ない（31日でも28日でも「10日まで／11日から」で同じ）。
+# ============================================================================
+SCHEDULE = {
+    'upload_deadline_day': 10,   # この日まではアップロード期間（この日を含む）
+    'reserve_open_day': 11,      # この日から予約できる
+}
+
+
+def schedule_state(today, schedule=None):
+    """ 今日が「集める期間」か「予約する期間」かを返す純関数。
+        ★「今日」を引数で受け取る（画面側で jst.today() を1回だけ呼んで渡す）。
+          こうすると、テストから任意の日付を流し込んで挙動を確かめられる（base_date と同じ方針）。
+
+        引数：
+          today    … 判定したい日付（datetime.date）。日（.day）だけを見る。
+          schedule … 締切日・解禁日の設定（省略時は上の SCHEDULE を使う）。
+
+        戻り値（辞書）：
+          'phase'          … 'collecting'（集める期間・1〜10日）か 'open'（予約する期間・11日〜）
+          'can_reserve'    … 予約してよいか（11日以降 True）
+          'is_upload_late' … アップロードの締切（10日）を過ぎているか（11日以降 True）
+          'deadline_day'   … 締切日（既定10）
+          'open_day'       … 解禁日（既定11） """
+    sch = schedule or SCHEDULE
+    deadline = sch['upload_deadline_day']
+    open_day = sch['reserve_open_day']
+    day = today.day
+    can_reserve = (day >= open_day)      # 解禁日を含む（11日から予約できる）
+    is_upload_late = (day > deadline)    # 締切日は含まない（10日まではアップ期間）
+    return {
+        'phase': 'open' if can_reserve else 'collecting',
+        'can_reserve': can_reserve,
+        'is_upload_late': is_upload_late,
+        'deadline_day': deadline,
+        'open_day': open_day,
+    }
 
 
 # ============================================================================
@@ -1024,7 +1072,7 @@ class LocalBackend:
         self.state['raw'][store_name] = list(slim_rows)
         self.state['index'][store_name] = {
             'ym': ym,
-            'uploaded_at': datetime.datetime.now().strftime('%Y/%m/%d %H:%M'),
+            'uploaded_at': jst.now().strftime('%Y/%m/%d %H:%M'),   # 日本時間（UTCずれ対策）
             'rows': str(len(slim_rows)),
             'format': 'OK' if format_ok else 'NG(別様式)',
             'filename': filename,

@@ -1764,7 +1764,7 @@ def write_pickup_request_excel(path_or_buf, data):
     my_store = data.get('my_store', '')
     ym = data.get('ym', '')
     ym_disp = ('%s年%s月' % (ym[:4], ym[4:6])) if (ym and len(str(ym)) >= 6) else '不明'
-    today = datetime.date.today().strftime('%Y/%m/%d')
+    today = __import__('jst').today().strftime('%Y/%m/%d')   # 日本時間の今日（UTCずれ対策・yuzu_coreはこの1行のみ変更）
 
     ncol = len(PICKUP_REQUEST_COLS)
     last_col = get_column_letter(ncol)

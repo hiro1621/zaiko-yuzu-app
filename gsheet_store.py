@@ -38,6 +38,7 @@
 import datetime
 import time
 
+import jst   # 日本時間の「いま」（Streamlit Cloud の UTC ずれ対策）
 # yuzu_core（同じフォルダ）から、保管庫に入れる列の定義と道具を借りる
 from yuzu_core import KEEP_COLS, g
 
@@ -761,7 +762,7 @@ def save_store_upload(sh, store_name, ym, slim_rows, filename, format_ok):
     write_raw(sh, store_name, slim_rows)
     index[store_name] = {
         'ym': ym,
-        'uploaded_at': datetime.datetime.now().strftime('%Y/%m/%d %H:%M'),
+        'uploaded_at': jst.now().strftime('%Y/%m/%d %H:%M'),   # 日本時間（UTCずれ対策）
         'rows': str(len(slim_rows)),
         'format': 'OK' if format_ok else 'NG(別様式)',
         'filename': filename,
