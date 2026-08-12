@@ -23,6 +23,7 @@ Streamlit を import しないので、そのまま単体テストできます�
 """
 
 import io
+import hashlib
 import datetime
 
 import yuzu_core
@@ -950,6 +951,39 @@ def excel_bytes(result, base_ym_disp, csv_base_disp):
         result['store_names'], result['matrix_rows'], result['summary_rows'])
     bio.seek(0)
     return bio.getvalue()
+
+
+def results_signature(index, latest, exclusions, reservations, supply_rows, csv_base_disp=''):
+    """
+    ②案1（2026-08-12）用：照合（compute_matching）とExcel（excel_bytes）を作り直すかどうかを
+    判断するための『入力の署名』を作る純関数（st に依存しない＝単体テスト可能）。
+
+    材料が1つでも変われば署名が変わる＝古い結果を見せない。混ぜるのは次のぜんぶ：
+      ・index（各店のアップ記録：対象年月・アップ日時・行数・様式・ファイル名）… ★下記の理由で
+        「行の内容そのもの」の代わりに使う『店データの指紋』。
+      ・latest（対象年月）… 月替わりで必ず変わる。
+      ・exclusions（除外リスト）／reservations（予約リスト）／supply_rows（出庫可能数の生の指定リスト）。
+      ・csv_base_disp（Excelに刷る「本日」の日付）… 日付が変わればExcelを刷り直す。
+
+    ★なぜ stores の『行の内容』ではなく index（アップ記録）を指紋に使うのか：
+      在庫本体（raw_<店>）は「アップロード」以外では絶対に変わらず、アップロードのたびに index の
+      アップ日時が必ず書き換わる（save_store_upload）。よって index が1文字も変わっていなければ
+      行の内容も変わっていない、と言い切れる（load_stores_cached が読み直しの要否を判断するのと同じ理屈）。
+      逆に、行を毎回ぜんぶ突き合わせて指紋を取ると、店数に比例して重くなり（14店で0.15秒/回）、
+      「チェック1つで重い」を直すという今回の目的そのものを損なう。だからアップ記録を指紋にする。
+    """
+    def _norm(rows):
+        # 辞書の並び順ゆらぎに影響されないよう、(キー,値) をソートしてから連結する。
+        return [tuple(sorted((str(k), str(v)) for k, v in (r or {}).items())) for r in (rows or [])]
+    material = (
+        # 各店のアップ記録（店名でソート・各記録の中身もソートして並び順非依存にする）
+        sorted((str(k), tuple(sorted((str(kk), str(vv)) for kk, vv in (v or {}).items())))
+               for k, v in (index or {}).items()),
+        str(latest),
+        _norm(exclusions), _norm(reservations), _norm(supply_rows),
+        str(csv_base_disp),
+    )
+    return hashlib.md5(repr(material).encode('utf-8', 'replace')).hexdigest()
 
 
 # ============================================================================

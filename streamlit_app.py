@@ -205,6 +205,10 @@ def clear_stores_cache():
     # 月替わりのアップロードでは 前月_YYYYMM タブが新しく作られるので、前月の記録も捨てる。
     #   （当月の年月が変わればキャッシュのキーも変わるが、念のためここでも落としておく）
     st.session_state.pop('prev_cache', None)
+    # 案1・案2（2026-08-12）：アップロード後は結果キャッシュと表示用リストキャッシュも捨てて、
+    #   新しい在庫ですぐ計算し直させる（署名にも index が入っているので二重の保険）。
+    st.session_state.pop('results_cache', None)
+    st.session_state.pop('lists_cache', None)
 
 
 # ============================================================================
@@ -251,6 +255,62 @@ def load_messages_cached(backend, force=False):
 def clear_messages_cache():
     """ 投稿・既読更新の直後に呼ぶ（次の描画でやり取りを必ず読み直させる）。 """
     st.session_state.pop('messages_cache', None)
+
+
+# ============================================================================
+# 表示用の3リスト（除外・予約・出庫可能数）を60秒キャッシュ越しに読む（2026-08-12・案2）
+#   ★★背景：チェックを1つ入れるたびの再描画で、除外・予約・出庫可能数を毎回読むと
+#     Google Sheets API の1分60回上限に近づき、画面が固まる一因になる（品質管理部の実測で
+#     チェック1つ＝往復4回＝_index＋除外＋予約＋出庫可能数）。
+#   → この3タブは60秒のセッションキャッシュ越しに“表示のためだけ”読む（load_messages_cached と同じ型）。
+#     ふだんの再描画では読み直さず（＝+0回）、保存の直後だけ clear_lists_cache で捨てて読み直す。
+#
+#   ★★★絶対に守る一線（二重予約の防止）：
+#     「保存の直前に、いまの本当の値を突き合わせるための読み直し」——_save_reservations の突合、
+#     _save_supply_qty_ui・_clear_all_supply_qty_ui、_save_exclusions_ui、予約取消——は
+#     いまどおり backend.load_*() を直接呼ぶこと（このキャッシュを絶対に通さない）。
+#     ここをキャッシュ越しにすると、2つの店が同じ品を同時に予約できてしまう。
+#     このキャッシュは「画面に出すための読み」だけに使う。
+# ============================================================================
+_LISTS_CACHE_TTL = 60   # 秒
+
+
+def load_lists_cached(backend, force=False):
+    """ 除外・予約・出庫可能数の3リストを60秒のセッションキャッシュ越しに読む（表示専用）。
+        戻り値：(exclusions, reservations, supply_rows)。
+        読めないリストは（あれば）前回値、無ければ空リストで返す（画面は普通に出る）。 """
+    import time as _time
+    now = _time.time()
+    cache = st.session_state.get('lists_cache')
+    if (not force) and cache and (now - cache.get('t', 0) < _LISTS_CACHE_TTL):
+        return cache['exclusions'], cache['reservations'], cache['supply']
+    prev = cache or {}
+    try:
+        exclusions = backend.load_exclusions()
+    except Exception as e:
+        show_gsheet_error(e, '除外リストを読めませんでした（除外なしで表示します）', 'warning')
+        exclusions = prev.get('exclusions', [])
+    try:
+        reservations = backend.load_reservations()
+    except Exception as e:
+        show_gsheet_error(e, '予約リストを読めませんでした（予約なしで表示します）', 'warning')
+        reservations = prev.get('reservations', [])
+    try:
+        supply = backend.load_supply_qty()
+    except Exception as e:
+        show_gsheet_error(e, '提供数量を読めませんでした（全量で表示します）', 'warning')
+        supply = prev.get('supply', [])
+    st.session_state['lists_cache'] = {'t': now, 'exclusions': exclusions,
+                                       'reservations': reservations, 'supply': supply}
+    return exclusions, reservations, supply
+
+
+def clear_lists_cache():
+    """ 除外・予約・出庫可能数を保存した“直後”に呼ぶ（次の描画で必ず読み直させる）。
+        あわせて結果キャッシュ（案1）も捨てる＝材料が変わったので照合とExcelを作り直させる。
+        ★これを呼ばないと、保存した本人が自分の変更を最大60秒見られない。 """
+    st.session_state.pop('lists_cache', None)
+    st.session_state.pop('results_cache', None)
 
 
 def _fmt_msg_time(s):
@@ -567,6 +627,13 @@ def _save_exclusions_ui(checked, my_store, backend, exclusions):
     """ 選ばれた品を除外（デッドストックから外す）に保存する。従来の「除外を保存」の中身。
         ★予約が入っている品は除外しない（引き取るつもりの店の予約が理由も分からず消えるため）。 """
     now = datetime.datetime.now().strftime('%Y/%m/%d %H:%M')
+    # ★★保存の直前に、除外リストを保管庫から“直接”読み直してから足す（2026-08-12）。
+    #   表示は60秒キャッシュ（load_lists_cached）越しだが、書き込みの土台は必ず最新にする。
+    #   これをしないと、直前60秒の間にほかの店が入れた除外を、丸ごと上書きで消してしまう。
+    try:
+        exclusions = backend.load_exclusions()
+    except Exception:
+        pass   # 読み直せなければ、渡された表示用の一覧を土台にする（従来どおり動く）
     keep = list(exclusions)
     have = {(r['店名'], r['除外キー']) for r in keep}
     # ★予約が入っている品は除外しない。品名と相手店を出して、話を付けてもらう。
@@ -588,6 +655,7 @@ def _save_exclusions_ui(checked, my_store, backend, exclusions):
         have.add(pair)
         added += 1
     backend.save_exclusions(keep)
+    clear_lists_cache()   # 保存直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
     st.success('%d件をデッドストックから外しました。' % added)
     st.rerun()
 
@@ -719,6 +787,7 @@ def _save_supply_qty_ui(rows, my_store, backend, desired):
     changed = plan['added'] + plan['updated'] + plan['removed']
     if changed:
         backend.save_supply_qty(plan['keep'])
+        clear_lists_cache()   # 保存直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
         parts = []
         if plan['added']:
             parts.append('新規%d件' % plan['added'])
@@ -743,6 +812,7 @@ def _clear_all_supply_qty_ui(my_store, backend):
     removed = len(latest_rows) - len(keep)
     if removed:
         backend.save_supply_qty(keep)
+        clear_lists_cache()   # 保存直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
         _flash('success', 'この店の出庫可能数の指定を%d件すべて取り消し、全品を在庫まるごとに戻しました。'
                % removed)
     else:
@@ -1061,6 +1131,7 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
 
     if plan['added']:
         backend.save_reservations(plan['keep'])
+        clear_lists_cache()   # 保存直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
         # 新しく予約できた行だけを出し手店へメール通知（保存後・rerun 前に1回だけ＝二重送信しない）。
         #   plan['keep'] のうち、読み直した latest_rows に無かった (出し手店, 予約キー) が新規。
         before_keys = {(r.get('出し手店', ''), r.get('予約キー', '')) for r in latest_rows}
@@ -1141,8 +1212,14 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
         checked = [view_reserved[i] for i in picked if 0 <= i < len(view_reserved)]
         n = len(checked)
         if st.button('予約を取り消す（%d件）' % n, key='btn_unreserve', disabled=(n == 0)):
+            # ★★保存の直前に予約リストを“直接”読み直してから取り消す（ほかの店の予約を消さない・2026-08-12）
+            try:
+                reservations = backend.load_reservations()
+            except Exception:
+                pass
             keep = app_logic.cancel_reservations(reservations, my_store, checked, latest)
             backend.save_reservations(keep)
+            clear_lists_cache()   # 取消直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
             st.session_state.pop('pickup_xls', None)   # 予約が変わったので作りかけの帳票は捨てる
             # 取り消した品を出し手店へメール通知（保存後・rerun 前に1回だけ＝二重送信しない）。
             _mail_flush(mailer.notify_cancellation(_mail_secrets(), my_store, checked))
@@ -1329,9 +1406,15 @@ def excluded_section(my_store, backend, exclusions):
         n = len(checked)
         if st.button('選んだ品目を戻す（%d件）' % n, key='btn_undo', disabled=(n == 0)):
             back = {r['除外キー'] for r in checked}
+            # ★★保存の直前に除外リストを“直接”読み直してから引く（ほかの店の除外を消さない・2026-08-12）
+            try:
+                exclusions = backend.load_exclusions()
+            except Exception:
+                pass
             keep = [r for r in exclusions
                     if not (r['店名'] == my_store and r['除外キー'] in back)]
             backend.save_exclusions(keep)
+            clear_lists_cache()   # 戻した直後：表示用キャッシュと結果キャッシュを捨て、次の描画ですぐ反映する
             st.success('%d件をデッドストックに戻しました。' % n)
             st.rerun()
 
@@ -1633,72 +1716,78 @@ def results_section(backend, stores, latest, index):
         st.warning('次の店のデータは旧形式で保管されているため、在庫金額が0円で表示されます。'
                    'お手数ですが、もう一度アップロードしてください：' + '、'.join(old_format))
 
-    # 除外リスト（店が「この品は出さない」と外した品目）を読み、計算から外す
-    try:
-        exclusions = backend.load_exclusions()
-    except Exception as e:
-        show_gsheet_error(e, '除外リストを読めませんでした（除外なしで表示します）', 'warning')
-        exclusions = []
-
-    # 予約リスト（受け手の店が「うちが引き取る」と押さえた品目）を読む。
-    #   ★対象年月が当月と一致するものだけを効かせる（reservation_map の中で絞る）＝
-    #     月が変わったら前月の予約は自動で無効になる。
-    try:
-        reservations = backend.load_reservations()
-    except Exception as e:
-        show_gsheet_error(e, '予約リストを読めませんでした（予約なしで表示します）', 'warning')
-        reservations = []
+    # ---- 表示用の3リスト（除外・予約・出庫可能数）を60秒キャッシュ越しにまとめて読む（案2）----
+    #   ★ふだんの再描画では読み直さず、往復を「_index の1回」だけに減らす。
+    #   ★保存の直前の読み直し（二重予約の防止）は各保存関数が backend.load_*() を直接呼ぶ。ここは表示用。
+    #   supply_rows_raw … apply_supply_cap で頭打ちする前の“生の指定リスト”。案1の署名に使う。
+    exclusions, reservations, supply_rows_raw = load_lists_cached(backend)
     reserved = app_logic.reservation_map(reservations, latest)
 
-    # 提供数量（出し手が「この品はN錠だけ出す」と決めた数）を読む。
-    #   ★年月列を持たない＝除外と同じく持ち越す。月替わりで在庫が減った品は、その在庫数まで
-    #     自動で頭打ち（apply_supply_cap）してから計算に渡す＝在庫20錠なら20錠＝実質全量。
-    try:
-        supply_rows = backend.load_supply_qty()
-    except Exception as e:
-        show_gsheet_error(e, '提供数量を読めませんでした（全量で表示します）', 'warning')
-        supply_rows = []
-    # 当月の (店名, 品目キー) → 在庫数（全量・ロット合算）を作り、その数まで頭打ちにする
+    # 提供数量（出し手が「この品はN錠だけ出す」と決めた数）を、当月在庫まで頭打ちにしてから計算へ。
+    #   当月の (店名, 品目キー) → 在庫数（全量・ロット合算）を作る。この下ごしらえは両方の道で使う
+    #   （n_supply_mine・表の下のキャプションは頭打ち後の supply_rows を見るため）ので毎回作る（軽い）。
     stock_by_key = {}
     for s in stores:
         for row in s['rows']:
             k = (s['name'], yuzu_core.exclusion_key(row))
             stock_by_key[k] = stock_by_key.get(k, 0.0) + yuzu_core.stock_qty(row)
-    supply_rows = app_logic.apply_supply_cap(supply_rows, stock_by_key)
-    supply = app_logic.supply_qty_map(supply_rows)
-
-    # 全店ぶんを毎回まとめて再計算
-    #   ※予約は出し手から品を取り除かない（件数・金額・自己検算は動かない）。印を付けるだけ。
-    #   ※出せる数（supply）が空なら、compute_matching は改修前とまったく同じ計算になる（既定 None 相当）。
-    result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions),
-                                        reserved=reserved, supply_qty=supply)
-
-    # 滞留（同じ品が何ヶ月つづけて載っているか）を書き込む。
-    #   ★compute_matching の直後・ビューを作る前に済ませる。ここで result に書き込むので、
-    #     ②③④の画面・Excel・Gシートのすべてに同じ値が行き渡る。
-    #   前月の記録がまだ無い月（この機能を入れた最初の月）は全部「今月から」になる＝
-    #     画面は今までどおりの見た目で、2ヶ月目以降から色が付きはじめる。
-    prev_map = load_prev_cached(backend, latest)
-    app_logic.apply_stagnation(result, prev_map)
+    supply_rows = app_logic.apply_supply_cap(supply_rows_raw, stock_by_key)
 
     base_ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '不明'
     csv_base_disp = datetime.date.today().strftime('%Y/%m/%d')
 
-    # 結果を保管庫にも書き戻す（次の月替わりで前月退避できるように）
-    #   ★中身が前回と同じなら書かない。結果4タブの書き戻しは clear＋update で8回の
-    #     API呼び出しになり、行を選ぶたびにこれをやるとGoogleの上限に当たって
-    #     画面が固まる。結果が変わっていないなら書き直す意味もない。
-    try:
-        payload = gsheet_store.build_results_payload(result, base_ym_disp, csv_base_disp)
-        sig = _signature(payload)
-        if st.session_state.get('results_sig') != sig:
-            if hasattr(backend, 'write_results'):
-                backend.write_results(payload)
-            elif hasattr(backend, 'save_results'):
-                backend.save_results(payload)
-            st.session_state['results_sig'] = sig   # 書けたときだけ覚える
-    except Exception as e:
-        show_gsheet_error(e, '結果の保管庫への書き戻しに失敗しました（画面表示は続行します）', 'warning')
+    # ============================================================================
+    # 案1（2026-08-12）：材料が前回と同じなら「照合もExcelもまるごと作り直さない」
+    #   入力の署名（各店のアップ記録＝index／対象年月／除外／予約／出庫可能数の生リスト／本日）を作り、
+    #   前回と同じなら compute_matching・apply_stagnation・build_results_payload・excel_bytes を
+    #   すべてスキップして、前回の結果（apply_stagnation 済み）と前回のExcelバイト列を使い回す。
+    #   ・index と latest が署名に入っているので、アップロード・月替わりで自動的に作り直される。
+    #   ・除外/予約/出庫可能数は保存直後に clear_lists_cache で結果キャッシュごと捨てるので、すぐ作り直す。
+    #   ・result は apply_stagnation でその場書き換え済み。ビュー作成は result を読むだけ（壊さない）ので、
+    #     同じ result を使い回しても値はずれない。
+    # ============================================================================
+    sig_input = app_logic.results_signature(
+        index, latest, exclusions, reservations, supply_rows_raw, csv_base_disp)
+    rc = st.session_state.get('results_cache')
+    if rc and rc.get('sig') == sig_input:
+        # 材料が前回と同じ → 照合もExcelも作り直さない（前回の成果をそのまま使う）
+        result = rc['result']      # apply_stagnation 済み
+        xls = rc['xls']            # 前回のExcelバイト列（同じ材料なら同じExcelになる）
+    else:
+        # 材料が変わった（または初回）→ ふつうに計算する
+        #   ※出せる数（supply）が空なら、compute_matching は改修前とまったく同じ計算になる（既定 None 相当）。
+        supply = app_logic.supply_qty_map(supply_rows)
+        result = yuzu_core.compute_matching(stores, excluded=_exclusion_set(exclusions),
+                                            reserved=reserved, supply_qty=supply)
+        # 滞留（同じ品が何ヶ月つづけて載っているか）を書き込む（result をその場で書き換える）。
+        #   前月の記録がまだ無い月は全部「今月から」になる（画面は従来どおりの見た目）。
+        prev_map = load_prev_cached(backend, latest)
+        app_logic.apply_stagnation(result, prev_map)
+
+        # 結果を保管庫にも書き戻す（次の月替わりで前月退避できるように）。
+        #   ★中身が前回と同じなら書かない（results_sig）。結果4タブの書き戻しは clear＋update で
+        #     8回のAPI呼び出しになるため、変わっていないなら書き直さない。
+        try:
+            payload = gsheet_store.build_results_payload(result, base_ym_disp, csv_base_disp)
+            sig = _signature(payload)
+            if st.session_state.get('results_sig') != sig:
+                if hasattr(backend, 'write_results'):
+                    backend.write_results(payload)
+                elif hasattr(backend, 'save_results'):
+                    backend.save_results(payload)
+                st.session_state['results_sig'] = sig   # 書けたときだけ覚える
+        except Exception as e:
+            show_gsheet_error(e, '結果の保管庫への書き戻しに失敗しました（画面表示は続行します）', 'warning')
+
+        # Excel（ダウンロードボタン用）をここで1回だけ作る。同じ材料なら次回は作り直さない。
+        try:
+            xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
+        except Exception as e:
+            xls = None
+            st.warning('Excel生成に失敗しました：%s' % e)
+
+        # 今回の材料と成果を覚えておく（次の再描画で材料が同じなら丸ごと使い回す）
+        st.session_state['results_cache'] = {'sig': sig_input, 'result': result, 'xls': xls}
 
     my_store = st.session_state.get('my_store')
 
@@ -1813,9 +1902,10 @@ def results_section(backend, stores, latest, index):
                 message_section(my_store, backend, threads, msg_reads)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
+    #   ★Excelバイト列（xls）は上のブロックで作る（材料が同じなら前回のものを使い回す・案1）。
+    #     ボタンを押していなくても毎回作り直していたのが最大の山だったため、ここでは作らない。
     st.divider()
-    try:
-        xls = app_logic.excel_bytes(result, base_ym_disp, csv_base_disp)
+    if xls is not None:
         # ダウンロードされるファイル名も画面の名前にそろえる（2026-07-28の改称に追随）
         if latest:
             xls_name = 'デッドストックリスト_%s-%s.xlsx' % (latest[:4], latest[4:6])
@@ -1826,8 +1916,6 @@ def results_section(backend, stores, latest, index):
             data=xls,
             file_name=xls_name,
             mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    except Exception as e:
-        st.warning('Excel生成に失敗しました：%s' % e)
 
 
 # ============================================================================
