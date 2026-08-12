@@ -1315,6 +1315,19 @@ def message_section(my_store, backend, threads, msg_reads):
     #   ★選択を st.dataframe に持たせず session_state に持つのが今回の要点（#10701 回避）。
     open_name = st.session_state.get('msg_open')
 
+    # ★★「開いた会話」には“持ち主（どの店でログイン中に開いたか）”を紐づける（msg_open_owner）。
+    #   ①上部のドロップダウンや URL の ?store= でログイン店を切り替えても、msg_open は
+    #   session_state に残るため、そのままだと「[開く]を押していないのに前の店で開いた会話が
+    #   別の店の画面でいきなり開く」事故が起きる（品管が再現：東大泉で和光を開く→みずほ台へ
+    #   切替→みずほ台↔和光の会話・投稿欄が開いてしまう）。宛先ペアは表示中の相手と整合していて
+    #   別店への誤配送ではないが、「[開く]を押すまで会話も投稿欄も出さない」誤送信防止のガードが
+    #   後退する。そこで持ち主が今の my_store と違うなら、開いた会話は“他店のもの”とみなして
+    #   msg_open ごと捨て、必ず一覧から始める（店の切替経路が増えても自動で塞がる＝案B）。
+    if st.session_state.get('msg_open_owner') != my_store:
+        st.session_state.pop('msg_open', None)
+        st.session_state.pop('msg_open_owner', None)
+        open_name = None
+
     # --- msg_open が空＝一覧だけを出す。会話も投稿欄もいっさい出さない（誤送信防止）---
     if not open_name:
         st.divider()
@@ -1338,6 +1351,9 @@ def message_section(my_store, backend, threads, msg_reads):
             #   位置で作ると、並び順が変わったとき別の店を開いてしまうため。
             if r5.button('開く', key='btn_open_%s' % t['相手店名']):
                 st.session_state['msg_open'] = t['相手店名']
+                # ★この会話の“持ち主”＝いまログイン中の店。別の店へ切り替わったら
+                #   冒頭のガードがこの会話を捨てる（前の店の会話が開いたままにならない）。
+                st.session_state['msg_open_owner'] = my_store
                 st.rerun()
         return
 
@@ -1347,6 +1363,7 @@ def message_section(my_store, backend, threads, msg_reads):
     if sel is None:
         # 開いていた相手が消えた（予約が全部取り消された等）。例外で落とさず一覧へ戻す。
         st.session_state.pop('msg_open', None)
+        st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
         st.info('開いていた相手店（%s）とのやり取りが見つかりませんでした。一覧に戻ります。' % open_name)
         return
 
@@ -1356,6 +1373,7 @@ def message_section(my_store, backend, threads, msg_reads):
     hcol.markdown('#### %s とのやり取り' % sel['相手店名'])
     if bcol.button('◀ 一覧に戻る', key='btn_msg_back'):
         st.session_state.pop('msg_open', None)
+        st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
         st.rerun()
     if sel['予約中の品']:
         st.caption('予約中：' + '　'.join(sel['予約中の品']))
@@ -1889,6 +1907,7 @@ def results_section(backend, stores, latest, index):
             #     （本間部長指示「⑤に切り替えただけで相手が選ばれている状態にしない」・誤送信防止）。
             if chosen != VIEW_MESSAGE:
                 st.session_state.pop('msg_open', None)
+                st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
 
             if chosen == VIEW_DEAD:
                 # ---- ②（自店）のデッド品 ----
