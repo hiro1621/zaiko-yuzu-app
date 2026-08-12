@@ -41,6 +41,8 @@ import io
 import datetime
 from collections import defaultdict, Counter
 
+import jst   # 日本時間の「今日」（Streamlit Cloud の UTC ずれ対策）
+
 # openpyxl（Excel出力・.xlsx読み込み）
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -1764,7 +1766,7 @@ def write_pickup_request_excel(path_or_buf, data):
     my_store = data.get('my_store', '')
     ym = data.get('ym', '')
     ym_disp = ('%s年%s月' % (ym[:4], ym[4:6])) if (ym and len(str(ym)) >= 6) else '不明'
-    today = __import__('jst').today().strftime('%Y/%m/%d')   # 日本時間の今日（UTCずれ対策・yuzu_coreはこの1行のみ変更）
+    today = jst.today().strftime('%Y/%m/%d')   # 日本時間の今日（UTCずれ対策）
 
     ncol = len(PICKUP_REQUEST_COLS)
     last_col = get_column_letter(ncol)
