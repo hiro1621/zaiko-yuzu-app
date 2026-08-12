@@ -1264,12 +1264,27 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
 def message_section(my_store, backend, threads, msg_reads):
     """
     ⑤ 店舗間のやり取り。threads は app_logic.build_threads の戻り（自店が関わるスレッド一覧）。
-      ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を st.dataframe の行選択で選ぶ。
-        ★一覧の並びは店番順（STORE_NAMES の並び）で固定する（投稿・未読で順番が変わらない
-          ＝選んだ行がずれない）。STORE_NAMES に無い店名は末尾へ五十音順でまとめる（黙って消さない）。
+      ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を「1行＝1店＋[開く]ボタン」で出す。
+        ★一覧の並びは店番順（STORE_NAMES の並び）で固定する（投稿・未読で順番が変わらない）。
+          STORE_NAMES に無い店名は末尾へ五十音順でまとめる（黙って消さない）。
           未読のあるスレッドは相手店名の左に ● を付けて目立たせる（並べ替えでは動かさない）。
       ・下段：選んだ相手との会話を時系列で表示し、任意で『どの薬の話』を添えて投稿できる。
-        ★★相手店を選ぶまでは下段そのものを出さない（誤送信を防ぐため）。
+        ★★相手店の[開く]を押すまでは下段そのものを出さない（誤送信を防ぐため）。
+
+    ★★なぜ st.dataframe の行選択をやめて[開く]ボタン方式にしたか（将来また表に戻そうとする人へ）★★
+      st.dataframe(on_select='rerun') は「表の中身（データ）が変わると frontend（glide-data-grid）が
+      行選択を捨てる」という Streamlit の未解決の不具合を抱えている（issue #10701）。
+      ⑤やり取りでは、これが次の形で牙を剥いていた：
+        ・投稿すると一覧の『やり取り』欄が 空→「1件」に変わる（送信者側）
+        ・未読スレッドを開くと、下で自動的に既読化して ● と『新着』欄が消える（受信者側）
+      どちらも“アプリが自分で起こした rerun の直後”に表の中身が変わるため、frontend が行選択を
+      捨て → 会話の窓が勝手に閉じて「投稿が消えた」ように見えていた。以前は msg_keep_sel という
+      「1回だけ選択を復元する」応急処置で打ち消していたが、Streamlit の不具合を相殺する繊細な作りで
+      壊れやすく、投稿のたびに□を選び直さないと連続で会話できなかった。
+      → そこで **st.dataframe の行選択そのものを使うのをやめ**、いま開いている相手店を
+        session_state['msg_open'] に明示的に持つ方式へ変えた。ボタンの押下・rerun は
+        session_state を消さないので、投稿や既読化で表の中身が変わっても会話は開いたままになる。
+        ＝表（st.dataframe）に戻すと #10701 の不具合が再発するので、戻さないこと。
     """
     st.subheader('⑤（%s）店舗間のやり取り' % my_store)
 
@@ -1292,63 +1307,56 @@ def message_section(my_store, backend, threads, msg_reads):
                 '他店のデッド品を予約するか、他店から自店の品を予約されると、その相手との会話が始まります。')
         return
 
-    # --- 並びは店番順（STORE_NAMES の並び）で固定。投稿・未読で順番が変わらない
-    #     ＝行選択の位置がずれて別の店を開く事故を防ぐ（本間部長指示 2026-08-10）。
+    # --- 並びは店番順（STORE_NAMES の並び）で固定。投稿・未読で順番が変わらない。
     #     STORE_NAMES に無い店名は末尾へまとめ、その中は五十音順にする（黙って消さない）。---
     threads = sorted(threads, key=_thread_sort_key)
 
-    rows = []
-    for t in threads:
-        ur = app_logic.unread_count(my_store, t, msg_reads)
-        rows.append({
-            '相手店': ('● ' if ur else '　') + t['相手店名'],
-            '新着': ('%d件' % ur) if ur else '',
-            '予約中': ('%d品' % len(t['予約中の品'])) if t['予約中の品'] else '',
-            'やり取り': ('%d件' % t['件数']) if t['件数'] else '',
-        })
-    tdf = pd.DataFrame(rows, columns=['相手店', '新着', '予約中', 'やり取り'])
-    event = st.dataframe(tdf, hide_index=True, width='stretch',
-                         on_select='rerun', selection_mode='single-row',
-                         key='table_threads')
+    # いま開いている相手店（[開く]で入れ、[◀ 一覧に戻る]や②③④への切替で消す）。
+    #   ★選択を st.dataframe に持たせず session_state に持つのが今回の要点（#10701 回避）。
+    open_name = st.session_state.get('msg_open')
 
-    # 選んだ相手店（＝並びが固定なので、行の位置＝スレッドの対応が崩れない）。
-    #   ★★左端の□にチェックを入れるまでは、会話も投稿欄もいっさい出さない。
-    #     以前は先頭（五十音の最初）のスレッドを既定で開いていたが、
-    #     ⑤に切り替えただけで相手店が選ばれている状態になり、
-    #     **選んだつもりのない店へ送ってしまう**危険があった（2026-08-10 本間部長の指摘）。
-    #     チェックを外したときも同じ理由で閉じる（session_state に覚えさせない）。
-    picked = _selected_rows(event)
-    # ★★st.dataframe(on_select) は「表の中身（データ）が変わると frontend が行選択を捨てる」
-    #   （Streamlit の既知の未解決問題 #10701）。⑤やり取りではこれが次の形で牙を剥く：
-    #     ・投稿すると一覧の『やり取り』欄が 空→「1件」に変わる（送信者側）
-    #     ・未読スレッドを開くと、下で自動的に既読化して ● と『新着』欄が消える（受信者側）
-    #   どちらも“アプリが自分で起こした rerun の直後”に表の中身が変わるため、frontend が
-    #   行選択を捨て → picked が空 → 会話の窓が閉じて、投稿が「消えた」ように見えていた
-    #   （送信者・受信者の両方がこの1つの理由で説明できる）。
-    #   → アプリが自分で rerun する直前だけ、開いていた相手店名を msg_keep_sel に控えておく。
-    #     その rerun で選択が捨てられて picked が空になった“この1回だけ”、その相手店を開き直して
-    #     控えを消す。利用者が自分でチェックを外したとき（控えが無い）は今までどおり閉じる
-    #     ＝「相手店を選ぶまで会話も投稿欄も出さない」誤送信防止はそのまま保つ。
-    keep = st.session_state.get('msg_keep_sel')
-    if picked and (0 <= picked[0] < len(threads)):
-        sel = threads[picked[0]]
-        # 利用者が自分の操作で別の相手店を選んだら、控えは用済み（残さない）
-        if keep and sel['相手店名'] != keep:
-            st.session_state.pop('msg_keep_sel', None)
-    elif keep:
-        # picked が空＝いま起きた rerun で frontend が選択を捨てた直後。
-        #   直前に開いていた相手店（keep）を、この1回だけ開き直す（一度使ったら消す）。
-        sel = next((t for t in threads if t['相手店名'] == keep), None)
-        st.session_state.pop('msg_keep_sel', None)
-        if sel is None:
-            st.info('やり取りする相手店を、上の表のいちばん左の□で選んでください。')
-            return
-    else:
-        st.info('やり取りする相手店を、上の表のいちばん左の□で選んでください。')
+    # --- msg_open が空＝一覧だけを出す。会話も投稿欄もいっさい出さない（誤送信防止）---
+    if not open_name:
+        st.divider()
+        st.caption('やり取りする相手店の右の［開く］を押してください。')
+        # 見出し行（相手店／新着／予約中／やり取り）。会話を開くボタンは各行の右端に置く。
+        h1, h2, h3, h4, h5 = st.columns([4, 2, 2, 2, 2])
+        h1.markdown('**相手店**')
+        h2.markdown('**新着**')
+        h3.markdown('**予約中**')
+        h4.markdown('**やり取り**')
+        h5.markdown('')
+        for t in threads:
+            ur = app_logic.unread_count(my_store, t, msg_reads)
+            r1, r2, r3, r4, r5 = st.columns([4, 2, 2, 2, 2])
+            # 未読があれば相手店名の左に ●（表のときと同じ見せ方）
+            r1.write(('● ' if ur else '') + t['相手店名'])
+            r2.write(('%d件' % ur) if ur else '')
+            r3.write(('%d品' % len(t['予約中の品'])) if t['予約中の品'] else '')
+            r4.write(('%d件' % t['件数']) if t['件数'] else '')
+            # ★ボタンの key は「行の位置」ではなく「相手店名」から作る。
+            #   位置で作ると、並び順が変わったとき別の店を開いてしまうため。
+            if r5.button('開く', key='btn_open_%s' % t['相手店名']):
+                st.session_state['msg_open'] = t['相手店名']
+                st.rerun()
+        return
+
+    # --- msg_open に相手店名が入っている＝一覧は出さず会話だけを出す ---
+    #   一覧と会話を同時に出さないのは、誰と話しているかを1画面で取り違えないため。
+    sel = next((t for t in threads if t['相手店名'] == open_name), None)
+    if sel is None:
+        # 開いていた相手が消えた（予約が全部取り消された等）。例外で落とさず一覧へ戻す。
+        st.session_state.pop('msg_open', None)
+        st.info('開いていた相手店（%s）とのやり取りが見つかりませんでした。一覧に戻ります。' % open_name)
         return
 
     st.divider()
-    st.markdown('#### %s とのやり取り' % sel['相手店名'])
+    # 見出しと「◀ 一覧に戻る」。戻るを押したら msg_open を捨てて一覧へ（会話を閉じる）。
+    hcol, bcol = st.columns([4, 1])
+    hcol.markdown('#### %s とのやり取り' % sel['相手店名'])
+    if bcol.button('◀ 一覧に戻る', key='btn_msg_back'):
+        st.session_state.pop('msg_open', None)
+        st.rerun()
     if sel['予約中の品']:
         st.caption('予約中：' + '　'.join(sel['予約中の品']))
 
@@ -1391,9 +1399,9 @@ def message_section(my_store, backend, threads, msg_reads):
             else:
                 clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
                 st.session_state['msgver_%s' % pair_key] = ver + 1   # 入力欄を空に戻す
-                # ★投稿の rerun で『やり取り』欄が 空→1件 に変わり選択が捨てられても、
-                #   この相手との会話を開いたままにするための控え（次の描画で1回だけ使う）。
-                st.session_state['msg_keep_sel'] = sel['相手店名']
+                # ★msg_open は触らない＝rerun 後もこの相手との会話が開いたまま（続けて投稿できる）。
+                #   投稿で『やり取り』欄が 空→1件 に変わっても、選択を session_state で持っているので
+                #   会話は閉じない（旧 msg_keep_sel の応急処置は不要になった）。
                 # メール通知（相手店へ）。保存後・rerun 前に1回だけ＝二重送信しない。
                 #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
                 _mail_flush(mailer.notify_new_message(
@@ -1411,9 +1419,8 @@ def message_section(my_store, backend, threads, msg_reads):
             show_gsheet_error(e, '既読の更新に失敗しました', 'warning')
         else:
             clear_messages_cache()   # 既読を書いた直後だけキャッシュを捨てて読み直す
-            # ★既読化の rerun で ● と『新着』欄が変わり選択が捨てられても、
-            #   いま開いている会話を閉じないための控え（次の描画で1回だけ使う）。
-            st.session_state['msg_keep_sel'] = sel['相手店名']
+            # ★msg_open は触らない＝既読化の rerun で ● と『新着』欄が消えても会話は開いたまま。
+            #   選択を session_state で持っているので、表のときのように会話が閉じない。
             st.rerun()
 
 
@@ -1877,10 +1884,11 @@ def results_section(backend, stores, latest, index):
             chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive),
                                    n_unread=total_unread)
 
-            # ⑤以外へ切り替えたら、会話を開き直すための控え（msg_keep_sel）は捨てる。
-            #   ＝⑤へ戻ってきたときに、前に開いていた相手が勝手に開かないようにする（誤送信防止）。
+            # ⑤以外へ切り替えたら、いま開いている会話（msg_open）を閉じる。
+            #   ＝⑤へ戻ってきたときは必ず一覧から始まり、前に開いていた相手が勝手に開かない
+            #     （本間部長指示「⑤に切り替えただけで相手が選ばれている状態にしない」・誤送信防止）。
             if chosen != VIEW_MESSAGE:
-                st.session_state.pop('msg_keep_sel', None)
+                st.session_state.pop('msg_open', None)
 
             if chosen == VIEW_DEAD:
                 # ---- ②（自店）のデッド品 ----
