@@ -1318,10 +1318,34 @@ def message_section(my_store, backend, threads, msg_reads):
     #     **選んだつもりのない店へ送ってしまう**危険があった（2026-08-10 本間部長の指摘）。
     #     チェックを外したときも同じ理由で閉じる（session_state に覚えさせない）。
     picked = _selected_rows(event)
-    if not picked or not (0 <= picked[0] < len(threads)):
+    # ★★st.dataframe(on_select) は「表の中身（データ）が変わると frontend が行選択を捨てる」
+    #   （Streamlit の既知の未解決問題 #10701）。⑤やり取りではこれが次の形で牙を剥く：
+    #     ・投稿すると一覧の『やり取り』欄が 空→「1件」に変わる（送信者側）
+    #     ・未読スレッドを開くと、下で自動的に既読化して ● と『新着』欄が消える（受信者側）
+    #   どちらも“アプリが自分で起こした rerun の直後”に表の中身が変わるため、frontend が
+    #   行選択を捨て → picked が空 → 会話の窓が閉じて、投稿が「消えた」ように見えていた
+    #   （送信者・受信者の両方がこの1つの理由で説明できる）。
+    #   → アプリが自分で rerun する直前だけ、開いていた相手店名を msg_keep_sel に控えておく。
+    #     その rerun で選択が捨てられて picked が空になった“この1回だけ”、その相手店を開き直して
+    #     控えを消す。利用者が自分でチェックを外したとき（控えが無い）は今までどおり閉じる
+    #     ＝「相手店を選ぶまで会話も投稿欄も出さない」誤送信防止はそのまま保つ。
+    keep = st.session_state.get('msg_keep_sel')
+    if picked and (0 <= picked[0] < len(threads)):
+        sel = threads[picked[0]]
+        # 利用者が自分の操作で別の相手店を選んだら、控えは用済み（残さない）
+        if keep and sel['相手店名'] != keep:
+            st.session_state.pop('msg_keep_sel', None)
+    elif keep:
+        # picked が空＝いま起きた rerun で frontend が選択を捨てた直後。
+        #   直前に開いていた相手店（keep）を、この1回だけ開き直す（一度使ったら消す）。
+        sel = next((t for t in threads if t['相手店名'] == keep), None)
+        st.session_state.pop('msg_keep_sel', None)
+        if sel is None:
+            st.info('やり取りする相手店を、上の表のいちばん左の□で選んでください。')
+            return
+    else:
         st.info('やり取りする相手店を、上の表のいちばん左の□で選んでください。')
         return
-    sel = threads[picked[0]]
 
     st.divider()
     st.markdown('#### %s とのやり取り' % sel['相手店名'])
@@ -1367,6 +1391,9 @@ def message_section(my_store, backend, threads, msg_reads):
             else:
                 clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
                 st.session_state['msgver_%s' % pair_key] = ver + 1   # 入力欄を空に戻す
+                # ★投稿の rerun で『やり取り』欄が 空→1件 に変わり選択が捨てられても、
+                #   この相手との会話を開いたままにするための控え（次の描画で1回だけ使う）。
+                st.session_state['msg_keep_sel'] = sel['相手店名']
                 # メール通知（相手店へ）。保存後・rerun 前に1回だけ＝二重送信しない。
                 #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
                 _mail_flush(mailer.notify_new_message(
@@ -1384,6 +1411,9 @@ def message_section(my_store, backend, threads, msg_reads):
             show_gsheet_error(e, '既読の更新に失敗しました', 'warning')
         else:
             clear_messages_cache()   # 既読を書いた直後だけキャッシュを捨てて読み直す
+            # ★既読化の rerun で ● と『新着』欄が変わり選択が捨てられても、
+            #   いま開いている会話を閉じないための控え（次の描画で1回だけ使う）。
+            st.session_state['msg_keep_sel'] = sel['相手店名']
             st.rerun()
 
 
@@ -1846,6 +1876,11 @@ def results_section(backend, stores, latest, index):
             #   ④のボタンには「引き取れる薬の件数」、⑤には「新着（未読）件数」を出す。
             chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive),
                                    n_unread=total_unread)
+
+            # ⑤以外へ切り替えたら、会話を開き直すための控え（msg_keep_sel）は捨てる。
+            #   ＝⑤へ戻ってきたときに、前に開いていた相手が勝手に開かないようにする（誤送信防止）。
+            if chosen != VIEW_MESSAGE:
+                st.session_state.pop('msg_keep_sel', None)
 
             if chosen == VIEW_DEAD:
                 # ---- ②（自店）のデッド品 ----
