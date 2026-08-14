@@ -102,6 +102,47 @@ st.set_page_config(page_title='デッドストックリスト', page_icon='💊'
 
 
 # ============================================================================
+# 見た目（2026-08-14・案B）
+#   ★色・角の丸み・字の大きさは .streamlit/config.toml に書いてあります。
+#     ここでやるのは「config.toml で指定したフォント本体の読み込み」と、
+#     configでは届かない細かい調整（左バーの詰め方など）だけです。
+#
+#   ★フォントは <style> の @import で読み込みます。
+#     Streamlit は <link> タグを消してしまうため、@import 以外では入りません。
+#     @import は <style> の先頭に置く決まりです（途中に書くと丸ごと無視されます）。
+#
+#   ★読み込めない環境（社外へ出られないPCなど）では游ゴシックに落ちるだけで、
+#     画面が壊れることはありません（config.toml のフォント指定が控えを持っています）。
+# ============================================================================
+FONT_CSS_URL = ('https://fonts.googleapis.com/css2'
+                '?family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap')
+
+
+def inject_style():
+    """ フォントの読み込みと、左バーまわりの細かい見た目の調整。 """
+    st.markdown("""
+<style>
+@import url('%s');
+
+/* 数字が縦にそろうようにする（数量・在庫数・金額の列を読みやすく） */
+[data-testid="stDataFrame"], [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+
+/* 左バー：上の余白を詰めて、店舗名と切替ボタンを画面の上のほうに置く */
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding-top: 1.2rem; }
+
+/* ★左バーの切替ボタン：文字を左そろえにして「一覧の項目」らしく見せる。
+   Streamlitの既定は中央そろえで、件数付きの項目が縦に並ぶと頭がそろわず読み取りにくい。
+   ボタンの中はさらに入れ子になっているので、中の段落まで指定しないと効かない。 */
+[data-testid="stSidebar"] [data-testid="stButton"] button { justify-content: flex-start !important; }
+[data-testid="stSidebar"] [data-testid="stButton"] button p { text-align: left !important; }
+
+/* 左バーの区切り線を細く（深緑の上では既定の線が目立ちすぎる） */
+[data-testid="stSidebar"] hr { margin: 0.7rem 0; border-color: #2E544D; }
+</style>
+""" % FONT_CSS_URL, unsafe_allow_html=True)
+
+
+# ============================================================================
 # Secrets（秘密）を安全に読む
 # ============================================================================
 def _get_secret(key, default=None):
@@ -1012,16 +1053,20 @@ def _pickup_offset_selector(key):
 
 def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
     """
-    ②③④⑤を切り替えるボタンを描き、選ばれた画面の記号（VIEW_*）を返す。
+    ②③④⑤を切り替えるボタンを『左バー（サイドバー）』に縦に描き、
+    選ばれた画面の記号（VIEW_*）を返す。
+
       ・件数をボタンに入れて、開く前に中身があるかどうか分かるようにする。
         ⑤は投稿数ではなく『新着（未読）件数』を出す（0件のときは「（新着…）」を付けない）。
-      ・★選択肢そのものは VIEW_* の記号にして、見た目の文字は format_func で作る。
-        ボタンの文字（件数入り）を選択肢にしてしまうと、除外を保存して件数が変わった瞬間に
-        「保存されている選択」が選択肢の中から消えて、③④を見ていても②に戻されてしまう。
-        ⑤の新着件数も未読が0になると変わるので、記号を選択肢にするこの作りが必須（設計の肝）。
-      ・★segmented_control は選択中のボタンをもう一度押すと「選択なし（None）」を返すので、
-        そのときは②に戻す（画面が空になるのを防ぐ）。
-      ・segmented_control が無い古いStreamlitでは st.radio（横並び）に自動で切り替える。
+
+      ・★覚えておく中身は VIEW_* の記号だけにして、件数入りの文字は表示にしか使わない。
+        件数入りの文字を「選択されている値」そのものにしてしまうと、除外を保存して件数が
+        変わった瞬間に、いま選んでいる値が選択肢から消えて②に戻されてしまう（設計の肝）。
+
+      ・★2026-08-14（案B）：横並びの segmented_control から、左バーの縦ボタンに変更。
+        segmented_control は「選択中をもう一度押すと選択なしになる」「表の中身が変わると
+        選択が飛ぶ」といった癖があったが、ふつうのボタン＋session_state で自分で覚えれば
+        どちらも起きない。押した瞬間に切り替わるので分かりやすさも上がる。
     """
     labels = {
         VIEW_DEAD:    '②  デッド品（%d件）' % n_dead,
@@ -1029,17 +1074,25 @@ def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
         VIEW_RECEIVE: '④  引き取れる薬（%d件）' % n_receive,
         VIEW_MESSAGE: ('⑤  やり取り（新着%d件）' % n_unread) if n_unread else '⑤  やり取り',
     }
-    st.caption('見たい表のボタンを押してください（選んだものだけを表示します）。')
-    picker = getattr(st, 'segmented_control', None)
-    if picker is None:
-        chosen = st.radio('表示する内容', VIEW_ORDER, horizontal=True,
-                          format_func=lambda k: labels[k],
-                          label_visibility='collapsed', key='view_switch')
-    else:
-        chosen = picker('表示する内容', VIEW_ORDER, default=VIEW_DEAD, required=True,
-                        format_func=lambda k: labels[k],
-                        label_visibility='collapsed', key='view_switch')
-    return chosen or VIEW_DEAD
+    # いま選ばれているもの。まだ何も押していなければ②から始める。
+    #   ★覚えている値がおかしい（古い版の文字列が残っている等）ときも②に落とす。
+    chosen = st.session_state.get('view_switch')
+    if chosen not in VIEW_ORDER:
+        chosen = VIEW_DEAD
+        st.session_state['view_switch'] = chosen
+
+    with st.sidebar:
+        st.divider()
+        st.caption('見たい表を選んでください')
+        for key in VIEW_ORDER:
+            # 選ばれているものだけ塗りつぶし（type='primary'）にして、どれを見ているか分かるようにする
+            pressed = st.button(labels[key], key='nav_%s' % key,
+                                type=('primary' if key == chosen else 'secondary'),
+                                width='stretch')
+            if pressed and key != chosen:
+                st.session_state['view_switch'] = key
+                st.rerun()
+    return chosen
 
 
 def _receive_view_with_talk(r, hidden, msg_by_store):
@@ -1492,20 +1545,23 @@ def excluded_section(my_store, backend, exclusions):
 
 
 def show_upload_status(status, latest):
-    """ 画面上部に『現在 N/15店 アップ済み』と未アップ店を出す。 """
+    """ 左バーに『いま N/14店 アップ済み』『対象月』『未アップの店』を出す。
+
+        ★2026-08-14（案B）：画面上部の横並びから、左バーの縦並びに変更。
+          下へスクロールしても消えないので、他店がそろっているかを見ながら作業できる。
+          幅が狭いので、店名の一覧は折りたたみの中に入れて場所を取らないようにする。 """
     n = status['n']
     ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '（まだデータがありません）'
-    c1, c2 = st.columns([1, 3])
-    with c1:
+    with st.sidebar:
+        st.divider()
         st.metric('アップ済み', '%d / %d 店' % (n, STORE_COUNT))
-    with c2:
-        st.write('**対象月：** %s' % ym_disp)
+        st.caption('対象月：%s' % ym_disp)
         if status['missing']:
-            st.write('**未アップの店：** ' + '、'.join(status['missing']))
+            with st.expander('未アップの店（%d店）' % len(status['missing'])):
+                st.write('、'.join(status['missing']))
+                st.caption('全店そろうと、他店の使用実績まで見えてマッチングの精度が上がります。')
         if status['ng']:
-            st.warning('様式が他店と違う（別様式）ため計算に入れていない店：' + '、'.join(status['ng']))
-    if n < STORE_COUNT:
-        st.info('全店（%d店）そろうと、他店の使用実績まで見えてマッチングの精度が上がります。' % STORE_COUNT)
+            st.warning('様式が他店と違うため計算に入れていない店：' + '、'.join(status['ng']))
 
 
 # ============================================================================
@@ -1612,7 +1668,11 @@ def _remember_store_in_url(store):
 #     「アップ済みです。このまま下の表を見られます」とはっきり出すようにした。
 # ============================================================================
 def upload_section(backend, index, latest):
-    st.subheader('① 店舗を選択')
+    """ 左バーの上段：店舗名の選択と、在庫ファイルのアップロード欄。
+
+        ★2026-08-14（案B）：本体の一番上から左バーへ移動。
+          自分がどの店として見ているかが、下へスクロールしても消えないようにするため。 """
+    st.caption('① 自店を選ぶ')
 
     # 店舗名の選択（先頭は「選択してください」。会社名（ソユーズ/内観堂）の付記は無し）
     options = [SENTINEL_STORE] + STORE_NAMES
@@ -1622,7 +1682,8 @@ def upload_section(backend, index, latest):
         prev = _store_from_query()
     default_index = options.index(prev) if prev in STORE_NAMES else 0
 
-    # ラベルはこの位置に後から入れる（選択状態に応じて色を変えるため）
+    # 未選択のときだけ、選択欄の上に赤い注意書きを出す（選んだあとは邪魔なので出さない）。
+    #   ★左バーは幅が狭いので、選択済みのときにラベルを重ねて出すのはやめた（2026-08-14）。
     label_ph = st.empty()
     choice = st.selectbox(
         '店舗名（必須）',
@@ -1632,16 +1693,13 @@ def upload_section(backend, index, latest):
         label_visibility='collapsed')
 
     if choice in STORE_NAMES:
-        # 選択済み → ラベルは通常色
-        label_ph.markdown('店舗名（必須）')
         my_store = choice
         st.session_state['my_store'] = my_store
     else:
-        # 未選択 → ラベルを赤の太字で強調
-        label_ph.markdown(':red[**店舗名（必須）**]')
+        # 未選択 → 赤の太字で強調（ここを選ばないと何も始まらないため）
+        label_ph.markdown(':red[**まず店舗名を選んでください**]')
         my_store = None
         st.session_state['my_store'] = None
-        st.caption('※ まず店舗名を選んでください。')
     _remember_store_in_url(my_store)
 
     # ------------------------------------------------------------------
@@ -1654,17 +1712,18 @@ def upload_section(backend, index, latest):
     done = bool(entry) and entry.get('ym') == latest \
         and not str(entry.get('format', '')).startswith('NG')
 
+    # ★左バーは幅が狭いので、長い一文は行数を食う。
+    #   「済み／未提出」がひと目で分かることを優先し、ファイル名などの細かい記録は
+    #   折りたたみ（アップロード欄）の中に回す。伝える内容は落としていない。
     if my_store and done:
-        st.success('**%s**の%s分はアップ済みです（%s／%s行／%s）。  \n'
-                   '**このまま下の表を見られます。毎回アップロードし直す必要はありません。**'
-                   % (my_store, ym_disp, entry.get('uploaded_at', '不明'),
-                      entry.get('rows', '?'), entry.get('filename', '')))
-        exp_label = '新しいデータに差し替える（アップロードし直す）'
+        st.success('%s分はアップ済み  \n'
+                   '毎回アップし直す必要はありません' % ym_disp)
+        st.caption('%s／%s行' % (entry.get('uploaded_at', '不明'), entry.get('rows', '?')))
+        exp_label = '新しいデータに差し替える'
         exp_open = False
     elif my_store:
         st.warning('**%s**の在庫ファイルは、まだアップされていません%s。'
-                   '下の欄からアップロードしてください。'
-                   % (my_store, ('' if latest is None else '（今の対象月は%s）' % ym_disp)))
+                   % (my_store, ('' if latest is None else '（対象月は%s）' % ym_disp)))
         exp_label = '在庫ファイルをアップロードする'
         exp_open = True
     else:
@@ -1790,7 +1849,9 @@ def results_section(backend, stores, latest, index):
                 'いまのうちに自店のデッド確認・除外・出庫可能数の調整をしてください。'
                 % (status['n'], STORE_COUNT, sched['open_day']))
 
-    st.subheader('現在の状況')
+    # 現在の状況（N/14店・対象月・未アップの店）は左バーへ描く（2026-08-14・案B）。
+    #   ★サイドバーはスクリプトのどこから書いても左バーに出るので、
+    #     ここで呼んでも並び順は「店舗選択 → 状況 → ②③④⑤」になる。
     show_upload_status(status, latest)
 
     if not stores:
@@ -1882,10 +1943,10 @@ def results_section(backend, stores, latest, index):
 
     my_store = st.session_state.get('my_store')
 
-    st.divider()
     if not my_store:
         st.subheader('②（自店）のデッド品')
-        st.info('上で自店の店舗名を選ぶと、自店のデッド品（②）・期限切迫品（③）と、'
+        # ★案内の「上で」→「左の」に修正（2026-08-14）。店舗の選択欄が左バーへ移ったため。
+        st.info('**左の「① 自店を選ぶ」**で店舗名を選ぶと、自店のデッド品（②）・期限切迫品（③）と、'
                 'それぞれを欲しがっている店が表示されます。')
     else:
         my_uploaded = (my_store in status['uploaded'])
@@ -2020,10 +2081,20 @@ def results_section(backend, stores, latest, index):
 # メイン
 # ============================================================================
 def main():
+    # フォントの読み込みと細かい見た目の調整。パスワード画面にも効かせたいので最初に呼ぶ。
+    inject_style()
+
     if not password_gate():
         return
 
-    st.title('💊 デッドストックリスト')
+    # ★2026-08-14（案B）：画面の骨組みを「左バー＋本体」に変更。
+    #   左バー … アプリ名・自店の選択・アップロード欄・アップ状況・②③④⑤の切替
+    #   本体　 … いま選んでいる表そのもの（幅いっぱいを表に使う）
+    #   左バーは下へスクロールしても消えないので、
+    #   「自分がどの店として見ているか」「他店がそろっているか」を見失わない。
+    with st.sidebar:
+        st.markdown('### 💊 デッドストック')
+
     if not gsheet_configured():
         st.warning('（開発モード）Googleシート未接続のため、このブラウザのセッションにだけ保存します。'
                    '本番では Streamlit Cloud の Secrets を設定してください。')
@@ -2042,8 +2113,12 @@ def main():
         show_gsheet_error(e, '保管庫からデータを読めませんでした')
         return
 
-    upload_section(backend, index, latest)
-    st.divider()
+    # 店舗の選択とアップロード欄は左バーの上段へ。
+    #   ★ここで my_store が session_state に入る。results_section はそれを読むので、
+    #     必ず results_section より先に呼ぶこと（順番を入れ替えない）。
+    with st.sidebar:
+        upload_section(backend, index, latest)
+
     results_section(backend, stores, latest, index)
 
 

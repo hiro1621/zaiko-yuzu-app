@@ -1,16 +1,58 @@
 # ============================================================
-# 在庫融通アプリ Streamlit 設定（任意）
+# 在庫融通アプリ（デッドストックリスト）Streamlit 設定
 # ------------------------------------------------------------
 # 薬VANの .xls は列が多く大きめなので、アップロード上限を広げておきます。
+#
+# ★2026-08-14 見た目の変更（案B：左バー＋広い表）
+#   色・フォント・角の丸みはここを書き換えるだけで変わります。
+#   元に戻したいときは git で1つ前に戻せば、そのまま元の見た目に戻ります。
 # ============================================================
 
 [server]
 # アップロード上限（MB）。薬VANの在庫ファイルは通常この範囲に収まります。
 maxUploadSize = 50
 
-[theme]
-base = "light"
-
 [browser]
 # 利用状況の外部送信を止める（社内ツールのため）
 gatherUsageStats = false
+
+# ============================================================
+# 本体（右側）の見た目
+# ============================================================
+[theme]
+base = "light"
+
+# ★フォント。ここに書いた名前が「表（一覧）の中の字」にも適用されます。
+#   表は文字ではなく“絵”として描かれるため、CSSだけでは書体が変わりません。
+#   フォント本体の読み込みは streamlit_app.py の inject_style() が行います。
+#   読み込めない環境（社外へ出られないPC等）では游ゴシックに落ちるだけで、画面は壊れません。
+font = "IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
+headingFont = "IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
+
+# 色。primaryColor は「予約する」など“押すボタン”に使われる色です。
+primaryColor = "#0E7C6B"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EDF5F3"
+textColor = "#1B2A28"
+linkColor = "#0B6455"
+
+# 枠線と角の丸み
+borderColor = "#DFEAE7"
+showWidgetBorder = true
+baseRadius = "medium"
+
+# 字の大きさ（既定は14。1つ上げて読みやすくする）
+baseFontSize = 15
+
+# ============================================================
+# 左バー（サイドバー）の見た目 ＝ 深緑の帯
+#   店舗名・アップ状況・②③④⑤の切替をここに固定します。
+# ============================================================
+[theme.sidebar]
+backgroundColor = "#0F2E29"
+secondaryBackgroundColor = "#163A34"
+textColor = "#CFE3DE"
+primaryColor = "#1FA98C"
+borderColor = "#2E544D"
+linkColor = "#8FE6D2"
+baseRadius = "medium"
