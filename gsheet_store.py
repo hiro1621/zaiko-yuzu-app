@@ -96,6 +96,22 @@ MESSAGE_HEADERS = ['投稿日時', '店A', '店B', '薬品名', '投稿店', '�
 #   行数が少ない（店数×スレッド数）ので、除外・予約と同じく clear+update で丸ごと書き直す。
 MSG_READ_HEADERS = ['店名', '店A', '店B', '最終確認日時']
 
+# _全店板 の見出し（列順）＝「全店へのお知らせ板」の本文タブ（第3弾）
+#   1行＝1投稿。相手を1店に絞らない“放送”なので、店A/店B は持たない（投稿店だけ）。
+#   ・投稿店 … 実際に書いた店。未読判定は「自分以外の店の投稿か」で使う（_やり取り と同じ考え方）。
+#   ★このタブは append_allboard（追記）だけで増やす。clear+update は絶対に使わない
+#     （他店の投稿を巻き込んで消す事故になるため。_やり取り と同じ約束）。
+#   ★append_rows（Google の values.append）も使わない（2026-08-12 の列ズレ障害の再発防止）。
+#     書き込む行番号をこちらで計算して直接その場所へ書く（append_message の写経）。
+ALLBOARD_TAB = '_全店板'
+ALLBOARD_HEADERS = ['投稿日時', '投稿店', '本文']
+
+# _全店板既読 の見出し（列順）
+#   1行＝(店名) が全店板をいつまで読んだか。相手ごとに分かれないので店名1つで1行。
+#   行数が少ない（最大14行）ので、除外・予約と同じく clear+update で丸ごと書き直す。
+ALLBOARD_READ_TAB = '_全店板既読'
+ALLBOARD_READ_HEADERS = ['店名', '最終確認日時']
+
 
 # ============================================================================
 # 接続
@@ -524,6 +540,96 @@ def write_msg_reads(sh, rows):
     for r in rows:
         body.append([r.get('店名', ''), r.get('店A', ''),
                      r.get('店B', ''), r.get('最終確認日時', '')])
+    _update(ws, body)
+
+
+# ============================================================================
+# _全店板（全店へのお知らせ板）／_全店板既読 の読み書き（第3弾）
+#   ・相手を1店に絞らない“放送”。1対1の _やり取り とはタブを分ける（本間部長確定・相乗りしない）。
+#   ・_全店板 は行が増え続けるため、書き込みは append_allboard（追記）だけにする。
+#     ★append_rows（Google の values.append）は使わない（2026-08-12 の列ズレ障害の教訓）。
+#       append_message と同じく「書く行番号を自分で計算して直接書く」方式にする。
+#   ・_全店板既読 は行数が少ない（最大14行）ので、既読と同じく clear+update で丸ごと書き直す。
+#   ・列は必ず見出し名で引く（位置固定にしない）。タブがまだ無ければ空リストを返す。
+# ============================================================================
+def read_allboard(sh):
+    """ _全店板 タブを読んで [{'投稿日時','投稿店','本文'}, ...] を返す。
+        タブがまだ無ければ空リスト。投稿店・本文がどちらも空の行（見出し・空行）は読み飛ばす。 """
+    ws = _find_ws(sh, ALLBOARD_TAB)
+    if ws is None:
+        return []
+    values = _values(ws)
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        if not cell('投稿店') and not cell('本文'):
+            continue
+        out.append({'投稿日時': cell('投稿日時'),
+                    '投稿店': cell('投稿店'), '本文': cell('本文')})
+    return out
+
+
+def append_allboard(sh, row):
+    """ _全店板 タブへ1投稿だけ追記する（★追記のみ。clear+update は絶対に使わない）。
+        row は read_allboard と同じ形の辞書（見出し名で引いて列順に並べ替える）。
+        タブが無ければ作り、まだ空なら見出し行も一緒に置く。429は _call のリトライに乗せる。
+
+    ★★★ここで ws.append_rows（Google の values.append）を使ってはいけない（2026-08-12 の障害）★★★
+      values.append は「書き込む場所を Google 側が推測する」API で、行の途中に空セルがあると
+      そこで表が切れたと判断され、次の追記が空セルの右側からズレて始まる。
+      _やり取り で実際に投稿が画面へ出なくなる障害を起こした（append_message のコメント参照）。
+      → 書き込む行番号を**こちらで決めて**その場所へ直接書く（append_message の写経）。
+        `_update` は指定した範囲だけを上書きするので、ほかの行には触らない
+        ＝「追記のみ・過去の投稿を消さない」という約束は守られる。 """
+    ws = _get_or_create_ws(sh, ALLBOARD_TAB, rows=5000, cols=len(ALLBOARD_HEADERS) + 2)
+    values = _values(ws)
+    body = []
+    start = len(values) + 1              # 既にある行の次の行（1始まり）
+    if not values:                       # まだ空＝いちばん最初は見出し行を先に置く
+        body.append(list(ALLBOARD_HEADERS))
+    body.append([str(row.get(h, '') or '') for h in ALLBOARD_HEADERS])
+    _update(ws, body, range_name='A%d' % start)
+
+
+def read_allboard_reads(sh):
+    """ _全店板既読 タブを読んで [{'店名','最終確認日時'}, ...] を返す。
+        タブがまだ無ければ空リスト。店名が欠けた行は読み飛ばす。 """
+    ws = _find_ws(sh, ALLBOARD_READ_TAB)
+    if ws is None:
+        return []
+    values = _values(ws)
+    if not values or len(values) < 2:
+        return []
+    header = values[0]
+    idx = {h: i for i, h in enumerate(header)}
+    out = []
+    for row in values[1:]:
+
+        def cell(name):
+            i = idx.get(name)
+            return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+        if not cell('店名'):
+            continue
+        out.append({'店名': cell('店名'), '最終確認日時': cell('最終確認日時')})
+    return out
+
+
+def write_allboard_reads(sh, rows):
+    """ 全店板の既読リストを丸ごと書き直す（rows は read_allboard_reads と同じ形の辞書リスト・write_msg_reads の写経）。 """
+    ws = _get_or_create_ws(sh, ALLBOARD_READ_TAB, rows=max(200, len(rows) + 10), cols=4)
+    _clear(ws)
+    body = [list(ALLBOARD_READ_HEADERS)]
+    for r in rows:
+        body.append([r.get('店名', ''), r.get('最終確認日時', '')])
     _update(ws, body)
 
 

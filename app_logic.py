@@ -864,6 +864,57 @@ def mark_thread_read(msg_reads, my_store, store_a, store_b, now):
     return out
 
 
+# ============================================================================
+# 全店へのお知らせ板（全店板）の未読・既読を数える純関数（第3弾）
+#   ・1対地の“放送”なので相手店（店A/店B）で分けない。1つの板を全店で共有する。
+#   ・未読の考え方は 1対1 の unread_count と同じ＝「自分以外の店の投稿で、
+#     自分がこの板を最後に見た日時より後のもの」を数える。
+#   ・Streamlit に依存しない純関数だけ（品質管理部がテストしやすいように）。
+# ============================================================================
+def _allboard_last_read_at(my_store, reads):
+    """ 自店(my_store)が、全店板を最後に確認した日時を返す。無ければ空文字。 """
+    my = str(my_store or '').strip()
+    for r in (reads or []):
+        if str(r.get('店名', '') or '').strip() == my:
+            return str(r.get('最終確認日時', '') or '')
+    return ''
+
+
+def allboard_unread_count(my_store, posts, reads):
+    """ 全店板の未読件数を返す純関数。
+        未読＝その投稿が『自分以外の店』のもので、かつ『自分の既読日時より新しい』もの。
+          my_store … 自店名
+          posts    … 全店板の投稿リスト（read_allboard と同じ形＝'投稿日時','投稿店','本文'）
+          reads    … 全店板既読の行リスト（read_allboard_reads と同じ形＝'店名','最終確認日時'）
+        ★日時は 'YYYY/MM/DD HH:MM:SS'（ゼロ詰め固定幅）なので、文字列の大小比較でそのまま時系列になる。 """
+    my = str(my_store or '').strip()
+    last_read = _allboard_last_read_at(my, reads)
+    n = 0
+    for m in (posts or []):
+        if str(m.get('投稿店', '') or '').strip() == my:
+            continue                                  # 自分の投稿は未読にならない
+        if str(m.get('投稿日時', '') or '') > last_read:
+            n += 1
+    return n
+
+
+def allboard_mark_read(reads, my_store, now):
+    """ 自店(my_store)の全店板の既読日時を now に更新した新しい行リストを返す純関数。
+        既存の自分の行があれば更新、無ければ追加する。ほかの店の行は一切触らない。 """
+    my = str(my_store or '').strip()
+    out = []
+    replaced = False
+    for r in (reads or []):
+        if str(r.get('店名', '') or '').strip() == my:
+            out.append({'店名': my, '最終確認日時': now})
+            replaced = True
+        else:
+            out.append(dict(r))
+    if not replaced:
+        out.append({'店名': my, '最終確認日時': now})
+    return out
+
+
 def build_threads(my_store, messages, reservations, qty_by_key=None):
     """
     自店(my_store)が関わるスレッド（相手店ごとに1本）の一覧を返す純関数。
@@ -1056,6 +1107,8 @@ class LocalBackend:
         state.setdefault('supply_qty', [])   # 出し手の店が「この品はN錠だけ出す」と決めた数量
         state.setdefault('messages', [])     # 店舗間のやり取り（掲示板）＝1件1投稿
         state.setdefault('msg_reads', [])    # どの店がどのスレッドをいつまで読んだか（未読判定用）
+        state.setdefault('allboard', [])     # 全店へのお知らせ板（放送）＝1件1投稿（第3弾）
+        state.setdefault('allboard_reads', [])  # どの店が全店板をいつまで読んだか（未読判定用）
         self.state = state
 
     # --- gsheet_store と同じメソッド名・戻り値でそろえる ---
@@ -1158,3 +1211,19 @@ class LocalBackend:
     def save_msg_reads(self, rows):
         """ 既読リストを丸ごと入れ替える（Gシート版 write_msg_reads と同じ挙動）。 """
         self.state['msg_reads'] = list(rows)
+
+    def load_allboard(self):
+        """ 全店へのお知らせ板の投稿を全部返す（Gシート版 read_allboard と同じ形）。 """
+        return list(self.state['allboard'])
+
+    def append_allboard(self, row):
+        """ 全店板へ1件だけ追記する（★追記のみ＝過去の投稿を消さない・Gシート版と同じ挙動）。 """
+        self.state['allboard'].append(dict(row))
+
+    def load_allboard_reads(self):
+        """ どの店が全店板をいつまで読んだかを返す（Gシート版 read_allboard_reads と同じ形）。 """
+        return list(self.state['allboard_reads'])
+
+    def save_allboard_reads(self, rows):
+        """ 全店板の既読リストを丸ごと入れ替える（Gシート版 write_allboard_reads と同じ挙動）。 """
+        self.state['allboard_reads'] = list(rows)

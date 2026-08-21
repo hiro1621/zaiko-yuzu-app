@@ -267,18 +267,29 @@ def clear_stores_cache():
 MSG_TS_FMT = '%Y/%m/%d %H:%M:%S'
 _MSG_CACHE_TTL = 60   # 秒
 
+# 全店へのお知らせ板を「開いている」ことを表す msg_open の目印（第3弾）。
+#   ・msg_open は 1対1 の会話では『相手店名』（実在の店名）を入れる。全店板には相手店が
+#     無いので、実在の店名と絶対にぶつからない専用の合言葉を入れて「板が開いている」を表す。
+#   ・店名は STORE_NAMES（stores_config）由来なので、この記号入り文字列と一致することはない。
+ALLBOARD_OPEN = '__全店へのお知らせ板__'
+
 
 def load_messages_cached(backend, force=False):
-    """ _やり取り・_やり取り既読 を 60秒のセッションキャッシュ越しに読む。
+    """ _やり取り・_やり取り既読・_全店板・_全店板既読 を 60秒のセッションキャッシュ越しに読む。
         force=True でキャッシュを無視して読み直す（「最新に更新」ボタン・投稿/既読更新の直後）。
-        戻り値：(messages, msg_reads)。読めないタブは（あれば）前回値、無ければ空リストで返す。 """
+        戻り値：(messages, msg_reads, allboard, allboard_reads)。
+          ★1対1のやり取りと全店へのお知らせ板を、同じ1回のキャッシュ（同じ60秒）でまとめて読む。
+            ＝ふだんの再描画でAPI（Googleシート）の呼び出しを増やさない。「最新に更新」ボタンも
+              投稿直後の clear_messages_cache も、この4つ全部に同じように効く。
+        読めないタブは（あれば）前回値、無ければ空リストで返す。 """
     import time as _time
     if not hasattr(backend, 'load_messages'):
-        return [], []      # 古い保管庫でも落ちない
+        return [], [], [], []      # 古い保管庫でも落ちない
     now = _time.time()
     cache = st.session_state.get('messages_cache')
     if (not force) and cache and (now - cache.get('t', 0) < _MSG_CACHE_TTL):
-        return cache['messages'], cache['reads']
+        return (cache['messages'], cache['reads'],
+                cache.get('allboard', []), cache.get('allboard_reads', []))
     prev = cache or {}
     try:
         messages = backend.load_messages()
@@ -290,8 +301,26 @@ def load_messages_cached(backend, force=False):
     except Exception as e:
         show_gsheet_error(e, 'やり取りの既読情報を読めませんでした', 'warning')
         reads = prev.get('reads', [])
-    st.session_state['messages_cache'] = {'t': now, 'messages': messages, 'reads': reads}
-    return messages, reads
+    # ---- 全店へのお知らせ板（第3弾）も、同じ1回のキャッシュで一緒に読む ----
+    if hasattr(backend, 'load_allboard'):
+        try:
+            allboard = backend.load_allboard()
+        except Exception as e:
+            show_gsheet_error(e, '全店へのお知らせ板を読めませんでした', 'warning')
+            allboard = prev.get('allboard', [])
+        try:
+            allboard_reads = backend.load_allboard_reads()
+        except Exception as e:
+            show_gsheet_error(e, '全店へのお知らせ板の既読情報を読めませんでした', 'warning')
+            allboard_reads = prev.get('allboard_reads', [])
+    else:
+        # 古い保管庫（全店板メソッドが無い）でも落ちない。前回値か空で返す。
+        allboard = prev.get('allboard', [])
+        allboard_reads = prev.get('allboard_reads', [])
+    st.session_state['messages_cache'] = {
+        't': now, 'messages': messages, 'reads': reads,
+        'allboard': allboard, 'allboard_reads': allboard_reads}
+    return messages, reads, allboard, allboard_reads
 
 
 def clear_messages_cache():
@@ -412,6 +441,18 @@ class _GSheetAdapter:
 
     def save_msg_reads(self, rows):
         gsheet_store.write_msg_reads(self.sh, rows)
+
+    def load_allboard(self):
+        return gsheet_store.read_allboard(self.sh)
+
+    def append_allboard(self, row):
+        gsheet_store.append_allboard(self.sh, row)
+
+    def load_allboard_reads(self):
+        return gsheet_store.read_allboard_reads(self.sh)
+
+    def save_allboard_reads(self, rows):
+        gsheet_store.write_allboard_reads(self.sh, rows)
 
     def load_index(self):
         """ _index だけを読む（1タブ）。在庫本体（raw_）を読み直すかどうかの判定に使う。 """
@@ -1331,9 +1372,84 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
 #   ・スレッドを開いたら既読日時を「いま」に更新する（未読が消える）。
 #   ・API節約：やり取りは60秒のセッションキャッシュ越しに読む。投稿・既読更新の直後だけ捨てる。
 # ============================================================================
-def message_section(my_store, backend, threads, msg_reads):
+def _allboard_section(my_store, backend, allboard, allboard_reads):
+    """ 「📣 全店へのお知らせ板」の中身を描く（第3弾＝すべて新規追加のコード）。
+        message_section から、板が開かれている（msg_open が ALLBOARD_OPEN）ときだけ呼ばれる。
+          ・投稿を時系列で表示 → 入力欄のすぐ上に注意書き → 自由記述の入力欄1本 → ［送信］。
+          ・［送信］は append_allboard で追記 → キャッシュ破棄 → notify_allboard で即・全店へ。
+          ・板を開いた時点で（未読があれば）既読にする（1対1のやり取りと同じ考え方）。
+        ★この板は「予約が起点」ではないので、当月データを未アップの店でも、1対1の相手が
+          いない店でも、いつでも使える（本間部長決定10）。 """
+    st.divider()
+    # 見出しと「◀ 一覧に戻る」。戻るを押したら板を閉じて一覧へ。
+    hcol, bcol = st.columns([4, 1])
+    hcol.markdown('#### 📣 全店へのお知らせ板')
+    if bcol.button('◀ 一覧に戻る', key='btn_allboard_back'):
+        st.session_state.pop('msg_open', None)
+        st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
+        st.rerun()
+    st.caption('ソユーズ・内観堂の全14店へ届く“放送”です。相手を選ばず、'
+               '転院・施設入所などで急に動かなくなった単発のデッド品を、'
+               '月初リストや予約を待たずにそのまま全店へ投げられます。投稿は消さずに残ります。')
+
+    # --- 投稿を時系列（古い→新しい）で表示 ---
+    posts = sorted(allboard or [], key=lambda x: str(x.get('投稿日時', '') or ''))
+    if not posts:
+        st.write('まだ投稿はありません。')
+    else:
+        for m in posts:
+            st.markdown('**%s　%s**'
+                        % (_fmt_msg_time(m.get('投稿日時', '')), m.get('投稿店', '')))
+            st.write(m.get('本文', ''))
+
+    # --- 投稿フォーム（送信後は入力欄を空に戻すため、版番号でキーを作り直す）---
+    ver = st.session_state.get('allboardver', 0)
+    # ★入力欄のすぐ上に注意書き（本間部長決定7）。患者の個人情報を板に載せないための歯止め。
+    st.warning('患者様の氏名・生年月日等は書かないでください。'
+               '薬品名・数量・受け渡しの相談だけを書いてください。')
+    body = st.text_area('本文', key='allboardbody_%d' % ver,
+                        placeholder='例）○○錠20mg が施設入所で急にデッドになりました。'
+                                    '使う店があれば引き取ってください。取りに伺います。')
+    if st.button('送信', type='primary', key='allboardsend'):
+        text = (body or '').strip()
+        if not text:
+            st.warning('本文が空です。ひとこと書いてから送信してください。')
+        else:
+            now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
+            row = {'投稿日時': now, '投稿店': my_store, '本文': text}
+            try:
+                backend.append_allboard(row)
+            except Exception as e:
+                show_gsheet_error(e, '全店へのお知らせ板への投稿の保存に失敗しました', 'error')
+            else:
+                clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
+                st.session_state['allboardver'] = ver + 1     # 入力欄を空に戻す
+                # ★msg_open は触らない＝rerun 後も板が開いたまま（続けて投稿できる）。
+                # メール通知（自店を除く全店へ・即時）。保存後・rerun 前に1回だけ＝二重送信しない。
+                #   宛先には STORE_NAMES（全14店）を渡し、notify_allboard が自店を除く。
+                #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
+                _mail_flush(mailer.notify_allboard(
+                    _mail_secrets(), my_store, text, STORE_NAMES))
+                st.rerun()
+
+    # --- 板を開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
+    if app_logic.allboard_unread_count(my_store, allboard, allboard_reads) > 0:
+        now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
+        new_reads = app_logic.allboard_mark_read(allboard_reads, my_store, now)
+        try:
+            backend.save_allboard_reads(new_reads)
+        except Exception as e:
+            show_gsheet_error(e, '全店へのお知らせ板の既読の更新に失敗しました', 'warning')
+        else:
+            clear_messages_cache()   # 既読を書いた直後だけキャッシュを捨てて読み直す
+            st.rerun()
+
+
+def message_section(my_store, backend, threads, msg_reads, allboard, allboard_reads):
     """
     ⑤ 店舗間のやり取り。threads は app_logic.build_threads の戻り（自店が関わるスレッド一覧）。
+      ★第3弾で「📣 全店へのお知らせ板」を一覧のいちばん上に足した（allboard／allboard_reads）。
+        1対1の相手がゼロの店でも、この板は必ず出す（単発デッド品しかない店を締め出さない）。
       ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を「1行＝1店＋[開く]ボタン」で出す。
         ★一覧の並びは店番順（STORE_NAMES の並び）で固定する（投稿・未読で順番が変わらない）。
           STORE_NAMES に無い店名は末尾へ五十音順でまとめる（黙って消さない）。
@@ -1372,14 +1488,14 @@ def message_section(my_store, backend, threads, msg_reads):
         st.caption('相手ごとに会話は1本にまとまります（予約が入ると、その相手とやり取りできます）。'
                    '他店の新着は最大60秒ほど遅れて出ます。すぐ見たいときは「最新に更新」を押してください。')
 
-    if not threads:
-        st.info('やり取りできる相手店がまだありません。'
-                '他店のデッド品を予約するか、他店から自店の品を予約されると、その相手との会話が始まります。')
-        return
+    # ★第3弾：以前はここで「相手店がまだありません」と早期終了していたが、それだと
+    #   単発デッド品しかない店（＝今回の主役）が全店板すら開けない。そこで早期終了はやめ、
+    #   1対1の相手がゼロでも「📣 全店へのお知らせ板」は必ず出す（下の一覧ビューで出す）。
 
     # --- 並びは店番順（STORE_NAMES の並び）で固定。投稿・未読で順番が変わらない。
-    #     STORE_NAMES に無い店名は末尾へまとめ、その中は五十音順にする（黙って消さない）。---
-    threads = sorted(threads, key=_thread_sort_key)
+    #     STORE_NAMES に無い店名は末尾へまとめ、その中は五十音順にする（黙って消さない）。
+    #     ★threads が空でも sorted([]) は空を返すので安全。---
+    threads = sorted(threads or [], key=_thread_sort_key)
 
     # いま開いている相手店（[開く]で入れ、[◀ 一覧に戻る]や②③④への切替で消す）。
     #   ★選択を st.dataframe に持たせず session_state に持つのが今回の要点（#10701 回避）。
@@ -1398,9 +1514,37 @@ def message_section(my_store, backend, threads, msg_reads):
         st.session_state.pop('msg_open_owner', None)
         open_name = None
 
+    # --- 全店へのお知らせ板が開かれている＝板の中身だけを出す（1対1の一覧は出さない）---
+    #   ★msg_open に実在の店名ではなく ALLBOARD_OPEN（専用の合言葉）が入っているときが板。
+    #     持ち主ガード（上）は板にもそのまま効く＝店を切り替えたら板も閉じる。
+    if open_name == ALLBOARD_OPEN:
+        _allboard_section(my_store, backend, allboard, allboard_reads)
+        return
+
     # --- msg_open が空＝一覧だけを出す。会話も投稿欄もいっさい出さない（誤送信防止）---
     if not open_name:
         st.divider()
+        # ★一覧のいちばん上に「📣 全店へのお知らせ板」の1行（本間部長決定11）。
+        #   1対1の相手がゼロでも必ず出す＝単発デッド品しかない店を締め出さない。
+        ab_unread = app_logic.allboard_unread_count(my_store, allboard, allboard_reads)
+        b1, b2 = st.columns([8, 2])
+        b1.markdown('**📣 全店へのお知らせ板**'
+                    + ('　● 新着%d件' % ab_unread if ab_unread else ''))
+        if b2.button('開く', key='btn_open_allboard'):
+            st.session_state['msg_open'] = ALLBOARD_OPEN
+            st.session_state['msg_open_owner'] = my_store
+            st.rerun()
+        st.caption('単発のデッド品（転院・施設入所などで急に動かなくなった薬）を、'
+                   '相手を選ばず全店へ投げたいときは、上の［開く］を押してください。')
+        st.divider()
+
+        if not threads:
+            # 1対1の相手がまだ無い店。全店板は上に出したので、ここは案内だけ（早期終了しない）。
+            st.info('1対1でやり取りできる相手店はまだありません。'
+                    '他店のデッド品を予約するか、他店から自店の品を予約されると、その相手との会話が始まります。'
+                    '（相手が決まっていないお知らせは、上の「📣 全店へのお知らせ板」をお使いください。）')
+            return
+
         st.caption('やり取りする相手店の右の［開く］を押してください。')
         # 見出し行（相手店／新着／予約中／やり取り）。会話を開くボタンは各行の右端に置く。
         h1, h2, h3, h4, h5 = st.columns([4, 2, 2, 2, 2])
@@ -1971,7 +2115,7 @@ def results_section(backend, stores, latest, index):
             # ---- ⑤やり取り（掲示板）の下ごしらえ（第2弾）----
             #   ★60秒キャッシュ越しに読む＝ふだんの再描画ではAPIを増やさない（load_messages_cached）。
             #   スレッドは「相手店ごとに1本」。各表の『やり取り』列と⑤の新着バッジに使う早見表を作る。
-            messages, msg_reads = load_messages_cached(backend)
+            messages, msg_reads, allboard, allboard_reads = load_messages_cached(backend)
             # ⑤『予約中：』に数量を添えるための早見表（②の改修・2026-08-10）。
             #   当月の提案行から (出し手店, 予約キー) で引く。数量＝提案行の『在庫数』
             #   （＝実効値＝画面の出庫可能数）、単位＝『単位』。表示は _fmt_qty で末尾の .00 を落とす。
@@ -1993,6 +2137,8 @@ def results_section(backend, stores, latest, index):
                 total_unread += ur
                 if t['件数'] > 0:
                     msg_by_store[t['相手店名']] = '%d件%s' % (t['件数'], ' ●' if ur else '')
+            # ★第3弾：⑤の「新着N件」バッジには、1対1の未読に全店板の未読も足す（本間部長決定8）。
+            total_unread += app_logic.allboard_unread_count(my_store, allboard, allboard_reads)
 
             # ---- ②③④⑤の切替ボタン。選ばれた1つだけを下に描く ----
             #   ④のボタンには「引き取れる薬の件数」、⑤には「新着（未読）件数」を出す。
@@ -2058,7 +2204,8 @@ def results_section(backend, stores, latest, index):
 
             else:
                 # ---- ⑤ 店舗間のやり取り（掲示板）＝第2弾 ----
-                message_section(my_store, backend, threads, msg_reads)
+                message_section(my_store, backend, threads, msg_reads,
+                                allboard, allboard_reads)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     #   ★Excelバイト列（xls）は上のブロックで作る（材料が同じなら前回のものを使い回す・案1）。

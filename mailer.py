@@ -55,6 +55,11 @@ from email.utils import formataddr
 FROM_DISPLAY_NAME = 'デッドストックリスト'
 # メール送信のタイムアウト（秒）。メールで画面を固めないための保険。
 _DEFAULT_TIMEOUT = 15
+# 全店板（放送）だけのタイムアウト（秒）。宛先が最大13店と多いので短めにする。
+#   既定15秒×13通だと、1店ずつ順に送るため最悪3分超も待たされる。
+#   全店板は「配れた分だけ配って先へ進む」割り切りで8秒に縮める（本間部長確定・第3弾）。
+#   ★1対1・予約通知は _DEFAULT_TIMEOUT（15秒）のまま。この定数は全店板だけで使う。
+_ALLBOARD_TIMEOUT = 8
 # 本文に載せるメッセージ冒頭の文字数（★中身の全文は載せない＝在庫情報を社外へ撒かないため）
 _EXCERPT_LEN = 100
 
@@ -178,6 +183,21 @@ def build_notification(kind, actor_store, recipient_store, drugs, body_excerpt, 
         parts.append(body_excerpt or '（本文なし）')
         parts.append('')
         parts.append('（メッセージの全文はアプリでご確認ください。'
+                     '在庫の詳しい情報はメールには載せていません。）')
+        parts.append('')
+        parts.append(_link_block(app_link))
+        return subject, '\n'.join(parts)
+
+    if kind == 'allboard':
+        # ★全店へのお知らせ板（放送）。件名を放送向けにして、受け手が「1対1の相談」と
+        #   「全店へのお知らせ」を件名だけで見分けられるようにする（本間部長確定・第3弾）。
+        #   本文は message と同じ骨格（誰から・冒頭100字・アプリのリンク）＝在庫の詳細は載せない。
+        subject = '【デッドストックリスト】%sから全店へのお知らせ' % disp_actor
+        parts = ['%s から、全店へのお知らせ板に投稿がありました。' % disp_actor, '']
+        parts.append('お知らせの冒頭：')
+        parts.append(body_excerpt or '（本文なし）')
+        parts.append('')
+        parts.append('（全文はアプリでご確認ください。'
                      '在庫の詳しい情報はメールには載せていません。）')
         parts.append('')
         parts.append(_link_block(app_link))
@@ -348,3 +368,30 @@ def notify_cancellation(secrets, actor_store, rows, timeout=_DEFAULT_TIMEOUT):
     if not targets:
         return {'messages': [], 'sent': []}
     return send_notifications(secrets, 'cancelled', actor_store, targets, timeout=timeout)
+
+
+def notify_allboard(secrets, actor_store, body, recipient_stores,
+                    timeout=_ALLBOARD_TIMEOUT):
+    """ 全店へのお知らせ板への投稿を、投稿した自店を除く全店へ即時通知する（放送・第3弾）。
+          actor_store     … 投稿した自店
+          body            … 投稿本文（メールには冒頭100字だけ載せる＝在庫の詳細は撒かない）
+          recipient_stores … 宛先候補の店名リスト（呼び出し側は全14店＝STORE_NAMES を渡す）
+          timeout         … 送信タイムアウト（既定8秒＝全店板だけ短縮。1対1・予約は15秒のまま）
+        この関数は宛先リスト（＝recipient_stores から自店・空・重複を除いた最大13店）を作って
+        既存の send_notifications を kind='allboard' で呼ぶだけの薄いラッパー。
+        送信本体（send_mail）や文面組み立て（build_notification）の仕組みには手を入れない。 """
+    excerpt = _excerpt(body)
+    actor = str(actor_store or '').strip()
+    targets = []
+    seen = set()
+    for s in (recipient_stores or []):
+        name = str(s or '').strip()
+        if not name or name == actor:
+            continue                    # 空・自店は宛先にしない（自分あてには送らない）
+        if name in seen:
+            continue                    # 同じ店を二重に送らない（宛先リストの重複よけ）
+        seen.add(name)
+        targets.append({'store': name, 'drugs': [], 'body_excerpt': excerpt})
+    if not targets:
+        return {'messages': [], 'sent': []}
+    return send_notifications(secrets, 'allboard', actor_store, targets, timeout=timeout)
