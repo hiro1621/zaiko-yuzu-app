@@ -23,6 +23,7 @@ Streamlit を import しないので、そのまま単体テストできます�
 """
 
 import io
+import uuid
 import hashlib
 import datetime
 
@@ -882,17 +883,22 @@ def _allboard_last_read_at(my_store, reads):
 
 def allboard_unread_count(my_store, posts, reads):
     """ 全店板の未読件数を返す純関数。
-        未読＝その投稿が『自分以外の店』のもので、かつ『自分の既読日時より新しい』もの。
+        未読＝その行が『自分以外の店』のもので、かつ『自分の既読日時より新しい』もの。
           my_store … 自店名
-          posts    … 全店板の投稿リスト（read_allboard と同じ形＝'投稿日時','投稿店','本文'）
+          posts    … 全店板の投稿リスト（read_allboard と同じ形＝'投稿日時','投稿店','本文','投稿ID','親ID','種別'）
           reads    … 全店板既読の行リスト（read_allboard_reads と同じ形＝'店名','最終確認日時'）
+        ★第4弾（2026-08-22）：未読は「投稿＋返信」で数える（返信も他店の新着として拾う）。
+          種別「状態」（解決済み／未解決の切替）は“新着”に数えない＝バッジのために板を開かせる
+          必要がないため。旧3列の投稿は種別が空なので、これまでどおり投稿として数える。
         ★日時は 'YYYY/MM/DD HH:MM:SS'（ゼロ詰め固定幅）なので、文字列の大小比較でそのまま時系列になる。 """
     my = str(my_store or '').strip()
     last_read = _allboard_last_read_at(my, reads)
     n = 0
     for m in (posts or []):
+        if str(m.get('種別', '') or '').strip() == '状態':
+            continue                                  # 状態変更（解決済み等）は新着に数えない
         if str(m.get('投稿店', '') or '').strip() == my:
-            continue                                  # 自分の投稿は未読にならない
+            continue                                  # 自分の投稿・返信は未読にならない
         if str(m.get('投稿日時', '') or '') > last_read:
             n += 1
     return n
@@ -912,6 +918,146 @@ def allboard_mark_read(reads, my_store, now):
             out.append(dict(r))
     if not replaced:
         out.append({'店名': my, '最終確認日時': now})
+    return out
+
+
+# ============================================================================
+# 全店へのお知らせ板：ツリー返信・解決済みを組み立てる純関数（第4弾・2026-08-22）
+#   ・板の中で「どの投稿への返信か」を親子で表す。稼働中の1対1やり取りには一切触らない。
+#   ・返信への返信（多段）も許す。解決済みは投稿した店だけが立てられる（決定6）。
+#   ・Streamlit に依存しない純関数だけ（品質管理部がテストしやすいように）。
+# ============================================================================
+def new_allboard_id():
+    """ 全店板の投稿・返信・状態行に振る一意な符号（UUID の先頭12桁）。
+        日時・店名・行番号に依存しないので、同じ店が同じ秒に投稿しても、2店が同時でも重複しない。
+        ★これは非決定（呼ぶたび違う値）。テストでは『重複しないこと・桁数』だけを確かめる。 """
+    return uuid.uuid4().hex[:12]
+
+
+def _legacy_allboard_id(row):
+    """ 投稿IDが空の“古い投稿行”（UUID採番前の3列時代）に、毎回同じ値で振る仮の符号。
+        『投稿日時＋投稿店＋本文』から決める＝古い投稿は追記のみで中身が変わらないので毎回同じ値に
+        なり、返信を保存しても後で同じ親に正しく結び付く（legacy-<短いハッシュ>）。
+        ★本番シートは手で書き換えない。読み手側でこの符号を計算して割り当てるだけ（決定どおり）。 """
+    base = '%s|%s|%s' % (
+        str(row.get('投稿日時', '') or ''),
+        str(row.get('投稿店', '') or ''),
+        str(row.get('本文', '') or ''))
+    return 'legacy-' + hashlib.md5(base.encode('utf-8')).hexdigest()[:12]
+
+
+def build_allboard_tree(rows):
+    """ 全店板の行リスト（read_allboard と同じ形）から、画面に出す“表示順リスト”を作る純関数。
+
+      入力  rows … [{'投稿日時','投稿店','本文','投稿ID','親ID','種別'}, ...]
+      出力  [ {'投稿ID','投稿日時','投稿店','本文','親ID','種別'（元の値）,
+                '深さ'（0＝大元・返信ごとに+1）,
+                'ルートID'（属する大元の投稿ID）,
+                'ルート解決済み'（その大元が解決済みか＝バッジ＋折りたたみの判定に使う）}, ... ]
+            ★状態行（種別「状態」）は“解決済みかどうか”に消費し、表示行としては返さない。
+
+      手順：
+        (1) 投稿IDが空の古い行に legacy-<hash> を補う（毎回同じ値）。
+        (2) 投稿・返信ノードと状態行に仕分ける（種別「状態」＝状態行、それ以外＝表示ノード）。
+        (3) 各投稿の“持ち主の店”を把握する（決定6：状態を立てられるのは投稿した店だけ）。
+        (4) 状態行から、各対象投稿の『最新の有効な状態』を確定する。
+            有効＝対象投稿の持ち主の店が書いた状態行だけ（別店の状態行は計算側でも無効にする＝
+            画面でボタンを出さないのと合わせて“二重の歯止め”）。最新＝投稿日時の文字列比較で最大。
+        (5) 親IDで親子を組み立てる。★親が見つからない返信は大元扱いにして必ず画面に出す
+            （黙って消すのが最悪）。★自分自身が親（自己参照）も大元扱い。
+        (6) 深さ優先で表示順に並べる。★循環参照（A→B→A 等）でも無限ループしないよう visited で止める。
+        (7) ★安全網：どのルートからも辿れなかったノード（循環だけで閉じた塊）を大元扱いで拾い残さない。
+    """
+    rows = rows or []
+
+    # (1) 投稿IDが空の行に仮ID（legacy-<hash>）を補う。親ID・種別は前後空白を落として正規化。
+    prepared = []
+    for r in rows:
+        d = dict(r)
+        pid = str(d.get('投稿ID', '') or '').strip()
+        d['投稿ID'] = pid if pid else _legacy_allboard_id(d)
+        d['親ID'] = str(d.get('親ID', '') or '').strip()
+        d['種別'] = str(d.get('種別', '') or '').strip()
+        prepared.append(d)
+
+    # (2) 状態行と表示ノード（投稿・返信）に仕分ける。
+    posts = []      # 表示ノード（投稿・返信）
+    states = []     # 状態行（解決済み／未解決）
+    for d in prepared:
+        (states if d['種別'] == '状態' else posts).append(d)
+
+    # 投稿ID → ノード（同じIDが複数あれば最初のを採用＝表示は1件に保つ）
+    by_id = {}
+    for d in posts:
+        by_id.setdefault(d['投稿ID'], d)
+
+    # (3) 各投稿の“持ち主の店”
+    owner_of = {pid: str(d.get('投稿店', '') or '').strip() for pid, d in by_id.items()}
+
+    # (4) 状態行 → 各対象投稿の『最新の有効な状態』
+    latest_state = {}   # 対象投稿ID → (最新日時, 状態値)
+    for s in states:
+        target = str(s.get('親ID', '') or '').strip()
+        if not target or target not in owner_of:
+            continue
+        writer = str(s.get('投稿店', '') or '').strip()
+        if writer != owner_of[target]:
+            continue    # ★対象投稿の持ち主以外が立てた状態は無効（決定6の“計算側の歯止め”）
+        ts = str(s.get('投稿日時', '') or '')
+        if (target not in latest_state) or (ts >= latest_state[target][0]):
+            latest_state[target] = (ts, str(s.get('本文', '') or '').strip())
+    resolved_of = {pid: (v[1] == '解決済み') for pid, v in latest_state.items()}
+
+    # (5) 親子を組み立てる。返信の親が見つからなければ大元扱い（★黙って落とさない）。
+    children = {}    # 親ID → [子ノード...]
+    roots = []
+    for d in posts:
+        parent = d['親ID']
+        if parent and parent in by_id and parent != d['投稿ID']:
+            children.setdefault(parent, []).append(d)
+        else:
+            roots.append(d)   # 親が空／親が見つからない／自己参照 → 大元として出す
+
+    # 兄弟は投稿日時の昇順（古い→新しい）。同時刻でも安定するよう投稿IDを第2キーにする。
+    def _sort_key(x):
+        return (str(x.get('投稿日時', '') or ''), str(x.get('投稿ID', '') or ''))
+    roots.sort(key=_sort_key)
+    for k in children:
+        children[k].sort(key=_sort_key)
+
+    # (6) 深さ優先で表示順リストを作る。★循環・重複は visited で1回だけに抑える。
+    out = []
+    visited = set()
+
+    def _emit(node, depth, root_id, root_resolved):
+        nid = node['投稿ID']
+        if nid in visited:
+            return                    # 循環参照・重複IDはここで打ち切る（無限ループ防止）
+        visited.add(nid)
+        out.append({
+            '投稿ID': nid,
+            '投稿日時': node.get('投稿日時', ''),
+            '投稿店': node.get('投稿店', ''),
+            '本文': node.get('本文', ''),
+            '親ID': node.get('親ID', ''),
+            '種別': node.get('種別', ''),
+            '深さ': depth,
+            'ルートID': root_id,
+            'ルート解決済み': root_resolved,
+        })
+        for c in children.get(nid, []):
+            _emit(c, depth + 1, root_id, root_resolved)
+
+    for r in roots:
+        rid = r['投稿ID']
+        _emit(r, 0, rid, resolved_of.get(rid, False))
+
+    # (7) 安全網：循環だけで閉じてどのルートからも辿れなかったノードを大元扱いで必ず出す。
+    for d in posts:
+        if d['投稿ID'] not in visited:
+            rid = d['投稿ID']
+            _emit(d, 0, rid, resolved_of.get(rid, False))
+
     return out
 
 

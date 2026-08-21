@@ -158,7 +158,7 @@ def t_allboard_missing_header_with_data():
 def t_allboard_normal_no_overwrite():
     print('■ 全店板：正常タブ（1行目に見出しがある）→ A1を絶対に上書きしない')
     grid = [
-        ['投稿日時', '投稿店', '本文'],
+        list(gs.ALLBOARD_HEADERS),   # ★第4弾で見出しは6列。3列だと『旧見出し』とみなし移行される
         ['t1', '和光', 'a'],
     ]
     ws = _install_fakes(grid)
@@ -172,7 +172,7 @@ def t_allboard_normal_no_overwrite():
 def t_allboard_trailing_blank():
     print('■ 全店板：末尾に空行がぶら下がる正常タブ → 詰めた位置に書く')
     grid = [
-        ['投稿日時', '投稿店', '本文'],
+        list(gs.ALLBOARD_HEADERS),   # ★第4弾で見出しは6列。3列だと『旧見出し』とみなし移行される
         ['t1', '和光', 'a'],
         ['', '', ''],
         ['', '', ''],
@@ -188,7 +188,7 @@ def t_allboard_trailing_blank():
 def t_allboard_inner_blank_kept():
     print('■ 全店板：途中の空行は詰めない（末尾側だけ削る）')
     grid = [
-        ['投稿日時', '投稿店', '本文'],
+        list(gs.ALLBOARD_HEADERS),   # ★第4弾で見出しは6列。3列だと『旧見出し』とみなし移行される
         ['t1', '和光', 'a'],
         ['', '', ''],          # ← 途中の空行
         ['t2', '徳丸', 'b'],

@@ -273,6 +273,11 @@ _MSG_CACHE_TTL = 60   # 秒
 #   ・店名は STORE_NAMES（stores_config）由来なので、この記号入り文字列と一致することはない。
 ALLBOARD_OPEN = '__全店へのお知らせ板__'
 
+# ツリー返信のインデント（左寄せの段差）の上限（第4弾・2026-08-22）。
+#   ★スマホの縦画面で横幅が破綻しないよう、深さがこれを超えても段差はこれで頭打ちにする。
+#     段差が浅くなっても文脈が消えないよう、各返信には「○○店への返信」を文字で必ず添える。
+_ALLBOARD_INDENT_CAP = 3
+
 
 def load_messages_cached(backend, force=False):
     """ _やり取り・_やり取り既読・_全店板・_全店板既読 を 60秒のセッションキャッシュ越しに読む。
@@ -1373,13 +1378,17 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
 #   ・API節約：やり取りは60秒のセッションキャッシュ越しに読む。投稿・既読更新の直後だけ捨てる。
 # ============================================================================
 def _allboard_section(my_store, backend, allboard, allboard_reads):
-    """ 「📣 全店へのお知らせ板」の中身を描く（第3弾＝すべて新規追加のコード）。
+    """ 「📣 全店へのお知らせ板」の中身を描く（第3弾で新設→第4弾でツリー返信・解決済みを追加）。
         message_section から、板が開かれている（msg_open が ALLBOARD_OPEN）ときだけ呼ばれる。
-          ・投稿を時系列で表示 → 入力欄のすぐ上に注意書き → 自由記述の入力欄1本 → ［送信］。
-          ・［送信］は append_allboard で追記 → キャッシュ破棄 → notify_allboard で即・全店へ。
+          ・投稿をツリー（親子インデント）で表示。各投稿に［返信］、返信を親の下にぶら下げる。
+          ・大元が自店の投稿にだけ［解決済みにする］／［未解決に戻す］（決定6）。解決済みは
+            バッジ＋返信を折りたたんで見せる（投稿本体はその場に残す・並べ替えはしない＝決定7）。
+          ・新規の投稿は今までどおり全店へ放送（notify_allboard）。返信の通知は「直近の親の投稿店
+            1店だけ」（決定2・5＝notify_allboard_reply）。
           ・板を開いた時点で（未読があれば）既読にする（1対1のやり取りと同じ考え方）。
         ★この板は「予約が起点」ではないので、当月データを未アップの店でも、1対1の相手が
-          いない店でも、いつでも使える（本間部長決定10）。 """
+          いない店でも、いつでも使える（本間部長決定10）。
+        ★稼働中の1対1やり取り（message_section の相手店ブランチ）には一切触っていない。 """
     st.divider()
     # 見出しと「◀ 一覧に戻る」。戻るを押したら板を閉じて一覧へ。
     hcol, bcol = st.columns([4, 1])
@@ -1387,22 +1396,149 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
     if bcol.button('◀ 一覧に戻る', key='btn_allboard_back'):
         st.session_state.pop('msg_open', None)
         st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
+        st.session_state.pop('allboard_reply_to', None)   # 開きかけの返信欄も閉じる
         st.rerun()
     st.caption('ソユーズ・内観堂の全14店へ届く“放送”です。相手を選ばず、'
                '転院・施設入所などで急に動かなくなった単発のデッド品を、'
-               '月初リストや予約を待たずにそのまま全店へ投げられます。投稿は消さずに残ります。')
+               '月初リストや予約を待たずにそのまま全店へ投げられます。投稿は消さずに残ります。'
+               '各投稿の［返信］でその投稿にぶら下げて返信でき、返信は元の投稿店にだけ届きます。')
 
-    # --- 投稿を時系列（古い→新しい）で表示 ---
-    posts = sorted(allboard or [], key=lambda x: str(x.get('投稿日時', '') or ''))
-    if not posts:
+    my = str(my_store or '').strip()
+
+    # ------------------------------------------------------------------
+    # 状態変更（解決済み／未解決）を1行の追記で保存する（★既存の投稿行は書き換えない）。
+    #   種別「状態」・親ID＝対象投稿ID・本文＝状態値。メールは飛ばさない（決定：解決は静かに）。
+    # ------------------------------------------------------------------
+    def _append_state(target_id, value):
+        now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
+        row = {'投稿日時': now, '投稿店': my_store, '本文': value,
+               '投稿ID': app_logic.new_allboard_id(), '親ID': target_id, '種別': '状態'}
+        try:
+            backend.append_allboard(row)
+        except Exception as e:
+            show_gsheet_error(e, '全店へのお知らせ板の解決状態の更新に失敗しました', 'error')
+        else:
+            clear_messages_cache()   # 追記直後だけキャッシュを捨てて読み直す
+            st.rerun()
+
+    # ------------------------------------------------------------------
+    # 返信入力欄（対象投稿の真下に、同時に1つだけ出す）。誤って別投稿へ返信しない作り。
+    # ------------------------------------------------------------------
+    def _reply_form(parent_node):
+        ppid = parent_node['投稿ID']
+        pstore = str(parent_node.get('投稿店', '') or '').strip()
+        excerpt = str(parent_node.get('本文', '') or '').strip()
+        excerpt = (excerpt[:20] + '…') if len(excerpt) > 20 else excerpt
+        # ★どの投稿への返信かを冒頭に明示（親の店名＋本文の冒頭）＝取り違え防止。
+        st.markdown('**%s の「%s」への返信**' % (pstore or '（不明な投稿）', excerpt or '（本文なし）'))
+        rver = st.session_state.get('ab_replyver_%s' % ppid, 0)
+        # ★返信欄にも患者の個人情報を書かないための注意書きを必ず出す（決定：板と同じ歯止め）。
+        st.warning('患者様の氏名・生年月日等は書かないでください。'
+                   '薬品名・数量・受け渡しの相談だけを書いてください。')
+        rbody = st.text_area('返信本文', key='ab_replybody_%s_%d' % (ppid, rver),
+                             placeholder='例）そちらで2箱お引き取りできます。火曜に取りに伺います。')
+        # ★ボタンは st.columns で横並びにしない（返信欄は列の中に出ることがあり、Streamlit は
+        #   列の入れ子を1段しか許さないため）。縦に並べる＝スマホでも押しやすい。
+        if st.button('送信', type='primary', key='ab_replysend_%s' % ppid):
+            text = (rbody or '').strip()
+            if not text:
+                st.warning('本文が空です。ひとこと書いてから送信してください。')
+            else:
+                now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
+                row = {'投稿日時': now, '投稿店': my_store, '本文': text,
+                       '投稿ID': app_logic.new_allboard_id(),
+                       '親ID': ppid, '種別': '返信'}
+                try:
+                    backend.append_allboard(row)
+                except Exception as e:
+                    show_gsheet_error(e, '全店へのお知らせ板への返信の保存に失敗しました', 'error')
+                else:
+                    clear_messages_cache()                          # 追記直後だけキャッシュを捨てる
+                    st.session_state['ab_replyver_%s' % ppid] = rver + 1   # 入力欄を空に戻す
+                    st.session_state.pop('allboard_reply_to', None)  # 返信欄を閉じる
+                    # メール通知は「直近の親の投稿店1店だけ」（決定2・5）。
+                    #   自分の投稿への自返信（親＝自店）は notify_allboard_reply が送らない。
+                    _mail_flush(mailer.notify_allboard_reply(
+                        _mail_secrets(), my_store, pstore, text))
+                    st.rerun()
+        if st.button('やめる', key='ab_replycancel_%s' % ppid):
+            st.session_state.pop('allboard_reply_to', None)
+            st.rerun()
+
+    # ------------------------------------------------------------------
+    # 投稿1件（ノード）を描く。深さぶん左にインデントし、解決済みルートはバッジ＋返信折りたたみ。
+    # ------------------------------------------------------------------
+    def _render_node(n, node_by_id, reply_to, folded_cnt):
+        depth = n['深さ']
+        pid = n['投稿ID']
+        resolved_root = n['ルート解決済み']
+        eff = min(depth, _ALLBOARD_INDENT_CAP)
+        # インデント：深さ0は素の container（列にしない）＝内側でボタンを縦に並べられる。
+        #   深さ>0は左に余白列を置いて段差を付ける。★段差は上限で頭打ち＝スマホで横幅が破綻しない。
+        if eff == 0:
+            box = st.container()
+        else:
+            box = st.columns([eff, max(1, 12 - eff)])[1]
+        with box:
+            head = '**%s　%s**' % (_fmt_msg_time(n['投稿日時']), n['投稿店'])
+            if depth == 0 and resolved_root:
+                head += '　✅ 解決済み'
+            st.markdown(head)
+            if depth > 0:
+                parent = node_by_id.get(n['親ID'])
+                pstore = str((parent or {}).get('投稿店', '') or '').strip()
+                # ★段差が浅く頭打ちになっても文脈が消えないよう、親の店名を必ず文字で添える。
+                st.caption('↳ %s への返信' % (pstore or '（元の投稿が見つかりません）'))
+            st.write(n['本文'])
+            if depth == 0 and resolved_root:
+                cnt = folded_cnt.get(pid, 0)
+                if cnt:
+                    st.caption('（返信 %d件は解決済みのため折りたたんでいます。'
+                               '見るには［未解決に戻す］を押してください。）' % cnt)
+
+            # ［返信］は解決済みでない木にだけ出す（解決済みは返信が折りたたまれるので、
+            #   まず［未解決に戻す］で開いてから返信する＝畳んだ話に隠れ返信が生まれない）。
+            if not resolved_root:
+                if st.button('返信', key='ab_reply_%s' % pid):
+                    st.session_state['allboard_reply_to'] = pid
+                    st.rerun()
+
+            # ［解決済みにする］／［未解決に戻す］は「大元（深さ0）が自店」のときだけ（決定6）。
+            if depth == 0 and str(n['投稿店'] or '').strip() == my:
+                if not resolved_root:
+                    if st.button('解決済みにする', key='ab_resolve_%s' % pid):
+                        _append_state(pid, '解決済み')
+                else:
+                    if st.button('未解決に戻す', key='ab_unresolve_%s' % pid):
+                        _append_state(pid, '未解決')
+
+            # 返信入力欄は「返信先に指定された投稿の真下」に、同時に1つだけ。
+            if reply_to == pid:
+                _reply_form(n)
+
+    # --- ツリーを組み立てて表示（親子インデント・解決済みは折りたたみ）---
+    tree = app_logic.build_allboard_tree(allboard or [])
+    node_by_id = {n['投稿ID']: n for n in tree}
+    reply_to = st.session_state.get('allboard_reply_to')
+
+    # 解決済みルートごとに、折りたたまれる返信の件数を数えておく（本体に「○件折りたたみ」と添える）。
+    folded_cnt = {}
+    for n in tree:
+        if n['ルート解決済み'] and n['深さ'] > 0:
+            folded_cnt[n['ルートID']] = folded_cnt.get(n['ルートID'], 0) + 1
+
+    if not tree:
         st.write('まだ投稿はありません。')
     else:
-        for m in posts:
-            st.markdown('**%s　%s**'
-                        % (_fmt_msg_time(m.get('投稿日時', '')), m.get('投稿店', '')))
-            st.write(m.get('本文', ''))
+        for n in tree:
+            # 解決済みルートの返信（深さ>0）は折りたたむ＝出さない。ルート本体（深さ0）は残す。
+            if n['ルート解決済み'] and n['深さ'] > 0:
+                continue
+            _render_node(n, node_by_id, reply_to, folded_cnt)
 
-    # --- 投稿フォーム（送信後は入力欄を空に戻すため、版番号でキーを作り直す）---
+    # --- 新しいお知らせを投稿するフォーム（大元＝種別「投稿」・送信は全店へ放送）---
+    st.divider()
+    st.markdown('##### 新しいお知らせを投稿')
     ver = st.session_state.get('allboardver', 0)
     # ★入力欄のすぐ上に注意書き（本間部長決定7）。患者の個人情報を板に載せないための歯止め。
     st.warning('患者様の氏名・生年月日等は書かないでください。'
@@ -1416,7 +1552,9 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
             st.warning('本文が空です。ひとこと書いてから送信してください。')
         else:
             now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
-            row = {'投稿日時': now, '投稿店': my_store, '本文': text}
+            # ★投稿IDを採番（UUID先頭12桁）。親ID空・種別「投稿」＝大元の投稿。
+            row = {'投稿日時': now, '投稿店': my_store, '本文': text,
+                   '投稿ID': app_logic.new_allboard_id(), '親ID': '', '種別': '投稿'}
             try:
                 backend.append_allboard(row)
             except Exception as e:
@@ -1433,6 +1571,7 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
                 st.rerun()
 
     # --- 板を開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
+    #   ★未読は「投稿＋返信」で数える（種別「状態」は数えない）＝allboard_unread_count の拡張。
     if app_logic.allboard_unread_count(my_store, allboard, allboard_reads) > 0:
         now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
         new_reads = app_logic.allboard_mark_read(allboard_reads, my_store, now)

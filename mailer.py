@@ -203,6 +203,21 @@ def build_notification(kind, actor_store, recipient_store, drugs, body_excerpt, 
         parts.append(_link_block(app_link))
         return subject, '\n'.join(parts)
 
+    if kind == 'allboard_reply':
+        # ★全店板のツリー返信（第4弾・2026-08-22）。宛先は「返信先（直近の親）の投稿店1店だけ」。
+        #   全店へは飛ばさない（決定2・5）。件名で「返信があった」ことが分かるようにする。
+        #   本文は allboard と同じ骨格（誰から・冒頭100字・アプリのリンク）＝在庫の詳細は載せない。
+        subject = '【デッドストックリスト】%sから全店板の返信があります' % disp_actor
+        parts = ['%s から、全店へのお知らせ板であなたの投稿への返信がありました。' % disp_actor, '']
+        parts.append('返信の冒頭：')
+        parts.append(body_excerpt or '（本文なし）')
+        parts.append('')
+        parts.append('（全文はアプリでご確認ください。'
+                     '在庫の詳しい情報はメールには載せていません。）')
+        parts.append('')
+        parts.append(_link_block(app_link))
+        return subject, '\n'.join(parts)
+
     if kind == 'reserved':
         subject = '【デッドストックリスト】%sが予約しました' % disp_actor
         head = '%s が、%sのデッドストックを予約しました。' % (disp_actor, disp_recipient)
@@ -217,7 +232,8 @@ def build_notification(kind, actor_store, recipient_store, drugs, body_excerpt, 
         #   呼び出し元（send_notifications）は例外を握って画面に警告を出すだけなので、
         #   ここで止めても投稿・予約・取消そのものは必ず残る。
         raise ValueError('お知らせメールの種類が不明です：%r'
-                         '（message／reserved／cancelled のどれかにしてください）' % (kind,))
+                         '（message／allboard／allboard_reply／reserved／cancelled のどれかにしてください）'
+                         % (kind,))
 
     parts = [head, '']
     if drugs:
@@ -395,3 +411,22 @@ def notify_allboard(secrets, actor_store, body, recipient_stores,
     if not targets:
         return {'messages': [], 'sent': []}
     return send_notifications(secrets, 'allboard', actor_store, targets, timeout=timeout)
+
+
+def notify_allboard_reply(secrets, actor_store, parent_store, body,
+                          timeout=_ALLBOARD_TIMEOUT):
+    """ 全店板のツリー返信を、返信先（直近の親）の投稿店【1店だけ】に通知する（第4弾・2026-08-22）。
+          actor_store  … 返信した自店
+          parent_store … 返信先（直近の親）の投稿店＝唯一の宛先
+          body         … 返信本文（メールには冒頭100字だけ載せる＝在庫の詳細は撒かない）
+          timeout      … 送信タイムアウト（既定8秒＝全店板と同じ。1対1・予約は15秒のまま）
+        ★全店へは飛ばさない（決定2・5＝直近の親1店だけ）。
+        ★自分の投稿に自分で返信したとき（親＝自店）は誰にも送らない（宛先ゼロ）。
+        既存の send_notifications を kind='allboard_reply' で呼ぶだけの薄いラッパー
+        （送信本体 send_mail・文面組み立て build_notification の仕組みには手を入れない）。 """
+    actor = str(actor_store or '').strip()
+    parent = str(parent_store or '').strip()
+    if not parent or parent == actor:
+        return {'messages': [], 'sent': []}   # 宛先なし＝自分あて・空は送らない
+    targets = [{'store': parent, 'drugs': [], 'body_excerpt': _excerpt(body)}]
+    return send_notifications(secrets, 'allboard_reply', actor_store, targets, timeout=timeout)
