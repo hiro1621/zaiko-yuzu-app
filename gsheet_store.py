@@ -254,6 +254,18 @@ def _update(ws, values, range_name='A1'):
     _call(ws.update, range_name=range_name, values=values, value_input_option='RAW')
 
 
+def _row_is_blank(row):
+    """ 行が「全セル空白」かどうかを返す（空文字・空白のみのセルばかりなら True）。
+        ★追記系（append_message／append_allboard）が『本当の行数』を数えるための共通判定。
+          get_all_values() はタブを新規作成した直後、中身が空でも「空の1行」を返すことがあり、
+          それを行数に含めると見出し行を書かないまま2行目から投稿を書いてしまう
+          （＝1行目が空のまま固定される。2026-08-21 の _全店板 障害の直接原因）。 """
+    for cell in row:
+        if str(cell).strip() != '':
+            return False
+    return True
+
+
 # ============================================================================
 # _index の読み書き
 # ============================================================================
@@ -499,12 +511,27 @@ def append_message(sh, row):
       よほど実害が大きいため。掲示板の投稿が同一秒に重なる頻度は極めて低い。 """
     ws = _get_or_create_ws(sh, MESSAGE_TAB, rows=5000, cols=len(MESSAGE_HEADERS) + 2)
     values = _values(ws)
-    body = []
-    start = len(values) + 1              # 既にある行の次の行（1始まり）
-    if not values:                       # まだ空＝いちばん最初は見出し行を先に置く
-        body.append(list(MESSAGE_HEADERS))
-    body.append([str(row.get(h, '') or '') for h in MESSAGE_HEADERS])
-    _update(ws, body, range_name='A%d' % start)
+
+    # 末尾の空行を無視して「本当の行数」を数える（★末尾側からのみ削る＝途中の空行は詰めない）。
+    #   ★以前は `if not values:` で「空かどうか」を見ていたが、タブを新規作成した直後は
+    #     中身が空でも get_all_values() が「空の1行」を返すことがあり、
+    #     見出し行を書かないまま2行目から投稿を書く事故になっていた（2026-08-21 の _全店板 障害）。
+    real_len = len(values)
+    while real_len > 0 and _row_is_blank(values[real_len - 1]):
+        real_len -= 1
+
+    post = [str(row.get(h, '') or '') for h in MESSAGE_HEADERS]
+    if real_len == 0:
+        # 実質からっぽ → A1 に見出し、A2 に投稿（1回の書き込みでまとめて置く）
+        _update(ws, [list(MESSAGE_HEADERS), post], range_name='A1')
+    else:
+        # 既にデータあり。1行目（見出し）が空なら、見出しだけを A1 へ入れ直して直す。
+        #   ★別範囲へ書くので既存のデータ行には一切触れない（他店の投稿を巻き込まない）。
+        #   ★1行目に何か入っている正常なタブは絶対に上書きしない（見出しの取り違え防止）。
+        if _row_is_blank(values[0]):
+            _update(ws, [list(MESSAGE_HEADERS)], range_name='A1')
+        # 投稿は「本当の行数＋1」行目へ（末尾の空行は数えていないので詰まった位置に書く）
+        _update(ws, [post], range_name='A%d' % (real_len + 1))
 
 
 def read_msg_reads(sh):
@@ -591,12 +618,29 @@ def append_allboard(sh, row):
         ＝「追記のみ・過去の投稿を消さない」という約束は守られる。 """
     ws = _get_or_create_ws(sh, ALLBOARD_TAB, rows=5000, cols=len(ALLBOARD_HEADERS) + 2)
     values = _values(ws)
-    body = []
-    start = len(values) + 1              # 既にある行の次の行（1始まり）
-    if not values:                       # まだ空＝いちばん最初は見出し行を先に置く
-        body.append(list(ALLBOARD_HEADERS))
-    body.append([str(row.get(h, '') or '') for h in ALLBOARD_HEADERS])
-    _update(ws, body, range_name='A%d' % start)
+
+    # 末尾の空行を無視して「本当の行数」を数える（★末尾側からのみ削る＝途中の空行は詰めない）。
+    #   ★以前は `if not values:` で「空かどうか」を見ていたが、タブを新規作成した直後は
+    #     中身が空でも get_all_values() が「空の1行」を返すことがあり、
+    #     見出し行を書かないまま2行目から投稿を書く事故になっていた。
+    #     本番の _全店板 でこれが起き、投稿は保存されているのに1行目が空のままで
+    #     read_allboard が列名を引けず「まだ投稿はありません。」になった（2026-08-21）。
+    real_len = len(values)
+    while real_len > 0 and _row_is_blank(values[real_len - 1]):
+        real_len -= 1
+
+    post = [str(row.get(h, '') or '') for h in ALLBOARD_HEADERS]
+    if real_len == 0:
+        # 実質からっぽ → A1 に見出し、A2 に投稿（1回の書き込みでまとめて置く）
+        _update(ws, [list(ALLBOARD_HEADERS), post], range_name='A1')
+    else:
+        # 既にデータあり。1行目（見出し）が空なら、見出しだけを A1 へ入れ直して直す。
+        #   ★別範囲へ書くので既存のデータ行には一切触れない（他店の投稿を巻き込まない）。
+        #   ★1行目に何か入っている正常なタブは絶対に上書きしない（見出しの取り違え防止）。
+        if _row_is_blank(values[0]):
+            _update(ws, [list(ALLBOARD_HEADERS)], range_name='A1')
+        # 投稿は「本当の行数＋1」行目へ（末尾の空行は数えていないので詰まった位置に書く）
+        _update(ws, [post], range_name='A%d' % (real_len + 1))
 
 
 def read_allboard_reads(sh):
