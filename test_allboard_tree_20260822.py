@@ -377,6 +377,65 @@ def t_new_id_unique():
     check('すべて12桁', all(len(x) == 12 for x in ids))
 
 
+# ---- 新着順（2026-08-22）：大元は新しい順・子は古い順のまま ---------------------
+def t_tree_roots_desc_children_asc():
+    print('■ tree：大元は新しい順（降順）・返信の子は古い順（昇順）＝多段でも子は昇順')
+    rows = [
+        _P('2026/08/22 10:00:00', '和光', '古い大元', 'p_old'),
+        _P('2026/08/22 12:00:00', '徳丸', '新しい大元', 'p_new'),
+        # p_old にぶら下がる返信（子は古い→新しい）。孫返信もぶら下げて多段にする。
+        _P('2026/08/22 10:10:00', '志木', '子1（早）', 'c1', 'p_old', '返信'),
+        _P('2026/08/22 10:20:00', '和光', '子2（遅）', 'c2', 'p_old', '返信'),
+        _P('2026/08/22 10:30:00', '朝霞', '孫（c1への返信）', 'g1', 'c1', '返信'),
+    ]
+    t = app_logic.build_allboard_tree(rows)
+    ids = [n['投稿ID'] for n in t]
+    check('大元は新しい順＝新しい p_new が先頭', ids[0] == 'p_new')
+    # p_old のツリーは 深さ優先・子は昇順： p_old → c1 →（c1の孫）g1 → c2
+    check('p_old のツリーは子が昇順のまま（p_old→c1→g1→c2）',
+          ids[1:] == ['p_old', 'c1', 'g1', 'c2'])
+    depth = {n['投稿ID']: n['深さ'] for n in t}
+    check('孫は深さ2（多段でも子は昇順で並ぶ）', depth['g1'] == 2)
+
+
+def t_tree_roots_same_time_stable():
+    print('■ tree：同時刻の大元でも並びが安定（入力順を変えても毎回同じ）')
+    same = '2026/08/22 11:00:00'
+    base = [
+        _P(same, '和光', 'A', 'aaa'),
+        _P(same, '徳丸', 'B', 'bbb'),
+        _P(same, '志木', 'C', 'ccc'),
+    ]
+    rows_a = base
+    rows_b = [base[2], base[0], base[1]]   # 入力の並びだけ入れ替える
+    ids_a = [n['投稿ID'] for n in app_logic.build_allboard_tree(rows_a)]
+    ids_b = [n['投稿ID'] for n in app_logic.build_allboard_tree(rows_b)]
+    check('入力順を変えても並びは同じ（安定）', ids_a == ids_b)
+    # roots は reverse=True＝第2キー（投稿ID）も降順。実質ユニークなので一意に定まる。
+    check('同時刻は投稿IDで一意に並ぶ（降順 ccc→bbb→aaa）',
+          ids_a == ['ccc', 'bbb', 'aaa'])
+
+
+def t_tree_resolved_keeps_position():
+    print('■ tree：解決済みにしても投稿の位置は変わらない（日付順のまま・持ち上げない）')
+    base = [
+        _P('2026/08/22 10:00:00', '和光', '古', 'p1'),
+        _P('2026/08/22 11:00:00', '徳丸', '中', 'p2'),
+        _P('2026/08/22 12:00:00', '志木', '新', 'p3'),
+    ]
+    before = [n['投稿ID'] for n in app_logic.build_allboard_tree(base)]
+    check('解決前は新しい順（p3→p2→p1）', before == ['p3', 'p2', 'p1'])
+    # 真ん中の p2 を「持ち主（徳丸）」が解決済みにする（状態行を1行足すだけ）。
+    rows = base + [_P('2026/08/22 12:30:00', '徳丸', '解決済み', 's1', 'p2', '状態')]
+    t = app_logic.build_allboard_tree(rows)
+    after = [n['投稿ID'] for n in t]
+    check('解決済みにしても並びは変わらない（p2 は持ち上がらない）',
+          after == ['p3', 'p2', 'p1'])
+    resolved = {n['投稿ID']: n['ルート解決済み'] for n in t}
+    check('p2 は解決済みフラグが立つ', resolved['p2'] is True)
+    check('p1・p3 は未解決のまま', resolved['p1'] is False and resolved['p3'] is False)
+
+
 # ============================================================================
 # 3) mailer：allboard_reply の文面／宛先1店・自返信抑止
 # ============================================================================
@@ -441,6 +500,10 @@ def main():
         t_tree_resolved_latest_wins,
         t_unread_counts_reply_not_state,
         t_new_id_unique,
+        # 新着順（2026-08-22）：大元は降順・子は昇順・解決済みは位置を変えない
+        t_tree_roots_desc_children_asc,
+        t_tree_roots_same_time_stable,
+        t_tree_resolved_keeps_position,
         # mailer
         t_mail_build_allboard_reply,
         t_mail_notify_reply_targets_one,

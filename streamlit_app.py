@@ -1516,28 +1516,11 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
             if reply_to == pid:
                 _reply_form(n)
 
-    # --- ツリーを組み立てて表示（親子インデント・解決済みは折りたたみ）---
-    tree = app_logic.build_allboard_tree(allboard or [])
-    node_by_id = {n['投稿ID']: n for n in tree}
-    reply_to = st.session_state.get('allboard_reply_to')
-
-    # 解決済みルートごとに、折りたたまれる返信の件数を数えておく（本体に「○件折りたたみ」と添える）。
-    folded_cnt = {}
-    for n in tree:
-        if n['ルート解決済み'] and n['深さ'] > 0:
-            folded_cnt[n['ルートID']] = folded_cnt.get(n['ルートID'], 0) + 1
-
-    if not tree:
-        st.write('まだ投稿はありません。')
-    else:
-        for n in tree:
-            # 解決済みルートの返信（深さ>0）は折りたたむ＝出さない。ルート本体（深さ0）は残す。
-            if n['ルート解決済み'] and n['深さ'] > 0:
-                continue
-            _render_node(n, node_by_id, reply_to, folded_cnt)
-
     # --- 新しいお知らせを投稿するフォーム（大元＝種別「投稿」・送信は全店へ放送）---
-    st.divider()
+    #   ★2026-08-22：一覧を新着順（新しい投稿が一番上）に変えたので、この入力欄も一覧の一番上へ移した。
+    #     下にあると「書くためだけに一番下までスクロール」が要るため（本間部長決定）。
+    #   ★返信フォーム（_reply_form）は動かしていない＝返信欄は今までどおり返信先の投稿の真下に出す。
+    #   ★allboardver（送信後に入力欄を空へ戻す版番号）の仕組みはそのまま。位置だけ移動している。
     st.markdown('##### 新しいお知らせを投稿')
     ver = st.session_state.get('allboardver', 0)
     # ★入力欄のすぐ上に注意書き（本間部長決定7）。患者の個人情報を板に載せないための歯止め。
@@ -1569,6 +1552,29 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
                 _mail_flush(mailer.notify_allboard(
                     _mail_secrets(), my_store, text, STORE_NAMES))
                 st.rerun()
+
+    # ★区切り線：ここから下が投稿一覧（新着順）。上の入力欄と見た目で分ける。
+    st.divider()
+
+    # --- ツリーを組み立てて表示（親子インデント・解決済みは折りたたみ）---
+    tree = app_logic.build_allboard_tree(allboard or [])
+    node_by_id = {n['投稿ID']: n for n in tree}
+    reply_to = st.session_state.get('allboard_reply_to')
+
+    # 解決済みルートごとに、折りたたまれる返信の件数を数えておく（本体に「○件折りたたみ」と添える）。
+    folded_cnt = {}
+    for n in tree:
+        if n['ルート解決済み'] and n['深さ'] > 0:
+            folded_cnt[n['ルートID']] = folded_cnt.get(n['ルートID'], 0) + 1
+
+    if not tree:
+        st.write('まだ投稿はありません。')
+    else:
+        for n in tree:
+            # 解決済みルートの返信（深さ>0）は折りたたむ＝出さない。ルート本体（深さ0）は残す。
+            if n['ルート解決済み'] and n['深さ'] > 0:
+                continue
+            _render_node(n, node_by_id, reply_to, folded_cnt)
 
     # --- 板を開いた＝既読にする。未読があるときだけ書く（ムダな書き込み・API消費を避ける）---
     #   ★未読は「投稿＋返信」で数える（種別「状態」は数えない）＝allboard_unread_count の拡張。
