@@ -1567,7 +1567,7 @@ def _allboard_section(my_store, backend, allboard, allboard_reads, my_rows=None)
                               placeholder='薬品名の一部を入力（例：タリ）',
                               key='ab_pick_%d' % cartver)
         if n_no_price:
-            st.caption('薬価が読めない品 %d件は選べません＝在庫を再アップロードしてください。' % n_no_price)
+            st.caption('薬価の無い品（自費薬など）%d件は選べません（薬価で金額を判定できないため）。' % n_no_price)
 
         # 薬を選んだときだけ数量欄を出す（未選択のまま先頭の薬を誤って追加しないため）。
         if picked is not None:
@@ -1584,7 +1584,7 @@ def _allboard_section(my_store, backend, allboard, allboard_reads, my_rows=None)
                     st.error('%s は 薬価%s円×%s＝%s円 で%s円未満のため投稿できません'
                              '（送料と手間が、仕入値として取り戻せる額を上回るため）。'
                              % (it['表示名'], _fmt_qty(it['薬価']), _fmt_qty(qty),
-                                _fmt_amount(amount), th_disp))
+                                app_logic.ab_fmt_amount(amount), th_disp))
                 else:
                     newrow = {'品目キー': picked, '表示名': it['表示名'], '数量': float(qty),
                               '単位': it['単位'], '薬価': it['薬価'], '金額': amount,
@@ -1615,19 +1615,19 @@ def _allboard_section(my_store, backend, allboard, allboard_reads, my_rows=None)
                 '数量': _fmt_qty(r['数量']),
                 '単位': r['単位'],
                 '薬価': _fmt_qty(r['薬価']),
-                '金額': _fmt_amount(r['金額']),
+                '金額': app_logic.ab_fmt_amount(r['金額']),   # 本文と同じ見た目（.00 を付けない）
                 '有効期限': yuzu_core.fmt_ym(d) if d else '',
                 '区分': r['区分'],
             })
         st.dataframe(_df(disp_rows, ['薬品名', '数量', '単位', '薬価', '金額', '有効期限', '区分']),
                      hide_index=True, width='stretch')
         total = sum(r['金額'] for r in cart)
-        st.markdown('**合計金額：%s円**' % _fmt_amount(total))
+        st.markdown('**合計金額：%s円**' % app_logic.ab_fmt_amount(total))
         # 各薬に［削除］。key は位置でなく品目キーから作る（並びが変わっても取り違えない）。
         for r in cart:
             dcol, bcol2 = st.columns([5, 1])
             dcol.write('%s　%s%s（%s円）'
-                       % (r['表示名'], _fmt_qty(r['数量']), r['単位'], _fmt_amount(r['金額'])))
+                       % (r['表示名'], _fmt_qty(r['数量']), r['単位'], app_logic.ab_fmt_amount(r['金額'])))
             if bcol2.button('削除', key='ab_del_%s' % r['品目キー']):
                 st.session_state['ab_cart'] = [x for x in cart if x['品目キー'] != r['品目キー']]
                 st.rerun()

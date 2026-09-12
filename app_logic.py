@@ -1106,6 +1106,11 @@ def _ab_fmt_amount(v):
     return '{:,.2f}'.format(f).rstrip('0')
 
 
+# 画面（streamlit_app）からも同じ表示規則を使えるように公開名を付ける（本文とカート表で金額の見た目をそろえる）。
+ab_fmt_qty = _ab_fmt_qty
+ab_fmt_amount = _ab_fmt_amount
+
+
 def build_allboard_items(store_rows):
     """ 自店の当月在庫（store_rows＝1行1ロットの辞書リスト）から、板の選択肢に使う品目辞書を作る純関数。
 
