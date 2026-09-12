@@ -26,6 +26,7 @@ import io
 import uuid
 import hashlib
 import datetime
+import unicodedata
 
 import jst
 import yuzu_core
@@ -1067,6 +1068,170 @@ def build_allboard_tree(rows):
             _emit(d, 0, rid, resolved_of.get(rid, False))
 
     return out
+
+
+# ============================================================================
+# 全店板の「カート方式の投稿」を支える純関数（第5弾・2026-09-12）
+#   ・板の投稿を「自由記述1本」から「自店の在庫から薬品名を選ぶ＋数量を入れる」方式へ変える。
+#     薬価×数量が限界値（CONFIG['min_supply_amount']＝1,500円）未満なら投稿できない。
+#   ・ここは Streamlit を一切 import しない純関数だけ＝品質管理部が単体テストできる。
+#     画面（streamlit_app.py）はこの3関数を呼ぶだけで、判定・整形のロジックを持たない。
+# ============================================================================
+def _ab_fmt_qty(v):
+    """ カート／本文で使う数量の表示。末尾の .00 は落とす（10.00→10／12.50→12.5）。
+        ★streamlit_app._fmt_qty と同じ考え方だが、app_logic は Streamlit を import しないため
+          画面側の関数は呼ばず、ここに小さく持つ（純関数として単体テストできるように）。 """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:                              # NaN はそのまま文字列で返す
+        return str(v)
+    if f == int(f):
+        return '{:,}'.format(int(f))
+    return '{:,.2f}'.format(f).rstrip('0')
+
+
+def _ab_fmt_amount(v):
+    """ カート／本文で使う金額の表示。カンマ区切り・整数なら小数なし・端数は2桁まで
+        （1500.0→1,500／2079.5→2,079.5／2079.55→2,079.55）。 """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f != f:
+        return str(v)
+    if f == int(f):
+        return '{:,}'.format(int(f))
+    return '{:,.2f}'.format(f).rstrip('0')
+
+
+def build_allboard_items(store_rows):
+    """ 自店の当月在庫（store_rows＝1行1ロットの辞書リスト）から、板の選択肢に使う品目辞書を作る純関数。
+
+      入力  store_rows … load_current_month_stores が返す自店の 'rows'（薬VANの列を持つ辞書のリスト）。
+      出力  (items, order)
+        items … {品目キー: {'品目キー','薬品名','表示名','単位','在庫数','薬価','有効期限','区分'}}
+            ・品目キー … yuzu_core.exclusion_key(row)（個別医薬品CD優先・無ければ『名:薬品名』）でロットを名寄せ。
+            ・薬品名   … 元の薬品名（最初に出た行のもの）。
+            ・表示名   … unicodedata.normalize('NFKC', 薬品名)＝全角英数記号を半角に直したもの
+                        （「タリージェＯＤ錠５ｍｇ」→「タリージェOD錠5mg」。カタカナはそのまま）。
+                        保存する本文にもこの表示名を使う＝全角・半角どちらで打っても引っかかる。
+            ・単位     … 最初に出た行の単位。
+            ・在庫数   … 同じ品目キーのロットを yuzu_core.stock_qty で合算（その店の全量）。
+            ・薬価     … yuzu_core.parse_num が返す最初の正の値（空/0しか無い品は 0.0 で残す＝画面側で弾く）。
+            ・有効期限 … 同じ品目キーのロットのうち最短（読める日付が無ければ空文字）。
+            ・区分     … yuzu_core.warn_labels（向精神薬・毒薬・劇薬）。麻薬・覚醒剤の品はそもそも入れない。
+        order … 表示名の昇順に並べた品目キーの配列（selectbox の options に使う）。
+
+      ★麻薬・覚醒剤（yuzu_core.is_legal_excluded が True）は選択肢に入れない（融通提案と同じ歯止め）。
+      ★薬価が空/0の品も items には残す（薬価=0）。画面側で「薬価不明」として弾き、件数を注記する。
+    """
+    rows = store_rows or []
+    items = {}
+    for row in rows:
+        # 麻薬・覚醒剤は板の選択肢に出さない（融通提案から完全除外するのと同じ）。
+        if yuzu_core.is_legal_excluded(row):
+            continue
+        key = yuzu_core.exclusion_key(row)
+        name = yuzu_core.g(row, '薬品名')
+        unit = yuzu_core.g(row, '単位')
+        qty = yuzu_core.stock_qty(row)                    # このロットの在庫数
+        yakka = yuzu_core.parse_num(yuzu_core.g(row, '薬価'))   # このロットの薬価（読めなければ0.0）
+        exp = yuzu_core.parse_date(yuzu_core.g(row, '有効期限'))  # このロットの有効期限（読めなければ None）
+        warn = yuzu_core.warn_labels(row)                 # 区分（向精神薬・毒薬・劇薬）
+
+        it = items.get(key)
+        if it is None:
+            it = {
+                '品目キー': key,
+                '薬品名': name,
+                '表示名': unicodedata.normalize('NFKC', name),
+                '単位': unit,
+                '在庫数': 0.0,
+                '薬価': 0.0,
+                '有効期限': None,   # 最後に文字列へ直す
+                '区分': warn,
+            }
+            items[key] = it
+        # 在庫数はロット合算。
+        it['在庫数'] += qty
+        # 薬価は「最初に出た正の値」を採用（0や空のロットは無視して、非0が出たら埋める）。
+        if it['薬価'] <= 0 and yakka > 0:
+            it['薬価'] = yakka
+        # 有効期限は最短（読める日付のうちいちばん近いもの）。
+        if exp is not None and (it['有効期限'] is None or exp < it['有効期限']):
+            it['有効期限'] = exp
+        # 区分は空でなければ埋める（同じ品目キーでロット間で食い違うことは通常ないが、非空を優先）。
+        if not it['区分'] and warn:
+            it['区分'] = warn
+
+    # 有効期限を 'YYYY/MM/DD' の文字列へ（None は空文字）。
+    for it in items.values():
+        it['有効期限'] = yuzu_core.fmt_date(it['有効期限'])
+
+    # 表示名の昇順で並べる（同名は品目キーで安定化）。
+    order = sorted(items.keys(), key=lambda k: (items[k]['表示名'], k))
+    return items, order
+
+
+def allboard_line_check(yakka, qty, threshold):
+    """ 板に1品を追加してよいか（薬価×数量が限界値以上か）を判定する純関数。
+
+      入力  yakka … 薬価（数値・文字列どちらでも可。parse_num で解釈）。
+            qty   … 数量（数値・文字列どちらでも可。小数可）。
+            threshold … 限界値（円）。画面側は yuzu_core.CONFIG['min_supply_amount'] を渡す。
+      出力  (ok, amount)
+            amount … parse_num(yakka) * parse_num(qty)（小数のまま）。
+            ok     … 薬価が空/0、または 数量≤0 のときは (False, 0.0)。それ以外は amount >= threshold。
+      ★境界：1,500.00 ちょうどは可（>=）、1,499.99 は不可。 """
+    y = yuzu_core.parse_num(yakka)
+    q = yuzu_core.parse_num(qty)
+    if y <= 0 or q <= 0:
+        return (False, 0.0)
+    amount = y * q
+    return (amount >= threshold, amount)
+
+
+def compose_allboard_body(lines, free_text):
+    """ カートの中身（lines）＋自由記述（free_text）から、板に保存する本文（文字列）を作る純関数。
+
+      入力  lines … [{'表示名','数量','単位','薬価','金額','有効期限','区分'}, ...]（カートの各行）。
+            free_text … 自由記述（理由・LOT・受け渡し方法など。空なら付けない）。
+      出力  保存用の本文（文字列）。形式：
+            ・各品を1行ずつ markdown のリスト記法「- 」で書く（Streamlitは単独改行を改行として
+              描かないため。「- 」なら1品1行で表示される）：
+                - 表示名　数量単位（薬価○円×数量＝○,○○○円）期限YYYY/MM
+              区分があれば末尾に【向精神薬】のように付ける。有効期限が空なら「期限」以降を付けない。
+            ・全品のあとに空行を1つ、続けて自由記述（free_text が空なら空行も自由記述も付けない）。
+      ★数量・薬価の末尾 .00 は落とす（_ab_fmt_qty）。金額はカンマ区切り・整数なら小数なし（_ab_fmt_amount）。 """
+    out_lines = []
+    for ln in (lines or []):
+        disp = str(ln.get('表示名', '') or '')
+        qty = _ab_fmt_qty(ln.get('数量', ''))
+        unit = str(ln.get('単位', '') or '')
+        yakka = _ab_fmt_qty(ln.get('薬価', ''))     # 薬価も末尾 .00 を落とす（6.30→6.3・330→330）
+        amount = _ab_fmt_amount(ln.get('金額', ''))
+        exp = str(ln.get('有効期限', '') or '').strip()
+        warn = str(ln.get('区分', '') or '').strip()
+        # 有効期限は YYYY/MM まで（日は落とす）。空なら期限表記を付けない。
+        exp_ym = ''
+        if exp:
+            d = yuzu_core.parse_date(exp)
+            exp_ym = yuzu_core.fmt_ym(d) if d else exp
+        line = '- %s　%s%s（薬価%s円×%s＝%s円）' % (disp, qty, unit, yakka, qty, amount)
+        if exp_ym:
+            line += '期限%s' % exp_ym
+        if warn:
+            line += '【%s】' % warn
+        out_lines.append(line)
+
+    body = '\n'.join(out_lines)
+    free = (free_text or '').strip()
+    if free:
+        # 品の箇条書きが1件も無い場合でも、自由記述の前に空行を1つ入れる（本文が自由記述だけの体裁）。
+        body = (body + '\n\n' + free) if body else free
+    return body
 
 
 def build_threads(my_store, messages, reservations, qty_by_key=None):
