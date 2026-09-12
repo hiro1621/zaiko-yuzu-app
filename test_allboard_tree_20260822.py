@@ -527,10 +527,12 @@ def t_ab_items_legal_excluded():
     rows = [
         _ab_row(個別医薬品CD='N1', 薬品名='麻薬相当の錠', 在庫数='5', 薬価='100', 麻薬区分='1'),
         _ab_row(個別医薬品CD='N2', 薬品名='ふつうの錠', 在庫数='5', 薬価='100', 麻薬区分='0'),
+        _ab_row(個別医薬品CD='N3', 薬品名='覚醒剤原料相当の錠', 在庫数='5', 薬価='100', 覚醒剤区分='1'),
     ]
     items, _order = app_logic.build_allboard_items(rows)
     check("麻薬区分'1'の品は選択肢に入らない", 'N1' not in items)
     check("麻薬区分'0'の品は残る", 'N2' in items)
+    check("覚醒剤区分'1'の品も選択肢に入らない（品管指摘で追加）", 'N3' not in items)
 
 
 def t_ab_items_nfkc_display():
