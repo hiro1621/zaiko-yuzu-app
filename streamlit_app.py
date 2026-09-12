@@ -1535,6 +1535,16 @@ def _allboard_section(my_store, backend, allboard, allboard_reads, my_rows=None)
     sel_order = [k for k in order if items[k]['薬価'] > 0]   # 薬価が読める品だけ選べる
     n_no_price = len(order) - len(sel_order)
 
+    # ★★カートにも“持ち主（どの店でログイン中に入れたか）”を紐づける（msg_open_owner と同じ考え方）。
+    #   A店で薬を追加したまま左のドロップダウンや ?store= でB店へ切り替えると、session_state に
+    #   残ったA店の薬がB店の名前で投稿できてしまう。持ち主が今の my_store と違えばカートを捨てて
+    #   選択欄も初期化する（店の切替経路が増えてもここ1か所で塞がる）。
+    _owner = st.session_state.get('ab_cart_owner')
+    if _owner != my_store:
+        if _owner is not None:   # 別の店から切り替わった＝選択欄・数量欄も作り直す（初回は不要）
+            st.session_state['ab_cartver'] = st.session_state.get('ab_cartver', 0) + 1
+        st.session_state['ab_cart'] = []
+        st.session_state['ab_cart_owner'] = my_store
     cartver = st.session_state.get('ab_cartver', 0)   # 追加・送信のたびに+1して選択欄を初期化
     cart = st.session_state.setdefault('ab_cart', [])   # カート（品目ごとの行dictのリスト）
 
