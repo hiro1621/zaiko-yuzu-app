@@ -1377,8 +1377,11 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
 #   ・スレッドを開いたら既読日時を「いま」に更新する（未読が消える）。
 #   ・API節約：やり取りは60秒のセッションキャッシュ越しに読む。投稿・既読更新の直後だけ捨てる。
 # ============================================================================
-def _allboard_section(my_store, backend, allboard, allboard_reads):
+def _allboard_section(my_store, backend, allboard, allboard_reads, my_rows=None):
     """ 「📣 全店へのお知らせ板」の中身を描く（第3弾で新設→第4弾でツリー返信・解決済みを追加）。
+        ★第5弾（2026-09-12）：新規投稿を「自店の在庫から薬品名を選ぶ＋数量を入れる」カート方式へ。
+          my_rows＝自店の当月在庫（load_current_month_stores の自店 'rows'）。既定 None は後方互換
+          （渡されなければ「在庫が手元に無い」扱いで投稿欄に案内を出す）。
         message_section から、板が開かれている（msg_open が ALLBOARD_OPEN）ときだけ呼ばれる。
           ・投稿をツリー（親子インデント）で表示。各投稿に［返信］、返信を親の下にぶら下げる。
           ・大元が自店の投稿にだけ［解決済みにする］／［未解決に戻す］（決定6）。解決済みは
@@ -1516,42 +1519,144 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
             if reply_to == pid:
                 _reply_form(n)
 
-    # --- 新しいお知らせを投稿するフォーム（大元＝種別「投稿」・送信は全店へ放送）---
-    #   ★2026-08-22：一覧を新着順（新しい投稿が一番上）に変えたので、この入力欄も一覧の一番上へ移した。
-    #     下にあると「書くためだけに一番下までスクロール」が要るため（本間部長決定）。
-    #   ★返信フォーム（_reply_form）は動かしていない＝返信欄は今までどおり返信先の投稿の真下に出す。
-    #   ★allboardver（送信後に入力欄を空へ戻す版番号）の仕組みはそのまま。位置だけ移動している。
+    # --- 新しいお知らせを投稿するフォーム（カート方式・大元＝種別「投稿」・送信は全店へ放送）---
+    #   ★第5弾（2026-09-12）：自由記述1本から「自店の在庫から薬品名を選ぶ＋数量を入れる」方式へ。
+    #     ①薬品名を選ぶ（文字を打てば絞り込む）→②数量→③［この薬を追加］でカート（session_state
+    #     の ab_cart）へ1行足す→複数薬をまとめて→④［送信］で本文を組み立てて1投稿として保存する。
+    #     薬価×数量が限界値（yuzu_core.CONFIG['min_supply_amount']＝1,500円）未満の薬は追加できない。
+    #   ★保存する行の形（6キー）・返信ツリー・未読・メールは今までどおり＝本文が箇条書きに変わるだけ。
+    #   ★追加・削除は session_state だけで backend を呼ばない（Gシート往復ゼロ）。送信の1回だけ書く。
     st.markdown('##### 新しいお知らせを投稿')
-    ver = st.session_state.get('allboardver', 0)
-    # ★入力欄のすぐ上に注意書き（本間部長決定7）。患者の個人情報を板に載せないための歯止め。
+    threshold = yuzu_core.CONFIG['min_supply_amount']   # 限界値（円）。文言にはここから埋める（直書きしない）。
+    th_disp = '{:,}'.format(threshold)
+
+    # 自店の当月在庫から選択肢を作る（麻薬・覚醒剤は入らない／薬価0は「薬価不明」で弾く）。
+    items, order = app_logic.build_allboard_items(my_rows or [])
+    sel_order = [k for k in order if items[k]['薬価'] > 0]   # 薬価が読める品だけ選べる
+    n_no_price = len(order) - len(sel_order)
+
+    cartver = st.session_state.get('ab_cartver', 0)   # 追加・送信のたびに+1して選択欄を初期化
+    cart = st.session_state.setdefault('ab_cart', [])   # カート（品目ごとの行dictのリスト）
+
+    st.caption('自店の在庫から薬品名を選び、数量を入れて［この薬を追加］を押してください。'
+               '薬価×数量が%s円以上の薬だけ投稿できます（少額は送料と手間が、取り戻せる仕入値を'
+               '上回り会社の持ち出しになるため）。複数の薬をまとめて1件で投稿できます。' % th_disp)
+
+    if not sel_order:
+        # 選べる薬が1つも無い（自店在庫が未アップ、または薬価が全部読めない）。
+        st.info('選べる薬がありません。左の「新しいデータに差し替える」で自店の在庫を'
+                'アップロードし直すと、ここから薬品名を選べるようになります。')
+    else:
+        def _ab_label(k):
+            it = items[k]
+            return '%s（在庫 %s %s・薬価 %s円）' % (
+                it['表示名'], _fmt_qty(it['在庫数']), it['単位'], _fmt_qty(it['薬価']))
+
+        picked = st.selectbox('薬品名', options=sel_order, index=None,
+                              format_func=_ab_label,
+                              placeholder='薬品名の一部を入力（例：タリ）',
+                              key='ab_pick_%d' % cartver)
+        if n_no_price:
+            st.caption('薬価が読めない品 %d件は選べません＝在庫を再アップロードしてください。' % n_no_price)
+
+        # 薬を選んだときだけ数量欄を出す（未選択のまま先頭の薬を誤って追加しないため）。
+        if picked is not None:
+            it = items[picked]
+            init_qty = float(it['在庫数']) if it['在庫数'] and it['在庫数'] > 0 else 0.01
+            qcol, ucol = st.columns([3, 1])
+            qty = qcol.number_input('数量', min_value=0.01, value=init_qty, step=1.0,
+                                    key='ab_qty_%d' % cartver)
+            ucol.markdown('　')          # 縦位置を数量欄の入力ボックスに合わせるための余白
+            ucol.markdown('**%s**' % it['単位'])
+            if st.button('この薬を追加', key='ab_add'):
+                ok, amount = app_logic.allboard_line_check(it['薬価'], qty, threshold)
+                if not ok:
+                    st.error('%s は 薬価%s円×%s＝%s円 で%s円未満のため投稿できません'
+                             '（送料と手間が、仕入値として取り戻せる額を上回るため）。'
+                             % (it['表示名'], _fmt_qty(it['薬価']), _fmt_qty(qty),
+                                _fmt_amount(amount), th_disp))
+                else:
+                    newrow = {'品目キー': picked, '表示名': it['表示名'], '数量': float(qty),
+                              '単位': it['単位'], '薬価': it['薬価'], '金額': amount,
+                              '有効期限': it['有効期限'], '区分': it['区分']}
+                    # 同じ品目キーが既にカートにあれば数量を置き換える（重複行を作らない）。
+                    replaced = False
+                    for i, r in enumerate(cart):
+                        if r['品目キー'] == picked:
+                            cart[i] = newrow
+                            replaced = True
+                            break
+                    if not replaced:
+                        cart.append(newrow)
+                    st.session_state['ab_cartver'] = cartver + 1   # 選択欄・数量欄を初期化
+                    st.rerun()
+
+    # --- カート（投稿する薬）の表示。読み取り専用の表＋合計＋各行に［削除］---
+    st.markdown('##### 投稿する薬（%d件）' % len(cart))
+    if not cart:
+        st.caption('まだ薬を追加していません。上で薬品名を選び、数量を入れて'
+                   '［この薬を追加］を押してください。')
+    else:
+        disp_rows = []
+        for r in cart:
+            d = yuzu_core.parse_date(r.get('有効期限', ''))
+            disp_rows.append({
+                '薬品名': r['表示名'],
+                '数量': _fmt_qty(r['数量']),
+                '単位': r['単位'],
+                '薬価': _fmt_qty(r['薬価']),
+                '金額': _fmt_amount(r['金額']),
+                '有効期限': yuzu_core.fmt_ym(d) if d else '',
+                '区分': r['区分'],
+            })
+        st.dataframe(_df(disp_rows, ['薬品名', '数量', '単位', '薬価', '金額', '有効期限', '区分']),
+                     hide_index=True, width='stretch')
+        total = sum(r['金額'] for r in cart)
+        st.markdown('**合計金額：%s円**' % _fmt_amount(total))
+        # 各薬に［削除］。key は位置でなく品目キーから作る（並びが変わっても取り違えない）。
+        for r in cart:
+            dcol, bcol2 = st.columns([5, 1])
+            dcol.write('%s　%s%s（%s円）'
+                       % (r['表示名'], _fmt_qty(r['数量']), r['単位'], _fmt_amount(r['金額'])))
+            if bcol2.button('削除', key='ab_del_%s' % r['品目キー']):
+                st.session_state['ab_cart'] = [x for x in cart if x['品目キー'] != r['品目キー']]
+                st.rerun()
+
+    # --- 注記・注意書き・本文（自由記述・任意）---
+    st.caption('ゆうパックでしか送れない大きな品（瓶・大容量など）は送料が高いので目安2,000円以上。')
+    st.caption('一覧に無い薬は、左の「新しいデータに差し替える」で自店の在庫をアップし直すと選べます。')
+    # ★患者の個人情報を板に載せないための歯止め（本間部長決定7）。自由記述欄のすぐ上に必ず出す。
     st.warning('患者様の氏名・生年月日等は書かないでください。'
                '薬品名・数量・受け渡しの相談だけを書いてください。')
-    body = st.text_area('本文', key='allboardbody_%d' % ver,
-                        placeholder='例）○○錠20mg が施設入所で急にデッドになりました。'
-                                    '使う店があれば引き取ってください。取りに伺います。')
-    if st.button('送信', type='primary', key='allboardsend'):
-        text = (body or '').strip()
-        if not text:
-            st.warning('本文が空です。ひとこと書いてから送信してください。')
+    ver = st.session_state.get('allboardver', 0)
+    body = st.text_area('本文（任意）', key='allboardbody_%d' % ver,
+                        placeholder='例）施設入所で急にデッドになりました。取りに伺います。'
+                                    'LOTや開封状態、受け渡し方法があれば書いてください。')
+
+    # --- 送信（カートに1件以上あるときだけ押せる）---
+    if st.button('送信', type='primary', key='allboardsend', disabled=(len(cart) == 0)):
+        # 本文＝カートの箇条書き＋空行＋自由記述（純関数 compose_allboard_body に一任）。
+        text = app_logic.compose_allboard_body(cart, body)
+        now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
+        # ★投稿IDを採番（UUID先頭12桁）。親ID空・種別「投稿」＝大元の投稿。保存行の形は今までどおり6キー。
+        row = {'投稿日時': now, '投稿店': my_store, '本文': text,
+               '投稿ID': app_logic.new_allboard_id(), '親ID': '', '種別': '投稿'}
+        try:
+            backend.append_allboard(row)
+        except Exception as e:
+            show_gsheet_error(e, '全店へのお知らせ板への投稿の保存に失敗しました', 'error')
         else:
-            now = jst.now().strftime(MSG_TS_FMT)   # 日本時間（UTCずれ対策）
-            # ★投稿IDを採番（UUID先頭12桁）。親ID空・種別「投稿」＝大元の投稿。
-            row = {'投稿日時': now, '投稿店': my_store, '本文': text,
-                   '投稿ID': app_logic.new_allboard_id(), '親ID': '', '種別': '投稿'}
-            try:
-                backend.append_allboard(row)
-            except Exception as e:
-                show_gsheet_error(e, '全店へのお知らせ板への投稿の保存に失敗しました', 'error')
-            else:
-                clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
-                st.session_state['allboardver'] = ver + 1     # 入力欄を空に戻す
-                # ★msg_open は触らない＝rerun 後も板が開いたまま（続けて投稿できる）。
-                # メール通知（自店を除く全店へ・即時）。保存後・rerun 前に1回だけ＝二重送信しない。
-                #   宛先には STORE_NAMES（全14店）を渡し、notify_allboard が自店を除く。
-                #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
-                _mail_flush(mailer.notify_allboard(
-                    _mail_secrets(), my_store, text, STORE_NAMES))
-                st.rerun()
+            clear_messages_cache()                       # 投稿直後だけキャッシュを捨てる
+            st.session_state['ab_cart'] = []              # カートを空に戻す
+            st.session_state['ab_cartver'] = cartver + 1  # 選択欄・数量欄を初期化
+            st.session_state['allboardver'] = ver + 1     # 自由記述欄を空に戻す
+            # ★msg_open は触らない＝rerun 後も板が開いたまま（続けて投稿できる）。
+            # メール通知（自店を除く全店へ・即時）。保存後・rerun 前に1回だけ＝二重送信しない。
+            #   宛先には STORE_NAMES（全14店）を渡し、notify_allboard が自店を除く。
+            #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
+            _mail_flush(mailer.notify_allboard(
+                _mail_secrets(), my_store, text, STORE_NAMES))
+            st.rerun()
 
     # ★区切り線：ここから下が投稿一覧（新着順）。上の入力欄と見た目で分ける。
     st.divider()
@@ -1590,9 +1695,11 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
             st.rerun()
 
 
-def message_section(my_store, backend, threads, msg_reads, allboard, allboard_reads):
+def message_section(my_store, backend, threads, msg_reads, allboard, allboard_reads, my_rows=None):
     """
     ⑤ 店舗間のやり取り。threads は app_logic.build_threads の戻り（自店が関わるスレッド一覧）。
+      ★第5弾（2026-09-12）：my_rows＝自店の当月在庫を受け取り、全店板のカート方式の投稿へ渡す。
+        既定 None は後方互換（渡されなければ板の投稿欄で在庫を選べず案内だけ出す）。
       ★第3弾で「📣 全店へのお知らせ板」を一覧のいちばん上に足した（allboard／allboard_reads）。
         1対1の相手がゼロの店でも、この板は必ず出す（単発デッド品しかない店を締め出さない）。
       ・上段：相手店の一覧（新着＝未読件数／予約中の品数つき）を「1行＝1店＋[開く]ボタン」で出す。
@@ -1663,7 +1770,7 @@ def message_section(my_store, backend, threads, msg_reads, allboard, allboard_re
     #   ★msg_open に実在の店名ではなく ALLBOARD_OPEN（専用の合言葉）が入っているときが板。
     #     持ち主ガード（上）は板にもそのまま効く＝店を切り替えたら板も閉じる。
     if open_name == ALLBOARD_OPEN:
-        _allboard_section(my_store, backend, allboard, allboard_reads)
+        _allboard_section(my_store, backend, allboard, allboard_reads, my_rows)
         return
 
     # --- msg_open が空＝一覧だけを出す。会話も投稿欄もいっさい出さない（誤送信防止）---
@@ -2349,8 +2456,11 @@ def results_section(backend, stores, latest, index):
 
             else:
                 # ---- ⑤ 店舗間のやり取り（掲示板）＝第2弾 ----
+                # ★第5弾：全店板のカート方式の投稿に使う「自店の当月在庫」を1本だけ渡す。
+                #   stores から自店の 'rows'（無ければ空リスト）を取り出す。
+                my_rows = next((s['rows'] for s in stores if s['name'] == my_store), [])
                 message_section(my_store, backend, threads, msg_reads,
-                                allboard, allboard_reads)
+                                allboard, allboard_reads, my_rows)
 
     # ---- Excelダウンロード（全店一覧・不足一覧は従来どおりこのExcelに入っている）----
     #   ★Excelバイト列（xls）は上のブロックで作る（材料が同じなら前回のものを使い回す・案1）。
