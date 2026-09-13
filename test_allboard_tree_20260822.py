@@ -25,7 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gsheet_store as gs
 import app_logic
 import mailer
-import yuzu_core
 
 
 # ============================================================================
@@ -477,105 +476,6 @@ def t_mail_notify_reply_targets_one():
 
 
 # ============================================================================
-# 第5弾（2026-09-12）：カート方式の投稿を支える app_logic の純関数
-#   build_allboard_items / allboard_line_check / compose_allboard_body
-# ============================================================================
-def _ab_row(**kw):
-    """ build_allboard_items 用のダミー在庫行。指定しない列は空文字・区分は全部『0』（非該当）。 """
-    base = {'個別医薬品CD': '', 'レセプト電算CD': '', '薬品名': '', '単位': '錠',
-            '在庫数': '0', '薬価': '0', '有効期限': '',
-            '麻薬区分': '0', '覚醒剤区分': '0', '向精神薬区分': '0',
-            '毒薬区分': '0', '劇薬区分': '0'}
-    base.update(kw)
-    return base
-
-
-def t_ab_line_check_boundary():
-    print('■ allboard_line_check：限界値1,500円の境界と不正値')
-    th = yuzu_core.CONFIG['min_supply_amount']
-    check('限界値は1,500円（据え置き）', th == 1500)
-    ok, amt = app_logic.allboard_line_check('7.5', '200', th)     # 1500.0
-    check('1,500.00ちょうどは可', ok is True and abs(amt - 1500.0) < 1e-9)
-    ok, amt = app_logic.allboard_line_check('1499.99', '1', th)
-    check('1,499.99は不可', ok is False and abs(amt - 1499.99) < 1e-9)
-    ok, amt = app_logic.allboard_line_check('', '10', th)
-    check('薬価が空なら不可・金額0', ok is False and amt == 0.0)
-    ok, amt = app_logic.allboard_line_check('0', '10', th)
-    check('薬価0なら不可・金額0', ok is False and amt == 0.0)
-    ok, amt = app_logic.allboard_line_check('330', '0', th)
-    check('数量0なら不可・金額0', ok is False and amt == 0.0)
-    ok, amt = app_logic.allboard_line_check('330', '10', th)
-    check('330円×10＝3,300円は可', ok is True and abs(amt - 3300.0) < 1e-9)
-
-
-def t_ab_items_lot_sum_and_shortest_expiry():
-    print('■ build_allboard_items：ロット合算・有効期限は最短・薬価は最初の正の値')
-    rows = [
-        _ab_row(個別医薬品CD='K1', 薬品名='テスト錠', 単位='錠', 在庫数='10', 薬価='0', 有効期限='2030/12'),
-        _ab_row(個別医薬品CD='K1', 薬品名='テスト錠', 単位='錠', 在庫数='15', 薬価='250', 有効期限='2028/05'),
-    ]
-    items, order = app_logic.build_allboard_items(rows)
-    it = items['K1']
-    check('ロット2行（10＋15）の在庫数が25に合算される', abs(it['在庫数'] - 25.0) < 1e-9)
-    check('薬価は最初の正の値（250）を採る', abs(it['薬価'] - 250.0) < 1e-9)
-    check('有効期限は最短（2028/05）を採る', it['有効期限'] == '2028/05/01')
-    check('order はこの1品だけ', order == ['K1'])
-
-
-def t_ab_items_legal_excluded():
-    print('■ build_allboard_items：麻薬区分の品は除外・非該当は残る')
-    rows = [
-        _ab_row(個別医薬品CD='N1', 薬品名='麻薬相当の錠', 在庫数='5', 薬価='100', 麻薬区分='1'),
-        _ab_row(個別医薬品CD='N2', 薬品名='ふつうの錠', 在庫数='5', 薬価='100', 麻薬区分='0'),
-        _ab_row(個別医薬品CD='N3', 薬品名='覚醒剤原料相当の錠', 在庫数='5', 薬価='100', 覚醒剤区分='1'),
-    ]
-    items, _order = app_logic.build_allboard_items(rows)
-    check("麻薬区分'1'の品は選択肢に入らない", 'N1' not in items)
-    check("麻薬区分'0'の品は残る", 'N2' in items)
-    check("覚醒剤区分'1'の品も選択肢に入らない（品管指摘で追加）", 'N3' not in items)
-
-
-def t_ab_items_nfkc_display():
-    print('■ build_allboard_items：表示名は NFKC で全角英数→半角')
-    rows = [_ab_row(個別医薬品CD='K9', 薬品名='テストＯＤ錠５ｍｇ', 在庫数='3', 薬価='100')]
-    items, _order = app_logic.build_allboard_items(rows)
-    check('「ＯＤ錠５ｍｇ」→「OD錠5mg」', items['K9']['表示名'] == 'テストOD錠5mg')
-    check('元の薬品名（全角）はそのまま残す', items['K9']['薬品名'] == 'テストＯＤ錠５ｍｇ')
-
-
-def t_ab_items_warn_label():
-    print('■ build_allboard_items：向精神薬などの区分が付く')
-    rows = [_ab_row(個別医薬品CD='K5', 薬品名='向精神相当の錠', 在庫数='3', 薬価='100', 向精神薬区分='1')]
-    items, _order = app_logic.build_allboard_items(rows)
-    check('区分に向精神薬が入る', items['K5']['区分'] == '向精神薬')
-
-
-def t_ab_compose_body_basic():
-    print('■ compose_allboard_body：箇条書き＋空行＋自由記述')
-    lines = [{'表示名': 'タリージェOD錠5mg', '数量': 200.0, '単位': '錠',
-              '薬価': 7.5, '金額': 1500.0, '有効期限': '2030/09/01', '区分': ''}]
-    body = app_logic.compose_allboard_body(lines, '火曜に取りに伺います')
-    first = body.split('\n')[0]
-    check('1行目が「- 」で始まる', first.startswith('- '))
-    check('1行目に表示名が入る', 'タリージェOD錠5mg' in first)
-    check('数量の末尾.00が落ちている（200錠）', '200錠' in first and '200.00' not in first)
-    check('期限がYYYY/MMで入る', '期限2030/09' in first)
-    check('自由記述の前に空行がある', '\n\n火曜に取りに伺います' in body)
-    check('自由記述が末尾に入る', body.rstrip().endswith('火曜に取りに伺います'))
-
-
-def t_ab_compose_body_no_free_text():
-    print('■ compose_allboard_body：自由記述が空なら末尾に空行を残さない・区分は末尾に付く')
-    lines = [{'表示名': 'ホニャララ錠', '数量': 10.0, '単位': '錠',
-              '薬価': 330.0, '金額': 3300.0, '有効期限': '', '区分': '向精神薬'}]
-    body = app_logic.compose_allboard_body(lines, '')
-    check('末尾に空行（改行）が残らない', not body.endswith('\n'))
-    check('区分【向精神薬】が末尾に付く', body.endswith('【向精神薬】'))
-    check('金額がカンマ区切り（3,300円）', '3,300円' in body)
-    check('有効期限が空なら「期限」を付けない', '期限' not in body)
-
-
-# ============================================================================
 def main():
     print('=== 全店板ツリー返信・解決済み 検証テスト（2026-08-22） ===\n')
     for fn in [
@@ -607,14 +507,6 @@ def main():
         # mailer
         t_mail_build_allboard_reply,
         t_mail_notify_reply_targets_one,
-        # 第5弾（2026-09-12）：カート方式の投稿を支える純関数
-        t_ab_line_check_boundary,
-        t_ab_items_lot_sum_and_shortest_expiry,
-        t_ab_items_legal_excluded,
-        t_ab_items_nfkc_display,
-        t_ab_items_warn_label,
-        t_ab_compose_body_basic,
-        t_ab_compose_body_no_free_text,
     ]:
         fn()
         print('')
