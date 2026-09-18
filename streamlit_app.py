@@ -12,7 +12,7 @@
     （2026-07-27 追加。ボタン・申込みは無し。連絡は従来どおり電話・デスクネッツ）
   ・（参考）自店が不足している薬を、デッド／期限切迫で持っている店
   ・全店の融通提案一覧（デッド＋期限切迫・在庫金額の大きい順／「種別」列つき）
-  ・「現在 N/14店 アップ済み」（店数は stores_config.py の STORE_COUNT）
+  ・「現在 N/36店 アップ済み」（店数は stores_config.py の STORE_COUNT。2026-09-18 に3法人36店へ）
 を返します。裏側の保管庫はGoogleスプレッドシート（サービスアカウント経由のみ）。
 店舗はGシートを直接触らず、必ずこのアプリ経由で読み書きします。
 
@@ -21,8 +21,11 @@
   「デッド（不動）」と「期限切迫」だけを出し手にします。
 
 【使い方（店舗）】
-  1. 共有パスワードを入れる（1回だけ）。
-  2. 自分の店をドロップダウンで選ぶ。
+  1. 合言葉を入れる（1回だけ）。★2026-09-18 3法人対応：合言葉は店ごと（Secrets の [store_passwords]）。
+     店の合言葉で入ると、その店が自店として確定する（店の選び直しはできない・?store= も無視）。
+     本部用の合言葉（admin_password）で入ったときだけ、36店を自由に切り替えられる（従来どおりの動き）。
+     [store_passwords] が無く app_password だけの環境では、従来どおり共有パスワード1つで入り店を選ぶ。
+  2. 自分の店をドロップダウンで選ぶ（本部用で入ったとき）。法人（ソユーズ／内観堂／飛鳥）で絞れる。
      （URLに ?store=店名 が付くので、そのURLをブックマークすれば次回から選ばずに済む）
   3. その月ぶんをまだ出していなければ、薬VANの在庫ファイルをアップロードする。
      ★アップロードは月に1回でよい。データは保管庫（Gシート）に残るので、2回目以降は
@@ -36,8 +39,8 @@
   旧仕様の「過剰数／過剰数金額」（＝安全在庫を超えた分だけ）は使いません。デッド品は
   在庫まるごとが動かす対象で、過剰数だと0になってしまう品が実在するためです。
 
-★載せない品（本間部長判断 2026-07-27）★
-  1) 在庫金額が 1,500円未満の少額品（yuzu_core.CONFIG['min_supply_amount'] で変更可）
+★載せない品（本間部長判断 2026-07-27／2026-09-18 に下限を 1,500円→500円へ・運用ルール確定版）★
+  1) 在庫金額が 500円未満の少額品（yuzu_core.CONFIG['min_supply_amount'] で変更可。画面の文言はこの値から作る）
   2) 店が「除外」にチェックを入れた品（保管庫の _除外 タブに保存。いつでも戻せる）
   どちらも自店の表だけでなく、全店一覧・他店の参考ビュー・Excel・Gシートから同時に消えます。
 
@@ -51,10 +54,15 @@
     ローカルで起動：  streamlit run streamlit_app.py
 
 【秘密（Streamlit Cloud の Secrets ＝ TOML に置く。リポジトリには入れない）】
-    app_password = "共有パスワード"
+    admin_password = "本部用の合言葉（36店を自由に切替できる）"
+    [store_passwords]
+    "東大泉" = "その店の合言葉"      ← 36店ぶん（キーは stores_config.py の店名そのまま）
+    ...
+    app_password = "共有パスワード"   ← 後方互換。[store_passwords] が無いときだけ使われる
     spreadsheet_id = "GスプレッドシートのID"
     [gcp_service_account]
     ... サービスアカウント鍵(JSON)の中身をTOML表として貼る ...
+    （メール通知の [smtp]／app_url／[store_emails] は mailer.py の説明を参照）
   ※ Secrets が未設定のときは、この画面だけで動く「ローカル保管庫モード」で起動します
     （＝Gシートに接続せず、その場のブラウザのメモリに貯めます。動作確認用）。
 
@@ -72,7 +80,7 @@ import yuzu_core
 import app_logic
 import gsheet_store
 import mailer
-from stores_config import STORE_NAMES, STORE_COUNT, COMPANY_OF
+from stores_config import STORE_NAMES, STORE_COUNT, COMPANY_OF, COMPANY_ORDER, STORES_BY_COMPANY
 
 # ⑤やり取りの相手店の並び順を『店番順（STORE_NAMES の並び）』に固定するための順位表。
 #   ★並びを固定にするのが要件：未読件数や投稿で順番が変わると、st.dataframe の行選択が
@@ -467,6 +475,11 @@ class _GSheetAdapter:
         """ 前月の結果（滞留＝何ヶ月つづけて載っているか の判定材料）を読む。 """
         return gsheet_store.read_prev_proposal(self.sh, current_ym)
 
+    def load_store_info(self):
+        """ _店舗情報 タブ（法人名・薬局名（正式）・所在地・管理薬剤師名）を読む（60秒キャッシュ）。
+            引取依頼書の記名欄に使う。タブが無ければ見出し行だけ作って空を返す。 """
+        return gsheet_store.read_store_info(self.sh)
+
 
 @st.cache_resource(show_spinner='Googleシートに接続しています…')
 def _open_sheet():
@@ -488,32 +501,64 @@ def get_backend():
 
 
 # ============================================================================
-# パスワードゲート
+# 合言葉ゲート（2026-09-18 3法人対応：店ごとの合言葉＋本部用）
+#   Secrets の型：
+#     [store_passwords]  店名 = "合言葉"（36店。キーは stores_config.STORE_NAMES の店名そのまま）
+#     admin_password     本部用の合言葉（36店を自由に切替できる＝従来どおりの動き）
+#     app_password       後方互換。[store_passwords] が無いときだけ使う（共有パスワード1つで入り店を選ぶ）
+#   動き：
+#     ・合言葉を1つ入れる → [store_passwords] のどれかと一致すれば、その店を自店として確定する
+#       （店の選び直しはできない。URL の ?store= も無視する）。
+#     ・admin_password と一致すれば本部モード＝36店を自由に切替できる。
+#     ・同じ合言葉が2店以上に登録されていたら、その値では入れず「設定を確認してください」と出す
+#       （黙って片方の店に入れない＝別店のデータを上書きする事故を防ぐ）。
+#     ・[store_passwords] があるときは app_password は見ない（切替後に旧の共有パスワードが残っていても通さない）。
+#   ★合言葉の値はコードにもテストにも書かない。値は Streamlit Cloud の Secrets 画面にだけ入れる。
 # ============================================================================
+def _store_passwords():
+    """ Secrets の [store_passwords] を {店名: 合言葉(str)} で返す。無ければ None。 """
+    raw = _get_secret('store_passwords')
+    if not raw:
+        return None
+    try:
+        return {str(k).strip(): str(v).strip() for k, v in dict(raw).items()}
+    except Exception:
+        return None
+
+
 def password_gate():
-    """ 正しい共有パスワードを入れるまで先へ進ませない。 """
+    """ 正しい合言葉を入れるまで先へ進ませない。入れたら session_state に
+        authed（入れた）／auth_mode（admin/store/legacy/dev）／auth_store（店に固定のときの店名）を置く。 """
     if st.session_state.get('authed'):
         return True
 
     st.title('💊 デッドストックリスト')
-    st.caption('社内限定ツール。共有パスワードを入力してください。')
+    sp = _store_passwords()
+    admin = _get_secret('admin_password')
+    legacy = _get_secret('app_password')
+    configured = bool(sp) or bool(admin) or bool(legacy)
+    if sp:
+        st.caption('社内限定ツール。自店の合言葉を入力してください（合言葉で店が決まります）。')
+    else:
+        st.caption('社内限定ツール。共有パスワードを入力してください。')
 
-    expected = _get_secret('app_password')
     with st.form('gate'):
-        pw = st.text_input('共有パスワード', type='password')
+        pw = st.text_input('合言葉' if sp else '共有パスワード', type='password')
         ok = st.form_submit_button('入る')
     if ok:
-        if not expected:
-            # Secrets未設定（ローカル検証・開発モード）では、そのまま入れる
+        res = app_logic.evaluate_password(pw, sp, admin, legacy, STORE_NAMES)
+        if res['ok']:
             st.session_state['authed'] = True
-            st.rerun()
-        elif pw == str(expected):
-            st.session_state['authed'] = True
+            st.session_state['auth_mode'] = res['mode']
+            st.session_state['auth_store'] = res['store']
+            if res['store']:
+                # 店に固定：前のセッションの選択・URLの ?store= より合言葉の店を優先する
+                st.session_state['my_store'] = res['store']
             st.rerun()
         else:
-            st.error('パスワードが違います。')
-    if not expected:
-        st.info('（開発モード：共有パスワード未設定のため、空欄のまま「入る」で進めます）')
+            st.error(res['error'])
+    if not configured:
+        st.info('（開発モード：合言葉が未設定のため、空欄のまま「入る」で進めます）')
     return False
 
 
@@ -640,6 +685,37 @@ def _style_expiry(df, paint=True, stag_levels=None, expiry_flags=None):
     except Exception:
         # 万一 Styler が使えない環境でも、表示自体は素のDataFrameで続行する
         return df
+
+
+def box_totals_table(rows, box_min, side):
+    """ 相手店ごとの予約合計と「まとめ便の3,000円ライン」の小さな表を描く（2026-09-18・3法人対応）。
+          rows    … app_logic.box_totals の戻りの 'receive'（④＝自店が引き取る側）または 'supply'（②＝自店が出す側）
+          box_min … 箱の下限（3,000円）
+          side    … 'receive'／'supply'（見出しの文言を変える）
+        ★予約は止めない。到達／未達（あと○円）を見せるだけ（手渡しなら3,000円は不要のため）。
+        1件も無ければ何も描かない。 """
+    if not rows:
+        return
+    if side == 'receive':
+        head = '相手店（出し手）ごとの予約合計＝自店へ届く箱の中身'
+    else:
+        head = '相手店（引き取る店）ごとの予約合計＝自店から出す箱の中身'
+    st.markdown('**%s**（まとめ便の%s円ライン）' % (head, '{:,}'.format(int(box_min))))
+    recs = []
+    for b in rows:
+        if b['到達']:
+            judge = '到達'
+        else:
+            judge = 'あと%s円' % '{:,.0f}'.format(b['あと'])
+        note = ('金額不明%d件' % b['金額不明']) if b.get('金額不明') else ''
+        recs.append({'相手店': b['相手店'], '法人': COMPANY_OF.get(b['相手店'], ''),
+                     '予約件数': b['件数'], '合計（円）': '{:,.0f}'.format(b['合計']),
+                     '3,000円ライン': judge, '備考': note})
+    st.dataframe(pd.DataFrame(recs, columns=['相手店', '法人', '予約件数', '合計（円）', '3,000円ライン', '備考']),
+                 hide_index=True, width='stretch', key='box_totals_%s' % side)
+    st.caption('同じ相手店への合計が%s円以上になったら箱を送ります。届かなければ次のまとめ便まで持ち越し'
+               '（手渡しなら%s円は不要）。予約自体はいつでもできます。'
+               % ('{:,}'.format(int(box_min)), '{:,}'.format(int(box_min))))
 
 
 def stagnation_legend(rows, chips=True):
@@ -1082,19 +1158,23 @@ VIEW_RECEIVE = 'receive'  # ④自店が引き取れる薬
 VIEW_MESSAGE = 'message'  # ⑤店舗間のやり取り（掲示板）
 VIEW_ORDER = [VIEW_DEAD, VIEW_EXPIRY, VIEW_RECEIVE, VIEW_MESSAGE]
 
-# ④の予約で選ぶ「受取時期」（今すぐ／1〜3ヶ月後の4択・最大3ヶ月・本間部長確定）。
-#   実際に予約する月は、品ごとの有効期限キャップ（app_logic.pickup_cap）で頭打ちにする。
-PICKUP_OFFSETS = [0, 1, 2, 3]
-PICKUP_LABELS = {0: '今すぐ', 1: '1ヶ月後', 2: '2ヶ月後', 3: '3ヶ月後'}
-
-
-def _pickup_offset_selector(key):
-    """ 受取時期（今すぐ／1〜3ヶ月後）を選ぶドロップダウンを描き、選ばれたオフセット（0〜3）を返す。 """
+# ④の予約で選ぶ「受取時期」＝「今すぐ（随時便）」＋次のまとめ便＋その次のまとめ便（2026-09-18・3法人対応）。
+#   選択肢は app_logic.pickup_options(当月) が作る（便の月＝1・4・7・10月。運用ルール確定版 2章）。
+#   旧の固定表（今すぐ／1〜3ヶ月後）は廃止。実際に予約する月は、品ごとの有効期限キャップ
+#   （app_logic.pickup_cap＝選択肢のうち期限の月以下で最も先の便）で頭打ちにする。
+def _pickup_offset_selector(key, ym):
+    """ 受取時期（今すぐ／次の便／その次の便）を選ぶドロップダウンを描き、選ばれたオフセット（月数）を返す。 """
+    opts = app_logic.pickup_options(ym)
+    labels = {o['offset']: o['label'] for o in opts}
+    anytime = yuzu_core.CONFIG.get('anytime_ship_amount', 1500)
     return st.selectbox(
-        '受取時期（いつ引き取るか）', PICKUP_OFFSETS,
-        format_func=lambda o: PICKUP_LABELS[o], key=key,
-        help='いま在庫があって使い切ってから引き取りたいときは、先の月を選べます（最大3ヶ月）。'
-             '有効期限が近い品は、期限の月より先は選べません（自動で早めます）。')
+        '受取時期（いつ引き取るか）', [o['offset'] for o in opts],
+        format_func=lambda o: labels.get(o, str(o)), key=key,
+        help='薬を送るのは3ヶ月に1回のまとめ便（1・4・7・10月の第3週 月〜水）です。'
+             'ふつうは「次の便」を選んでください。'
+             '「今すぐ」＝随時便（1品%s円以上・使用期限まで6ヶ月未満・欠品対応のときだけ）。'
+             '有効期限が近い品は、期限の月より先の便は選べません（自動で早めます）。'
+             % '{:,}'.format(anytime))
 
 
 def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
@@ -1189,7 +1269,7 @@ def receive_section(view_receive, my_store, backend, reservations, ym, msg_by_st
     picked = _selected_rows(event)
     checked = [view_receive[i] for i in picked if 0 <= i < len(view_receive)]
     n = len(checked)
-    offset = _pickup_offset_selector('pickup_offset_receive')
+    offset = _pickup_offset_selector('pickup_offset_receive', ym)
     # ★集計中（1〜10日）は予約ボタンを押せなくする。ボタンは消さず「押せない状態＋理由」で出す
     #   （ボタンごと消すと「予約機能が壊れた」という問い合わせになるため）。
     can_reserve = (sched or {}).get('can_reserve', True)
@@ -1213,9 +1293,10 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
       すでに他店が押さえていた品は保存せず、赤でその品名と店名を知らせる。
       残り（重複していない品）はそのまま保存する＝全部やり直しにはしない。
 
-    ★2026-08-01：受取時期（offset＝今から何ヶ月後に引き取るか・0〜3）を受け取る。
+    ★2026-08-01：受取時期（offset＝今から何ヶ月後に引き取るか）を受け取る。
       品ごとに有効期限キャップ（app_logic.pickup_cap）で頭打ちにしてから受取予定月を決める
       ＝期限の月より先の受け取りは選ばせない（自動で早める）。早めた品は下で知らせる。
+    ★2026-09-18：offset は便の月の選択肢（pickup_options）から来る。頭打ちは便単位で丸める。
     """
     try:
         latest_rows = backend.load_reservations()
@@ -1225,12 +1306,15 @@ def _save_reservations(backend, my_store, ym, checked, reservations, offset=0):
     now = jst.now().strftime('%Y/%m/%d %H:%M')   # 日本時間（UTCずれ対策）
     picked = []
     clamped = []   # 有効期限が近く、受取時期を早めた品（薬品名, 実際の受取ラベル）
+    # ★2026-09-18：受取時期は便の月（app_logic.pickup_options）。有効期限の頭打ちは
+    #   「選択肢のうち期限の月以下で最も先の便」に丸める（resolve_pickup）。保存形式 YYYYMM は不変。
+    options = app_logic.pickup_options(ym)
     for d in checked:
-        cap = app_logic.pickup_cap(d.get('_有効期限', d.get('有効期限', '')), ym)
-        eff_off = max(0, min(int(offset), cap))
+        eff_off, eff_ym = app_logic.resolve_pickup(
+            offset, d.get('_有効期限', d.get('有効期限', '')), ym, options)
         if eff_off < int(offset):
-            clamped.append((d.get('薬品名', ''), yuzu_core.pickup_label(eff_off)))
-        picked.append(dict(d, _now=now, _受取予定月=yuzu_core.ym_add(ym, eff_off)))
+            clamped.append((d.get('薬品名', ''), yuzu_core.pickup_label(eff_off, eff_ym)))
+        picked.append(dict(d, _now=now, _受取予定月=eff_ym))
     plan = app_logic.plan_reservations(latest_rows, my_store, ym, picked)
 
     if clamped:
@@ -1271,14 +1355,14 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_st
     ④の別枠『いまは在庫があるが、先になら引き取れる薬』（③の改修・2026-08-01）。
       ・自店もその薬を使っているが、いま在庫を余らせている品（tier③参考）。今すぐ引き取ると
         移した先で新しいデッドを作りかねないので、本来の④からは外している。
-      ・ここから「1〜3ヶ月後」の受取予定月つきで予約できる（本命の狙い）。
+      ・ここから「次の便（1・4・7・10月）」の受取予定月つきで予約できる（本命の狙い）。
       ・④本体と同じ方式（st.dataframe + 行選択）・同じ2列構成（出し手の出庫可能数＋自店の在庫数）。
         ★本来の④に出る品目は1件も変えない（増えるのはこの別枠だけ）。
     """
     with st.expander('いまは在庫があるが、先になら引き取れる薬（%d件）' % len(view_ref)):
         st.caption('自店もこの薬を使っていますが、いまは在庫を余らせているため、今すぐ引き取ると'
                    'かえって自店で新しいデッドを作りかねない品です。'
-                   'いまの在庫を使い切る先の時期（1〜3ヶ月後）を選んで予約できます。'
+                   'いまの在庫を使い切る先の便（次の便・その次の便）を選んで予約できます。'
                    '数量の相談・連絡は従来どおり電話・デスクネッツでお願いします。')
         if not view_ref:
             st.info('該当する品はありません。')
@@ -1296,7 +1380,7 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_st
         picked = _selected_rows(event)
         checked = [view_ref[i] for i in picked if 0 <= i < len(view_ref)]
         n = len(checked)
-        offset = _pickup_offset_selector('pickup_offset_ref')
+        offset = _pickup_offset_selector('pickup_offset_ref', ym)
         # ★集計中（1〜10日）は予約ボタンを押せなくする（本体の④と同じ扱い）。理由も1行そえる。
         can_reserve = (sched or {}).get('can_reserve', True)
         if st.button('予約する（%d件）' % n, type='primary', key='btn_reserve_ref',
@@ -1308,10 +1392,14 @@ def receive_ref_section(view_ref, my_store, backend, reservations, ym, msg_by_st
 
 
 def reserved_section(view_reserved, my_store, backend, reservations, result, latest,
-                     msg_by_store=None):
+                     msg_by_store=None, box=None):
     """ 「予約中の品」を折りたたみで出し、選んで取り消せるようにする（②③の除外と同じ操作感）。
         ★2026-08-01：一番下に「引取依頼書（出し手店ごとのExcel）」を作るボタンを足した（④の改修）。
-        ★2026-08-10 第2弾：出し手店ごとのやり取り件数を『やり取り』列で出す（会話は⑤で見る）。 """
+        ★2026-08-10 第2弾：出し手店ごとのやり取り件数を『やり取り』列で出す（会話は⑤で見る）。
+        ★2026-09-18 3法人対応：折りたたみの上に「相手店ごとの合計（3,000円ライン）」の表を出す（box＝app_logic.box_totals の戻り）。
+          引取依頼書は _店舗情報（記名欄）と法人名（同一法人の注記・単価・金額）を渡して作る。 """
+    if box:
+        box_totals_table(box.get('receive', []), box.get('box_min', 3000), 'receive')
     with st.expander('予約中の品（%d件）＝自店が引き取ると押さえている薬' % len(view_reserved)):
         if not view_reserved:
             st.write('いまは1件もありません。')
@@ -1350,11 +1438,20 @@ def reserved_section(view_reserved, my_store, backend, reservations, result, lat
         st.divider()
         st.caption('予約した品を、もらう先（出し手店）ごとにまとめた「引取依頼書」をExcelで作れます'
                    '（A4横・出し手店ごとにシート・FAX/デスクネッツ用）。'
-                   '数量は在庫まるごとを初期値にしているので、必要に応じて紙の上で書き換えてください。')
+                   '記名欄（法人名・薬局名・所在地・管理薬剤師名）と単価（薬価・税込）・金額・消費税の合計が入るので、'
+                   '法人をまたぐ分譲では譲渡・譲受の記録と請求明細の元になります（出す店・受け取る店の双方が3年保存）。'
+                   '数量は在庫まるごとを初期値にしているので、必要に応じて「数量」のセルを書き換えてください'
+                   '（金額と合計は自動で計算し直されます）。')
         if st.button('引取依頼書を作成する', key='btn_make_pickup'):
             try:
+                # 記名欄の材料（_店舗情報 タブ）。読めなくても帳票は作る（記名欄が下線になるだけ）。
+                try:
+                    store_info = backend.load_store_info() if hasattr(backend, 'load_store_info') else {}
+                except Exception as e:
+                    show_gsheet_error(e, '店舗情報（記名欄）を読めませんでした。記名欄は空欄で作ります', 'warning')
+                    store_info = {}
                 st.session_state['pickup_xls'] = app_logic.pickup_request_bytes(
-                    result, my_store, reservations, latest)
+                    result, my_store, reservations, latest, store_info, COMPANY_OF)
             except Exception as e:
                 st.session_state.pop('pickup_xls', None)
                 st.warning('引取依頼書の作成に失敗しました：%s' % e)
@@ -1398,7 +1495,7 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
         st.session_state.pop('msg_open_owner', None)   # 持ち主も一緒に捨てる（取り残さない）
         st.session_state.pop('allboard_reply_to', None)   # 開きかけの返信欄も閉じる
         st.rerun()
-    st.caption('ソユーズ・内観堂の全14店へ届く“放送”です。相手を選ばず、'
+    st.caption('3法人（ソユーズ・内観堂・飛鳥）の全%d店へ届く“放送”です。相手を選ばず、' % STORE_COUNT +
                '転院・施設入所などで急に動かなくなった単発のデッド品を、'
                '月初リストや予約を待たずにそのまま全店へ投げられます。投稿は消さずに残ります。'
                '各投稿の［返信］でその投稿にぶら下げて返信でき、返信は元の投稿店にだけ届きます。')
@@ -1547,7 +1644,7 @@ def _allboard_section(my_store, backend, allboard, allboard_reads):
                 st.session_state['allboardver'] = ver + 1     # 入力欄を空に戻す
                 # ★msg_open は触らない＝rerun 後も板が開いたまま（続けて投稿できる）。
                 # メール通知（自店を除く全店へ・即時）。保存後・rerun 前に1回だけ＝二重送信しない。
-                #   宛先には STORE_NAMES（全14店）を渡し、notify_allboard が自店を除く。
+                #   宛先には STORE_NAMES（全36店）を渡し、notify_allboard が自店を除く。
                 #   失敗しても投稿は保存済み＝止めない（結果の案内は _flash で rerun 後に出す）。
                 _mail_flush(mailer.notify_allboard(
                     _mail_secrets(), my_store, text, STORE_NAMES))
@@ -1698,7 +1795,16 @@ def message_section(my_store, backend, threads, msg_reads, allboard, allboard_re
         h3.markdown('**予約中**')
         h4.markdown('**やり取り**')
         h5.markdown('')
+        # ★2026-09-18 3法人対応：相手店が36店に増えたので、法人（ソユーズ／内観堂／飛鳥）の見出し行を
+        #   入れる（絞り込みは付けない）。並びは店番順のまま＝同じ法人が続けて並ぶので見出しは法人が変わる
+        #   ところにだけ出る。stores_config に無い店名は末尾「その他」に入る。
+        last_corp = None
         for t in threads:
+            corp = COMPANY_OF.get(t['相手店名'], 'その他')
+            if corp != last_corp:
+                st.markdown('<div style="margin-top:0.4rem;color:#0B6455;font-weight:600;">'
+                            '▍%s</div>' % corp, unsafe_allow_html=True)
+                last_corp = corp
             ur = app_logic.unread_count(my_store, t, msg_reads)
             r1, r2, r3, r4, r5 = st.columns([4, 2, 2, 2, 2])
             # 未読があれば相手店名の左に ●（表のときと同じ見せ方）
@@ -1834,7 +1940,7 @@ def excluded_section(my_store, backend, exclusions):
 
 
 def show_upload_status(status, latest):
-    """ 左バーに『いま N/14店 アップ済み』『対象月』『未アップの店』を出す。
+    """ 左バーに『いま N/36店 アップ済み』『対象月』『未アップの店』を出す。
 
         ★2026-08-14（案B）：画面上部の横並びから、左バーの縦並びに変更。
           下へスクロールしても消えないので、他店がそろっているかを見ながら作業できる。
@@ -1847,7 +1953,15 @@ def show_upload_status(status, latest):
         st.caption('対象月：%s' % ym_disp)
         if status['missing']:
             with st.expander('未アップの店（%d店）' % len(status['missing'])):
-                st.write('、'.join(status['missing']))
+                # ★2026-09-18 3法人対応：36店を1行に並べると読めないので、法人ごとに分けて出す。
+                missing = list(status['missing'])
+                for corp in COMPANY_ORDER:
+                    names = [n for n in missing if COMPANY_OF.get(n) == corp]
+                    if names:
+                        st.markdown('**%s**（%d店）：%s' % (corp, len(names), '、'.join(names)))
+                others = [n for n in missing if COMPANY_OF.get(n) not in COMPANY_ORDER]
+                if others:
+                    st.markdown('**その他**：%s' % '、'.join(others))
                 st.caption('全店そろうと、他店の使用実績まで見えてマッチングの精度が上がります。')
         if status['ng']:
             st.warning('様式が他店と違うため計算に入れていない店：' + '、'.join(status['ng']))
@@ -1963,13 +2077,45 @@ def upload_section(backend, index, latest):
           自分がどの店として見ているかが、下へスクロールしても消えないようにするため。 """
     st.caption('① 自店を選ぶ')
 
-    # 店舗名の選択（先頭は「選択してください」。会社名（ソユーズ/内観堂）の付記は無し）
-    options = [SENTINEL_STORE] + STORE_NAMES
+    # ★2026-09-18 3法人対応：店の合言葉で入ったときは、その店に固定する（選び直し不可・?store= も無視）。
+    #   本部用（admin）・共有パスワード（legacy）・開発モード（dev）のときだけ、法人で絞ってから店を選ぶ。
+    auth_store = st.session_state.get('auth_store')
+    if auth_store in STORE_NAMES:
+        my_store = auth_store
+        st.session_state['my_store'] = my_store
+        st.markdown('**%s**（%s）' % (my_store, COMPANY_OF.get(my_store, '')))
+        st.caption('合言葉で確定した店です（店の切り替えはできません）。')
+        _remember_store_in_url(my_store)
+    else:
+        my_store = _select_store_with_company()
+    _render_upload_form_area(backend, my_store, index, latest)
+
+
+def _select_store_with_company():
+    """ 法人（すべて／ソユーズ／内観堂／飛鳥）で絞ってから店を選ぶ（本部用・共有パスワード・開発モード用）。
+        選んだ店を session_state['my_store'] と URL（?store=）に覚えさせ、店名（未選択なら None）を返す。
+        ・36店を1つのドロップダウンに並べると探しにくいので、法人の絞り込みを上に置く。
+        ・?store= の完全一致は従来どおり（法人の絞り込みは、その店の法人に自動で合わせる）。 """
     # 思い出す順番：1) このセッションで選んだ店 → 2) URLの ?store=
     prev = st.session_state.get('my_store')
     if prev not in STORE_NAMES:
         prev = _store_from_query()
-    default_index = options.index(prev) if prev in STORE_NAMES else 0
+
+    corp_options = ['すべて'] + list(COMPANY_ORDER)
+    # 法人の初期値：覚えている店があればその法人、無ければ前回選んだ法人、それも無ければ「すべて」
+    corp_default = st.session_state.get('store_company_filter', 'すべて')
+    if prev in STORE_NAMES:
+        corp_default = COMPANY_OF.get(prev, 'すべて')
+    if corp_default not in corp_options:
+        corp_default = 'すべて'
+    corp = st.selectbox('法人で絞る', corp_options, index=corp_options.index(corp_default),
+                        key='store_company_filter_box')
+    st.session_state['store_company_filter'] = corp
+    names = list(STORE_NAMES) if corp == 'すべて' else list(STORES_BY_COMPANY.get(corp, []))
+
+    # 店舗名の選択（先頭は「選択してください」）
+    options = [SENTINEL_STORE] + names
+    default_index = options.index(prev) if prev in names else 0
 
     # 未選択のときだけ、選択欄の上に赤い注意書きを出す（選んだあとは邪魔なので出さない）。
     #   ★左バーは幅が狭いので、選択済みのときにラベルを重ねて出すのはやめた（2026-08-14）。
@@ -1979,7 +2125,8 @@ def upload_section(backend, index, latest):
         options,
         index=default_index,
         format_func=lambda n: n,
-        label_visibility='collapsed')
+        label_visibility='collapsed',
+        key='store_select_%s' % corp)   # 法人を変えたら選択欄を作り直す（前の法人の選択を引きずらない）
 
     if choice in STORE_NAMES:
         my_store = choice
@@ -1990,6 +2137,11 @@ def upload_section(backend, index, latest):
         my_store = None
         st.session_state['my_store'] = None
     _remember_store_in_url(my_store)
+    return my_store
+
+
+def _render_upload_form_area(backend, my_store, index, latest):
+    """ 選んだ店の「当月ぶんアップ済みか」を出し、アップロード欄（折りたたみ）を描く。upload_section の後半。 """
 
     # ------------------------------------------------------------------
     # 選んだ店の「当月ぶんアップ済みか」を出し、アップロード欄の開き方を決める
@@ -2138,7 +2290,7 @@ def results_section(backend, stores, latest, index):
                 'いまのうちに自店のデッド確認・除外・出庫可能数の調整をしてください。'
                 % (status['n'], STORE_COUNT, sched['open_day']))
 
-    # 現在の状況（N/14店・対象月・未アップの店）は左バーへ描く（2026-08-14・案B）。
+    # 現在の状況（N/36店・対象月・未アップの店）は左バーへ描く（2026-08-14・案B）。
     #   ★サイドバーはスクリプトのどこから書いても左バーに出るので、
     #     ここで呼んでも並び順は「店舗選択 → 状況 → ②③④⑤」になる。
     show_upload_status(status, latest)
@@ -2251,6 +2403,8 @@ def results_section(backend, stores, latest, index):
             view_receive_ref = app_logic.build_view_receive_ref(result, my_store)
             # 自店が押さえている品（予約中）。④の下に折りたたみで出し、ここから取り消せる。
             view_reserved = app_logic.build_view_reserved(result, my_store, reservations, latest)
+            # 相手店ごとの予約合計と3,000円ライン（②＝出す側／④＝引き取る側の両方で使う・2026-09-18）
+            box = app_logic.box_totals(result, my_store, reservations, latest)
 
             # この店で現在『出庫可能数』の指定が入っている件数（②③の一括取消ボタン用）。
             #   supply_rows は apply_supply_cap 後でも行数は変わらない＝取り消す件数と一致する。
@@ -2320,6 +2474,8 @@ def results_section(backend, stores, latest, index):
                 st.caption(cap)
                 supply_editor(view_a, my_store, backend, exclusions, table_key='dead',
                               n_supply_specified=n_supply_mine, msg_by_store=msg_by_store)
+                # 出し手視点：自店の品を予約している店ごとの合計（自店から出す箱の中身・3,000円ライン）
+                box_totals_table(box.get('supply', []), box.get('box_min', 3000), 'supply')
                 excluded_section(my_store, backend, exclusions)
 
             elif chosen == VIEW_EXPIRY:
@@ -2345,7 +2501,7 @@ def results_section(backend, stores, latest, index):
                                     msg_by_store=msg_by_store, sched=sched)
                 # さらに下に「予約中の品」＋引取依頼書ボタン（④の改修）
                 reserved_section(view_reserved, my_store, backend, reservations, result, latest,
-                                 msg_by_store=msg_by_store)
+                                 msg_by_store=msg_by_store, box=box)
 
             else:
                 # ---- ⑤ 店舗間のやり取り（掲示板）＝第2弾 ----
@@ -2386,6 +2542,9 @@ def main():
     #   「自分がどの店として見ているか」「他店がそろっているか」を見失わない。
     with st.sidebar:
         st.markdown('### 💊 デッドストック')
+        # 本部用の合言葉で入っているときは、それが分かるように1行出す（店の合言葉なら何も出さない）
+        if st.session_state.get('auth_mode') == 'admin':
+            st.caption('本部モード（36店を自由に切り替えできます）'.replace('36', str(STORE_COUNT)))
 
     if not gsheet_configured():
         st.warning('（開発モード）Googleシート未接続のため、このブラウザのセッションにだけ保存します。'
