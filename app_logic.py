@@ -431,25 +431,95 @@ def _reservation_active(r, ym):
 
 def _pickup_display(eff_ym, ym):
     """ 受取予定月(YYYYMM)を画面・帳票に出す読みやすい文字列にする。
-        当月と同じ（またはどちらか空）なら『今すぐ』、先なら『YYYY/MM（Nヶ月後）』。 """
+        当月と同じ（またはどちらか空）なら『今すぐ』。
+        先の月で、それが便の月（1・4・7・10月）なら『2027年1月便』（2026-09-18・3法人対応）。
+        それ以外の先の月（旧方式＝1〜3ヶ月後で入れた既存の予約）は従来どおり『YYYY/MM（Nヶ月後）』
+        ＝保存形式（YYYYMM）を変えていないので、既存の予約はそのまま有効で、表示だけ月で出る。 """
     if not eff_ym or not ym:
         return '今すぐ'
     off = yuzu_core.ym_offset(ym, eff_ym)
     if off <= 0:
         return '今すぐ'
+    if yuzu_core.is_bin_ym(eff_ym):
+        return yuzu_core.bin_label(eff_ym)
     return '%s/%s（%dヶ月後）' % (eff_ym[:4], eff_ym[4:6], off)
 
 
-def pickup_cap(expiry_str, ym):
-    """ 受取予定月の上限オフセット（今から何ヶ月後まで選べるか、0〜3）を返す純関数。
+# ============================================================================
+# 受取時期の選択肢＝「今すぐ（随時便）」＋次のまとめ便＋その次のまとめ便（2026-09-18・3法人対応）
+#   運用ルール確定版 2章：薬を送るのは 1・4・7・10月 の第3週（月〜水）。予約するときは
+#   「次のまとめ便の月」を受取時期に選ぶだけ。随時便（1品1,500円以上・期限6ヶ月未満・欠品対応）は
+#   これまでどおり「今すぐ」。
+#   ★選択肢は当月 ym から純関数で作る（テストから任意の月を流し込める）。
+#   ★保存形式は変えない＝選んだ選択肢の 'ym'（YYYYMM）をそのまま _予約 タブの受取予定月に入れる。
+# ============================================================================
+def pickup_options(ym):
+    """ 当月 ym（'YYYYMM'）に対する受取時期の選択肢を返す純関数。
+        戻り値：[{'offset': 今から何ヶ月後, 'ym': 受取予定月(YYYYMM), 'label': 画面の文言, 'is_bin': 便の月か}, ...]
+          ・先頭は必ず offset=0（今すぐ）。
+          ・当月が便の月でなければ … [今すぐ, 次の便, その次の便]（例 202611 → 今すぐ／2027年1月便（2ヶ月後）／2027年4月便（5ヶ月後））
+          ・当月が便の月なら     … 「今すぐ」と「今月の便」を1つに統合し、その次の便を1つ
+                                  （例 202701 → 今すぐ／2027年1月便（今月・18〜20日発送）, 2027年4月便（3ヶ月後））
+        ym が読めないときは [今すぐ] だけを返す（画面が落ちないように）。 """
+    try:
+        y, m = int(str(ym)[:4]), int(str(ym)[4:6])
+        if not (1 <= m <= 12):
+            raise ValueError
+    except (ValueError, TypeError):
+        return [{'offset': 0, 'ym': str(ym or ''), 'label': '今すぐ（随時便）', 'is_bin': False}]
+
+    out = []
+    if m in yuzu_core.BIN_MONTHS:
+        mon, wed = yuzu_core.bin_ship_days(ym)
+        out.append({'offset': 0, 'ym': str(ym),
+                    'label': '今すぐ／%s（今月・%d〜%d日発送）' % (yuzu_core.bin_label(ym), mon, wed),
+                    'is_bin': True})
+        need = 1          # 今月の便に統合したので、次の便を1つだけ足す
+    else:
+        out.append({'offset': 0, 'ym': str(ym), 'label': '今すぐ（随時便）', 'is_bin': False})
+        need = 2          # 次の便＋その次の便
+    off = 1
+    while need > 0:
+        cand = yuzu_core.ym_add(ym, off)
+        if yuzu_core.is_bin_ym(cand):
+            out.append({'offset': off, 'ym': cand,
+                        'label': '%s（%dヶ月後）' % (yuzu_core.bin_label(cand), off),
+                        'is_bin': True})
+            need -= 1
+        off += 1
+    return out
+
+
+def pickup_cap(expiry_str, ym, options=None):
+    """ その品で選べる受取時期の上限オフセット（今から何ヶ月後まで）を返す純関数。
         ★有効期限のある品は、その期限の月より先の受取予定月を選ばせない
           （期限切れ後に受け取っても使えず、その間ほかの店も引き取れなくなるため）。
-        ★有効期限が空の品は3ヶ月後まで選べる（最大3ヶ月・本間部長確定）。
+        ★2026-09-18（3法人対応）：上限は「選択肢（pickup_options）のうち、期限の月以下で最も先の便」に
+          丸める。期限の月以下の便が1つも無ければ 0（今すぐ）。有効期限が空の品は選択肢の最も先の便。
+          例：当月202611・有効期限2027/02/28 → 選択肢[0,2,5] のうち 3以下の最大＝2（2027年1月便）
+              当月202611・有効期限2026/12/31 → 1以下の最大＝0（今すぐ）
+          options … pickup_options(ym) の戻り（省略時はここで作る）。
           expiry_str … 'YYYY/MM/DD' などの日付文字列（④の行の『有効期限』）。 """
+    opts = options if options is not None else pickup_options(ym)
+    offsets = sorted({int(o.get('offset', 0)) for o in opts} | {0})
     d = yuzu_core.parse_date(expiry_str)
     if d is None:
-        return 3
-    return max(0, min(3, yuzu_core.ym_offset(ym, d.strftime('%Y%m'))))
+        return offsets[-1]
+    raw_cap = yuzu_core.ym_offset(ym, d.strftime('%Y%m'))
+    allowed = [o for o in offsets if o <= raw_cap]
+    return max(allowed) if allowed else 0
+
+
+def resolve_pickup(offset, expiry_str, ym, options=None):
+    """ 画面で選んだ受取時期 offset を、その品の有効期限で頭打ちにして (実際のoffset, 受取予定月YYYYMM) を返す。
+        _save_reservations が品ごとに呼ぶ。頭打ちで早まったかは 実際のoffset < offset で分かる。 """
+    try:
+        offset = int(offset)
+    except (ValueError, TypeError):
+        offset = 0
+    cap = pickup_cap(expiry_str, ym, options)
+    eff = max(0, min(offset, cap))
+    return eff, yuzu_core.ym_add(ym, eff)
 
 
 def reservation_map(reservations, ym):
@@ -472,7 +542,9 @@ def reservation_map(reservations, ym):
         eff = _reservation_effective_ym(r)
         offset = yuzu_core.ym_offset(ym, eff) if (ym and eff) else 0
         out[k] = {'店': r.get('予約した店', ''), '日時': r.get('予約日時', ''),
-                  '受取予定月': eff, '受取ラベル': yuzu_core.pickup_label(offset)}
+                  '受取予定月': eff,
+                  # 受取ラベル：便の月なら『2027年1月便』、旧方式の月なら『Nヶ月後』、当月なら『今すぐ』
+                  '受取ラベル': yuzu_core.pickup_label(offset, eff)}
     return out
 
 
@@ -603,6 +675,121 @@ def build_view_reserved(result, store_name, reservations, ym):
 
 
 # ============================================================================
+# 合言葉の判定（2026-09-18 3法人対応：店ごとの合言葉＋本部用＋後方互換の共有パスワード）
+#   ★合言葉の値はここにもテストにも書かない。値は Streamlit Cloud の Secrets 画面にだけ入れる。
+# ============================================================================
+def evaluate_password(pw, store_passwords, admin_password, app_password, store_names):
+    """ 入力された合言葉を判定する純関数（画面部品に依存しない＝テスト可能・2026-09-18 3法人対応）。
+          store_passwords … {店名: 合言葉}（Secrets の [store_passwords]。無ければ None）
+          admin_password  … 本部用の合言葉（無ければ ''）
+          app_password    … 旧・共有パスワード（後方互換。[store_passwords] が無いときだけ見る）
+          store_names     … 店舗マスタ（stores_config.STORE_NAMES）。合言葉に対応する店がここに無ければ拒否
+        戻り値の辞書：
+          {'ok': True/False,
+           'mode': 'admin'（本部・自由切替）／'store'（店に固定）／'legacy'（共有パスワード）／'dev'（未設定）／'',
+           'store': 確定した店名（mode='store' のときだけ）,
+           'error': 画面に出す文言（ok=False のとき）}
+        判定の順：本部用 → 店ごと → （[store_passwords] が無いときだけ）共有 → どれも未設定なら開発モード。 """
+    pw = str(pw or '')
+    admin = str(admin_password or '').strip()
+    sp = store_passwords or None
+    legacy = str(app_password or '').strip()
+
+    if admin and pw == admin:
+        return {'ok': True, 'mode': 'admin', 'store': None, 'error': ''}
+    if sp:
+        if not pw:
+            return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉を入れてください。'}
+        matched = [s for s, v in sp.items() if v and v == pw]
+        if len(matched) >= 2:
+            return {'ok': False, 'mode': '', 'store': None,
+                    'error': '同じ合言葉が複数の店に登録されています。管理本部に連絡し、設定を確認してください。'}
+        if len(matched) == 1:
+            store = matched[0]
+            if store not in (store_names or []):
+                return {'ok': False, 'mode': '', 'store': None,
+                        'error': '合言葉に対応する店（%s）が店舗マスタにありません。管理本部に連絡し、設定を確認してください。' % store}
+            return {'ok': True, 'mode': 'store', 'store': store, 'error': ''}
+        return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉が違います。'}
+    if legacy:
+        if pw == legacy:
+            return {'ok': True, 'mode': 'legacy', 'store': None, 'error': ''}
+        return {'ok': False, 'mode': '', 'store': None, 'error': 'パスワードが違います。'}
+    if admin:
+        # 本部用だけが設定されている（店ごとも共有も無い）＝本部用以外では入れない
+        return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉が違います。'}
+    # 何も設定されていない（ローカル検証・開発モード）
+    return {'ok': True, 'mode': 'dev', 'store': None, 'error': ''}
+
+
+
+# ============================================================================
+# 相手店ごとの合計と「まとめ便の3,000円ライン」（2026-09-18・3法人対応／運用ルール確定版 1章-4・6-2 推奨）
+#   箱を送るのは「同じ相手店への予約合計が 3,000円以上」のとき（手渡しなら不要）。
+#   ★予約は止めない。到達／未達（あと○円）を表で見せるだけ。しきい値は yuzu_core.CONFIG['box_min_amount']。
+#   ・受け手視点（④）… 自店が予約している品を、出し手店ごとに合計（＝自店へ届く箱ごとの中身）
+#   ・出し手視点（②）… 自店の品を予約している店ごとに合計（＝自店から出す箱ごとの中身）
+#   金額＝提案行の『在庫金額』（出せる数×薬価＝実効金額）。出し手の一覧から外れた品は金額が分からないので
+#   合計に入れず『金額不明』の件数として別に数える（黙って0円にしない）。
+# ============================================================================
+def box_totals(result, store, reservations, ym, box_min=None):
+    """ 相手店ごとの予約合計と3,000円ラインの到達状況を返す純関数。
+          result       … compute_matching の戻り（proposal_rows を使う）
+          store        … 自店名
+          reservations … _予約 の行リスト（有効判定は _reservation_active に一本化）
+          ym           … 当月 'YYYYMM'
+          box_min      … 箱の下限（省略時 CONFIG['box_min_amount']＝3,000円）
+        戻り値：
+          {'box_min': 3000,
+           'receive': [{'相手店': 出し手店, '件数': n, '合計': 円, '金額不明': k, '到達': bool, 'あと': 円}, ...],
+           'supply':  [{'相手店': 予約した店, '件数': n, '合計': 円, '金額不明': k, '到達': bool, 'あと': 円}, ...]}
+        並びは合計の大きい順→相手店名。 """
+    if box_min is None:
+        box_min = yuzu_core.CONFIG.get('box_min_amount', 3000)
+    by_key = {(r['出し手店'], r['_ex_key']): r for r in (result or {}).get('proposal_rows', [])}
+    my = str(store or '').strip()
+
+    def _bucket(d, other):
+        return d.setdefault(other, {'相手店': other, '件数': 0, '合計': 0.0, '金額不明': 0})
+
+    recv, supp = {}, {}
+    for rv in (reservations or []):
+        if not _reservation_active(rv, ym):
+            continue
+        taker = str(rv.get('予約した店', '') or '').strip()
+        supplier = str(rv.get('出し手店', '') or '').strip()
+        if not taker or not supplier:
+            continue
+        if taker != my and supplier != my:
+            continue
+        pr = by_key.get((supplier, str(rv.get('予約キー', '') or '').strip()))
+        amt = None
+        if pr is not None:
+            try:
+                amt = float(pr.get('在庫金額', 0) or 0)
+            except (TypeError, ValueError):
+                amt = None
+        target = _bucket(recv, supplier) if taker == my else _bucket(supp, taker)
+        target['件数'] += 1
+        if amt is None:
+            target['金額不明'] += 1
+        else:
+            target['合計'] += amt
+
+    def _finish(d):
+        out = []
+        for b in d.values():
+            b['合計'] = round(b['合計'], 2)
+            b['到達'] = b['合計'] >= box_min
+            b['あと'] = 0.0 if b['到達'] else round(box_min - b['合計'], 2)
+            out.append(b)
+        out.sort(key=lambda b: (-b['合計'], b['相手店']))
+        return out
+
+    return {'box_min': box_min, 'receive': _finish(recv), 'supply': _finish(supp)}
+
+
+# ============================================================================
 # 出せる数（提供数量）… 出し手の店が「この品はN錠だけ出す」と決めた数量
 #   2026-08-10 追加（第1弾）。保管庫の _提供数量 タブ（辞書のリスト）と、
 #   compute_matching が欲しい形（辞書）を橋渡しする。品目キーは exclusion_key（除外・予約と同一）。
@@ -729,28 +916,41 @@ def plan_supply_qty(current_rows, my_store, picked):
 #   ・build_view_reserved 自体は帳票のために作り替えない（同じ値を2箇所で作らない原則）。
 #     ロットNO は build_view_reserved が返さないので、出し手の提案行から引き当てて借りる。
 # ============================================================================
-def build_pickup_request(result, my_store, reservations, ym):
+def build_pickup_request(result, my_store, reservations, ym, store_info=None, company_of=None):
     """
     引取依頼書のデータを組み立てる純関数（Excel化は yuzu_core.write_pickup_request_excel が担当）。
 
+      store_info … {店名: {'法人名','薬局名（正式）','所在地','管理薬剤師名'}}（保管庫の _店舗情報 タブ。
+                   無い店は空欄＝帳票では下線になる）。省略可。
+      company_of … {店名: 法人名}（stores_config.COMPANY_OF）。省略時は法人名を空で扱う。
+
       戻り値：
         {'my_store': 自店名, 'ym': 'YYYYMM',
-         'sheets': [{'出し手店': 店名,
+         'sheets': [{'出し手店': 店名, '出し手法人': 法人名, '受け手法人': 法人名, '同一法人': bool,
+                     '出し手情報': {...}, '受け手情報': {...}, '便': '2027年1月便' など,
                      'rows': [{'薬品名','単位','数量','有効期限','ロットNO','医薬品CD',
-                               '受取予定月','区分','状態','_期限強調','_受取予定月'}, ...]}, ...]}
+                               '受取予定月','区分','単価（薬価・税込）','金額（税込）','状態',
+                               '_期限強調','_受取予定月'}, ...]}, ...]}
 
       ・対象＝自店が予約している品のうち有効期間内（受取予定月をまだ過ぎていない）もの
         ＝build_view_reserved の戻りそのもの（有効判定はあちらに一本化済み）。
       ・数量＝在庫まるごと（出し手の在庫数＝提案行の在庫数）を初期値。手で書き換える前提。
-      ・ロットNO＝build_view_reserved は返さないので、出し手の提案行から (出し手店, 品目キー) で引き当てる。
+      ・ロットNO・薬価＝build_view_reserved は返さないので、出し手の提案行から (出し手店, 品目キー) で引き当てる。
       ・『出し手の一覧から外れました（要確認）』の品も黙って落とさず載せる
-        （数量・ロットNO・有効期限は空欄、状態欄に明記）。このツールの一貫原則。
+        （数量・ロットNO・有効期限・単価・金額は空欄、状態欄に明記）。このツールの一貫原則。
       ・受取予定月は1枚のシートの中に列で出し、近い順（同月内は薬品名順）に並べる。
+      ・★2026-09-18（3法人対応）：法人名・単価（薬価・税込）・金額（税込）・記名欄の材料を足した。
+        法人をまたぐ分譲ではこの紙が譲渡・譲受記録と請求明細の元になる（運用ルール確定版 4-4）。
+        金額（税込）はここでは数値（単価×数量）で持つ。Excel では式にする（yuzu_core 側）。
     """
+    store_info = store_info or {}
+    company_of = company_of or {}
     reserved = build_view_reserved(result, my_store, reservations, ym)
-    # ロットNO を出し手の提案行から借りる（同じ値を2箇所で作らない）。掲載が外れた品はキーが無い＝空。
+    # ロットNO・薬価を出し手の提案行から借りる（同じ値を2箇所で作らない）。掲載が外れた品はキーが無い＝空。
     lot_by_key = {(r['出し手店'], r['_ex_key']): r.get('ロットNO', '')
                   for r in result.get('proposal_rows', [])}
+    price_by_key = {(r['出し手店'], r['_ex_key']): r.get('薬価', 0.0)
+                    for r in result.get('proposal_rows', [])}
     # 有効期限が近い品を帳票で太字強調するための基準日（当月1日）。ym から作る。
     base_date = None
     if ym and len(str(ym)) >= 6:
@@ -762,11 +962,22 @@ def build_pickup_request(result, my_store, reservations, ym):
     by_store = {}
     for rv in reserved:
         listed = (rv.get('状態') == '出し手が掲載中')
-        lot = lot_by_key.get((rv['_出し手店'], rv['_key']), '') if listed else ''
+        k = (rv['_出し手店'], rv['_key'])
+        lot = lot_by_key.get(k, '') if listed else ''
         # 期限強調：有効期限があり、当月から expiry_yellow_months（既定12ヶ月）以内なら太字にする
         exp_d = yuzu_core.parse_date(rv.get('有効期限', ''))
         near = bool(exp_d and base_date
                     and yuzu_core.month_diff(base_date, exp_d) <= yuzu_core.CONFIG['expiry_yellow_months'])
+        # 単価（薬価・税込）と金額（税込）。掲載が外れた品は空欄（数量も空なので計算できない）。
+        price = ''
+        amount = ''
+        if listed:
+            try:
+                price = float(price_by_key.get(k, 0.0) or 0.0)
+                qty = float(str(rv.get('在庫数', '') or 0).replace(',', '') or 0)
+                amount = round(price * qty, 2)
+            except (TypeError, ValueError):
+                price, amount = '', ''
         detail = {
             '薬品名': rv.get('薬品名', ''),
             '単位': rv.get('単位', ''),
@@ -776,24 +987,48 @@ def build_pickup_request(result, my_store, reservations, ym):
             '医薬品CD': rv.get('医薬品CD', ''),
             '受取予定月': rv.get('受取予定月', ''),
             '区分': rv.get('区分', ''),
+            '単価（薬価・税込）': price,
+            '金額（税込）': amount,
             '状態': rv.get('状態', ''),
             '_期限強調': near,
             '_受取予定月': rv.get('_受取予定月', ''),   # 並べ替え用の生値（YYYYMM）
         }
         by_store.setdefault(rv['出し手店'], []).append(detail)
 
+    my_corp = str(company_of.get(my_store, '') or '')
     sheets = []
     for store in sorted(by_store.keys()):
         rows = by_store[store]
         # 受取予定月の近い順（空＝末尾）→ 同月内は薬品名順
         rows.sort(key=lambda d: (d.get('_受取予定月', '') or '999999', d.get('薬品名', '')))
-        sheets.append({'出し手店': store, 'rows': rows})
+        # 便の表示：このシートの品の受取予定月のうち便の月のもの（重複除去・近い順）。無ければ随時便。
+        bins = []
+        for d in rows:
+            lab = yuzu_core.bin_label(d.get('_受取予定月', ''))
+            if lab and lab not in bins:
+                bins.append(lab)
+        if bins:
+            bin_disp = '／'.join(bins)
+        elif any(d.get('受取予定月', '') == '今すぐ' for d in rows):
+            bin_disp = '随時便（今すぐ）'
+        else:
+            bin_disp = ''
+        sup_corp = str(company_of.get(store, '') or '')
+        sheets.append({
+            '出し手店': store,
+            '出し手法人': sup_corp, '受け手法人': my_corp,
+            '同一法人': bool(sup_corp) and (sup_corp == my_corp),
+            '出し手情報': dict(store_info.get(store, {}) or {}),
+            '受け手情報': dict(store_info.get(my_store, {}) or {}),
+            '便': bin_disp,
+            'rows': rows,
+        })
     return {'my_store': my_store, 'ym': ym or '', 'sheets': sheets}
 
 
-def pickup_request_bytes(result, my_store, reservations, ym):
+def pickup_request_bytes(result, my_store, reservations, ym, store_info=None, company_of=None):
     """ 引取依頼書を Excel にして bytes で返す（画面のダウンロードボタン用）。 """
-    data = build_pickup_request(result, my_store, reservations, ym)
+    data = build_pickup_request(result, my_store, reservations, ym, store_info, company_of)
     bio = io.BytesIO()
     yuzu_core.write_pickup_request_excel(bio, data)
     bio.seek(0)
@@ -1263,6 +1498,7 @@ class LocalBackend:
         state.setdefault('msg_reads', [])    # どの店がどのスレッドをいつまで読んだか（未読判定用）
         state.setdefault('allboard', [])     # 全店へのお知らせ板（放送）＝1件1投稿（第3弾）
         state.setdefault('allboard_reads', [])  # どの店が全店板をいつまで読んだか（未読判定用）
+        state.setdefault('store_info', {})    # 店舗情報（法人名・薬局名・所在地・管理薬剤師名）＝引取依頼書の記名欄用
         self.state = state
 
     # --- gsheet_store と同じメソッド名・戻り値でそろえる ---
@@ -1381,3 +1617,10 @@ class LocalBackend:
     def save_allboard_reads(self, rows):
         """ 全店板の既読リストを丸ごと入れ替える（Gシート版 write_allboard_reads と同じ挙動）。 """
         self.state['allboard_reads'] = list(rows)
+
+    def load_store_info(self):
+        """ 店舗情報（引取依頼書の記名欄＝法人名・薬局名（正式）・所在地・管理薬剤師名）を返す
+            （Gシート版 read_store_info と同じ形 {店名: {...}}）。
+            ローカル保管庫は検証用なので既定は空＝帳票の記名欄は下線になる。
+            テストから state['store_info'] に入れれば、記名欄の挙動を確かめられる。 """
+        return {k: dict(v) for k, v in (self.state.get('store_info') or {}).items()}
