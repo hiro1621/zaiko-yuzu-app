@@ -14,7 +14,7 @@ streamlit_app.py から1回だけ呼ばれます（メールはあくまで“�
 【送信のしくみ】
   ・カゴヤの送信サーバー（smtp.kagoya.net）を使います（Microsoft 365 ではありません）。
     ポート465はSSL、それ以外（587など）はSTARTTLS。実装は
-    「技術料データ作成Webアプリ\backend\mailer.py」の書き方を写経しています
+    「技術料データ作成Webアプリ\\backend\\mailer.py」の書き方を写経しています
     （標準ライブラリ smtplib / email / ssl だけ・追加の pip install は不要）。
   ・設定は Streamlit の Secrets から読みます（★リポジトリがPublicなので、
     メールアドレス・パスワード・URLはコードに一切書きません。下は“書き方の見本”で、
@@ -30,11 +30,22 @@ streamlit_app.py から1回だけ呼ばれます（メールはあくまで“�
 
         [store_emails]
         "＜店名＞" = "＜その店のメールアドレス＞"
-        …（14店分）
+        …（36店分。無い店には送らず「宛先未登録」として知らせる）
   ・[smtp] が無ければ送信を黙ってスキップし、画面に「メール通知は未設定です。」を1行だけ出します。
-  ・宛先が [store_emails] に無い店はスキップし、店名を画面に出して知らせます（黙って捨てません）。
+  ・宛先が [store_emails] に無い店はスキップして知らせます（黙って捨てません）。
+      1対1・予約の通知 … 店名を出して「○○には通知できませんでした」。
+      全店板（放送）   … 店名を全部並べず「宛先未登録：N店（ソユーズ○・内観堂○・飛鳥○）」に要約
+                         （飛鳥22店の宛先がそろうまで22店ぶんの店名が毎回並ぶのを避ける・2026-09-18）。
   ・送信に失敗しても投稿・予約は残し、警告（黄色）だけ出します（画面は止めません）。
   ・タイムアウト（既定15秒）を入れ、メール送信で画面が固まらないようにします。
+
+【2026-09-18 3法人対応（36店）での送り方】
+  ・SMTP（メール送信サーバー）へは【1回だけ】つないでログインし、その接続で複数通を順に送ります
+    （以前は1通ごとに接続し直していた。全店板は35通になるので、接続のやり直しをなくす）。
+  ・全店板は1通8秒の上限に加えて【全体の予算（既定60秒）】を持ち、超えたら残りは送らず
+    「○通は送れませんでした」と1行で知らせます（投稿は保存済み＝止めない）。
+  ・カゴヤの送信上限（1時間あたりの通数など）は公開文書に数値が無いため、実測は本間部長が
+    検証用アプリで行います（手順書「検証用アプリ登録手順」参照）。
 
 【画面（Streamlit）との切り分け】
   ・このモジュールは Streamlit を import しません（品質管理部が単体テストしやすいように）。
@@ -46,20 +57,31 @@ streamlit_app.py から1回だけ呼ばれます（メールはあくまで“�
 ※ venv不要。Windows専用パス。コメント・メッセージはすべて日本語です。
 """
 import ssl
+import time
 import smtplib
 from urllib.parse import quote
 from email.message import EmailMessage
 from email.utils import formataddr
 
+# 宛先未登録の要約（法人ごとの店数）に使う。stores_config は他のファイルに依存しないので安全に読める。
+try:
+    from stores_config import COMPANY_OF, COMPANY_ORDER
+except Exception:   # 単体テストなどで stores_config が無くても mailer 自体は動く
+    COMPANY_OF, COMPANY_ORDER = {}, []
+
 # 差出人の表示名（例：デッドストックリスト <差出人アドレス>）
 FROM_DISPLAY_NAME = 'デッドストックリスト'
 # メール送信のタイムアウト（秒）。メールで画面を固めないための保険。
 _DEFAULT_TIMEOUT = 15
-# 全店板（放送）だけのタイムアウト（秒）。宛先が最大13店と多いので短めにする。
-#   既定15秒×13通だと、1店ずつ順に送るため最悪3分超も待たされる。
+# 全店板（放送）だけのタイムアウト（秒）。宛先が最大35店と多いので短めにする。
+#   既定15秒×35通だと、1店ずつ順に送るため最悪8分超も待たされる。
 #   全店板は「配れた分だけ配って先へ進む」割り切りで8秒に縮める（本間部長確定・第3弾）。
 #   ★1対1・予約通知は _DEFAULT_TIMEOUT（15秒）のまま。この定数は全店板だけで使う。
 _ALLBOARD_TIMEOUT = 8
+# 全店板（放送）の【全体予算】（秒）。35通ぶんの合計でこれを超えたら残りは送らずに知らせる（2026-09-18）。
+#   1通8秒×35通＝最悪280秒では画面が固まったように見えるため、全体で60秒を上限にする。
+#   ★1対1・予約通知には予算を付けない（宛先が1〜数店なので不要）。
+_ALLBOARD_BUDGET = 60
 # 本文に載せるメッセージ冒頭の文字数（★中身の全文は載せない＝在庫情報を社外へ撒かないため）
 _EXCERPT_LEN = 100
 
@@ -250,93 +272,187 @@ def build_notification(kind, actor_store, recipient_store, drugs, body_excerpt, 
 # ============================================================================
 # 送信（カゴヤSMTP）… backend\mailer.py の send_report_mail を写経
 # ============================================================================
-def send_mail(smtp_conf, to_addr, subject, body, timeout=_DEFAULT_TIMEOUT):
-    """ メールを1通送る。ポート465はSSL(SMTPS)、それ以外（587など）はSTARTTLS。
-        件名・本文（日本語）のエンコードは EmailMessage が自動で行う。
-        失敗時は日本語の RuntimeError を送出する（呼び出し側で握って画面に警告表示）。 """
+def _build_message(smtp_conf, to_addr, subject, body):
+    """ 1通ぶんの EmailMessage を組み立てる（差出人の表示名つき）。 """
+    msg = EmailMessage()
+    # 差出人の表示名を付ける（例：デッドストックリスト <差出人アドレス>）。
+    msg['From'] = formataddr((FROM_DISPLAY_NAME, smtp_conf['from']))
+    msg['To'] = to_addr
+    msg['Subject'] = subject
+    msg.set_content(body)
+    return msg
+
+
+def open_smtp(smtp_conf, timeout=_DEFAULT_TIMEOUT):
+    """ SMTP（メール送信サーバー）へつないでログインした接続オブジェクトを返す。
+        ポート465はSSL(SMTPS)、それ以外（587など）はSTARTTLS。
+        ★呼び出し側が必ず quit()（または close()）すること。send_notifications が1回だけ開き、
+          その接続で複数通を送ってから閉じる（2026-09-18・36店対応）。
+        失敗時は日本語の RuntimeError を送出する。 """
     host = smtp_conf['host']
     try:
         port = int(str(smtp_conf.get('port', '587') or '587').strip())
     except ValueError:
         port = 587
-    from_addr = smtp_conf['from']
     user = smtp_conf.get('user') or ''
     password = smtp_conf.get('password') or ''
-
-    msg = EmailMessage()
-    # 差出人の表示名を付ける（例：デッドストックリスト <差出人アドレス>）。
-    msg['From'] = formataddr((FROM_DISPLAY_NAME, from_addr))
-    msg['To'] = to_addr
-    msg['Subject'] = subject
-    msg.set_content(body)
-
     # SSLコンテキスト（既定＝厳密。証明書のCA署名＋ホスト名一致を検証）
     ctx = ssl.create_default_context()
     try:
         if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=timeout, context=ctx) as s:
-                if user and password:
-                    s.login(user, password)
-                s.send_message(msg)
+            s = smtplib.SMTP_SSL(host, port, timeout=timeout, context=ctx)
         else:
-            with smtplib.SMTP(host, port, timeout=timeout) as s:
-                s.ehlo()
-                s.starttls(context=ctx)
-                s.ehlo()
-                if user and password:
-                    s.login(user, password)
-                s.send_message(msg)
+            s = smtplib.SMTP(host, port, timeout=timeout)
+            s.ehlo()
+            s.starttls(context=ctx)
+            s.ehlo()
+        if user and password:
+            s.login(user, password)
+        return s
     except Exception as e:
         # SMTP例外・ネットワーク不通・タイムアウトなどをまとめて日本語で返す
-        raise RuntimeError('メール送信に失敗しました（%s:%d）：%s' % (host, port, e))
+        raise RuntimeError('メール送信サーバーへの接続に失敗しました（%s:%d）：%s' % (host, port, e))
+
+
+def _close_smtp(s):
+    """ 接続を静かに閉じる（閉じ損ねても呼び出し側を止めない）。 """
+    try:
+        s.quit()
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def send_mail(smtp_conf, to_addr, subject, body, timeout=_DEFAULT_TIMEOUT, conn=None):
+    """ メールを1通送る。conn（open_smtp の戻り）を渡せばその接続で送り、渡さなければ
+        この1通のためだけに接続して閉じる（従来どおりの使い方も残す）。
+        失敗時は日本語の RuntimeError を送出する（呼び出し側で握って画面に警告表示）。 """
+    msg = _build_message(smtp_conf, to_addr, subject, body)
+    own = conn is None
+    if own:
+        conn = open_smtp(smtp_conf, timeout=timeout)
+    try:
+        conn.send_message(msg)
+    except Exception as e:
+        host = smtp_conf.get('host', '')
+        raise RuntimeError('メール送信に失敗しました（%s）：%s' % (host, e))
+    finally:
+        if own:
+            _close_smtp(conn)
 
 
 # ============================================================================
 # 通知のまとめ役（画面に出す文言はここで作って“返す”だけ。表示は呼び出し側）
 # ============================================================================
-def send_notifications(secrets, kind, actor_store, targets, timeout=_DEFAULT_TIMEOUT):
+def _unregistered_summary(stores):
+    """ 宛先未登録の店を「宛先未登録：N店（ソユーズ○・内観堂○・飛鳥○）」の1行に要約する（0の法人は省く）。
+        stores_config に無い店名は「その他」にまとめる。 """
+    counts = {}
+    for s in stores:
+        corp = COMPANY_OF.get(s, 'その他')
+        counts[corp] = counts.get(corp, 0) + 1
+    order = list(COMPANY_ORDER) + [c for c in counts if c not in COMPANY_ORDER]
+    parts = ['%s%d' % (c, counts[c]) for c in order if counts.get(c)]
+    return '宛先未登録：%d店（%s）のため、その店へは通知していません（掲示板・予約は保存済みです）。' % (
+        len(stores), '・'.join(parts))
+
+
+def send_notifications(secrets, kind, actor_store, targets, timeout=_DEFAULT_TIMEOUT, budget=None):
     """
     複数の宛先へお知らせメールをまとめて送る。
       secrets … Secrets（st.secrets でも dict でも可）
-      kind    … 'message' / 'reserved' / 'cancelled'
+      kind    … 'message' / 'allboard' / 'allboard_reply' / 'reserved' / 'cancelled'
       actor_store … 動作した店
       targets … [{'store': 宛先店, 'drugs': [薬品名...], 'body_excerpt': 冒頭文字}, ...]
-      timeout … 送信のタイムアウト（秒）
+      timeout … 1通あたり（接続あたり）のタイムアウト（秒）
+      budget  … 全体の予算（秒）。None なら無制限。超えたら残りは送らず「○通は送れませんでした」を返す
     戻り値：
       {'messages': [(レベル, 文言), ...],  # 呼び出し側が画面に出す（'info'/'warning'）
-       'sent':     [送れた宛先アドレス, ...]}
+       'sent':     [送れた宛先アドレス, ...],
+       'skipped':  送れなかった通数（予算切れ・接続失敗ぶん）}
     ※ [smtp] 未設定なら送信せず、'info' の案内1行だけを返す（掲示板・予約は呼び出し側で保存済み）。
+    ★2026-09-18：SMTP へは1回だけつなぎ、その接続で順に送る。1通が失敗しても残りは続ける
+      （接続が切れていたら1回だけつなぎ直す）。
     """
     smtp_conf = get_smtp_config(secrets)
     if smtp_conf is None:
-        return {'messages': [('info', 'メール通知は未設定です。')], 'sent': []}
+        return {'messages': [('info', 'メール通知は未設定です。')], 'sent': [], 'skipped': 0}
 
     app_url = get_app_url(secrets)
     messages = []
     sent = []
+    skipped = 0
+
+    # --- 宛先の下ごしらえ：アドレスを引き、無い店は分けておく ---
+    plan = []          # [(店名, 宛先アドレス, 件名, 本文)]
+    unregistered = []  # 宛先未登録の店名
     for tg in (targets or []):
         store = str((tg or {}).get('store', '') or '').strip()
         if not store:
             continue
         to_addr = get_store_email(secrets, store)
         if not to_addr:
-            messages.append((
-                'warning',
-                'メール通知先が未登録のため、%s には通知できませんでした'
-                '（掲示板・予約は保存済みです）。' % store))
+            unregistered.append(store)
             continue
         link = build_app_link(app_url, store)
         subject, body = build_notification(
             kind, actor_store, store, tg.get('drugs') or [],
             tg.get('body_excerpt', ''), link)
-        try:
-            send_mail(smtp_conf, to_addr, subject, body, timeout=timeout)
-            sent.append(to_addr)
-        except Exception as e:
-            messages.append((
-                'warning',
-                '%s へのメール通知に失敗しました（掲示板・予約は保存済みです）：%s' % (store, e)))
-    return {'messages': messages, 'sent': sent}
+        plan.append((store, to_addr, subject, body))
+
+    if unregistered:
+        if kind in ('allboard',):
+            # 放送は店名を並べず要約（飛鳥22店の宛先がそろうまで、毎回22店名が並ぶのを避ける）
+            messages.append(('warning', _unregistered_summary(unregistered)))
+        else:
+            for store in unregistered:
+                messages.append((
+                    'warning',
+                    'メール通知先が未登録のため、%s には通知できませんでした'
+                    '（掲示板・予約は保存済みです）。' % store))
+
+    if not plan:
+        return {'messages': messages, 'sent': sent, 'skipped': 0}
+
+    # --- 1回だけ接続し、その接続で順に送る ---
+    started = time.monotonic()
+    try:
+        conn = open_smtp(smtp_conf, timeout=timeout)
+    except Exception as e:
+        messages.append(('warning', '%s（掲示板・予約は保存済みです）。%d通は送れませんでした。'
+                         % (e, len(plan))))
+        return {'messages': messages, 'sent': sent, 'skipped': len(plan)}
+    try:
+        for i, (store, to_addr, subject, body) in enumerate(plan):
+            if budget is not None and (time.monotonic() - started) > budget:
+                skipped = len(plan) - i
+                messages.append(('warning',
+                                 'メール通知が時間内に終わらなかったため、%d通は送れませんでした'
+                                 '（掲示板・予約は保存済みです）。' % skipped))
+                break
+            try:
+                send_mail(smtp_conf, to_addr, subject, body, timeout=timeout, conn=conn)
+                sent.append(to_addr)
+            except Exception as e:
+                # 接続が切れていたら1回だけつなぎ直して、その1通をやり直す
+                retried = False
+                try:
+                    _close_smtp(conn)
+                    conn = open_smtp(smtp_conf, timeout=timeout)
+                    send_mail(smtp_conf, to_addr, subject, body, timeout=timeout, conn=conn)
+                    sent.append(to_addr)
+                    retried = True
+                except Exception as e2:
+                    e = e2
+                if not retried:
+                    messages.append((
+                        'warning',
+                        '%s へのメール通知に失敗しました（掲示板・予約は保存済みです）：%s' % (store, e)))
+    finally:
+        _close_smtp(conn)
+    return {'messages': messages, 'sent': sent, 'skipped': skipped}
 
 
 def _group_by_store(rows):
@@ -387,13 +503,14 @@ def notify_cancellation(secrets, actor_store, rows, timeout=_DEFAULT_TIMEOUT):
 
 
 def notify_allboard(secrets, actor_store, body, recipient_stores,
-                    timeout=_ALLBOARD_TIMEOUT):
+                    timeout=_ALLBOARD_TIMEOUT, budget=_ALLBOARD_BUDGET):
     """ 全店へのお知らせ板への投稿を、投稿した自店を除く全店へ即時通知する（放送・第3弾）。
           actor_store     … 投稿した自店
           body            … 投稿本文（メールには冒頭100字だけ載せる＝在庫の詳細は撒かない）
-          recipient_stores … 宛先候補の店名リスト（呼び出し側は全14店＝STORE_NAMES を渡す）
+          recipient_stores … 宛先候補の店名リスト（呼び出し側は全36店＝STORE_NAMES を渡す）
           timeout         … 送信タイムアウト（既定8秒＝全店板だけ短縮。1対1・予約は15秒のまま）
-        この関数は宛先リスト（＝recipient_stores から自店・空・重複を除いた最大13店）を作って
+          budget          … 全体の予算（既定60秒）。超えたら残りは送らず「○通は送れませんでした」（2026-09-18）
+        この関数は宛先リスト（＝recipient_stores から自店・空・重複を除いた最大35店）を作って
         既存の send_notifications を kind='allboard' で呼ぶだけの薄いラッパー。
         送信本体（send_mail）や文面組み立て（build_notification）の仕組みには手を入れない。 """
     excerpt = _excerpt(body)
@@ -409,8 +526,8 @@ def notify_allboard(secrets, actor_store, body, recipient_stores,
         seen.add(name)
         targets.append({'store': name, 'drugs': [], 'body_excerpt': excerpt})
     if not targets:
-        return {'messages': [], 'sent': []}
-    return send_notifications(secrets, 'allboard', actor_store, targets, timeout=timeout)
+        return {'messages': [], 'sent': [], 'skipped': 0}
+    return send_notifications(secrets, 'allboard', actor_store, targets, timeout=timeout, budget=budget)
 
 
 def notify_allboard_reply(secrets, actor_store, parent_store, body,
