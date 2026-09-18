@@ -118,7 +118,23 @@ CONFIG = {
 
     # 融通提案に載せる最低の在庫金額（円）。これ未満の少額品は載せない。
     #   （本間部長判断 2026-07-27：少額品まで並ぶと本当に動かすべき品が埋もれるため）
-    'min_supply_amount': 1500,
+    #   ★2026-09-18 3法人対応（運用ルール確定版 3-4 表）：1,500 → 500 に引き下げ。
+    #     根拠＝「品を箱に入れる価値」＝薬1品の手間283円÷原価率0.89＝318円→余裕をみて500円。
+    #     3ヶ月に1回のまとめ便で送るため、送料と箱の手間は箱1つぶん（下の box_min_amount）で
+    #     別勘定にし、品ごとの下限は「取り出して記録する手間」だけで決める。
+    #     ※画面の文言（②の注記）はこの値から動的に作るので、ここを変えれば追従する。
+    #     ※Excel・Gシート結果タブ・コマンド版（create_yuzu_list.py）にも同じ値が波及する。
+    'min_supply_amount': 500,
+
+    # 随時便（まとめ便を待たずに1品だけ送ってよい）の目安金額（円）。運用ルール確定版 1章-5：
+    #   「①1品で1,500円以上 ②使用期限まで6ヶ月未満 ③相手店が欠品中で急いでいるとき」。
+    #   ★計算（載せる／載せない）には使わない。受取時期の説明文（今すぐ＝随時便）に出すだけ。
+    'anytime_ship_amount': 1500,
+
+    # まとめ便で箱を送る下限（円）＝同じ相手店への予約合計がこの金額以上で箱を送る（確定版 3-4 表）。
+    #   根拠＝（送料719〜935円＋箱の手間708円）÷0.89＝1,604〜1,846円→品数ぶんの余裕を上乗せして3,000円。
+    #   ★予約は止めない（手渡しなら3,000円は不要のため）。画面に「到達／あと○円」を出すだけ。
+    'box_min_amount': 3000,
 
     # 引取候補店の最大表示数（あふれた分は「他N店」と表示）
     'max_candidates': 5,
@@ -247,13 +263,55 @@ def ym_add(base_ym, months):
     return '%04d%02d' % (total // 12, total % 12 + 1)
 
 
-def pickup_label(offset):
-    """ 受取までの月数（0=今すぐ）を画面に出す短い言葉にする。0以下は『今すぐ』、それ以外は『Nヶ月後』。 """
+# --- まとめ便（3ヶ月に1回・1・4・7・10月）の道具（2026-09-18 3法人対応）---
+#   運用ルール確定版 2章：薬を送るのは 1月・4月・7月・10月 の第3週（月〜水）。
+#   受取予定月はこれまでどおり YYYYMM（6桁文字列）で保管し、「便の月かどうか」は表示のときに判定する
+#   ＝保存形式を変えないので、旧方式（今すぐ／1〜3ヶ月後）で入れた既存の予約もそのまま読める。
+BIN_MONTHS = (1, 4, 7, 10)
+
+
+def is_bin_ym(ym):
+    """ 'YYYYMM' が便の月（1・4・7・10月）なら True。読めない値は False。 """
+    try:
+        return int(str(ym)[4:6]) in BIN_MONTHS
+    except (ValueError, TypeError):
+        return False
+
+
+def bin_label(ym):
+    """ 便の月の 'YYYYMM' を『2027年1月便』の形にする。便の月でない・読めない値は '' を返す。 """
+    if not is_bin_ym(ym):
+        return ''
+    return '%s年%d月便' % (str(ym)[:4], int(str(ym)[4:6]))
+
+
+def bin_ship_days(ym):
+    """ 便の月 'YYYYMM' の発送日（第3週の月曜〜水曜）を (月曜の日, 水曜の日) で返す。
+        「第3週の月〜水」＝その月の3番目の月曜日から3日間（確定版 付録B：2027年1月18〜20／4月19〜21／
+        7月19〜21／10月18〜20 と一致）。便の月でない・読めない値は None。 """
+    if not is_bin_ym(ym):
+        return None
+    y, m = int(str(ym)[:4]), int(str(ym)[4:6])
+    first = datetime.date(y, m, 1)
+    first_monday = 1 + ((0 - first.weekday()) % 7)   # weekday(): 月曜=0
+    mon = first_monday + 14
+    return mon, mon + 2
+
+
+def pickup_label(offset, target_ym=None):
+    """ 受取までの月数（0=今すぐ）を画面に出す短い言葉にする。
+          0以下 … 『今すぐ』
+          それ以外 … 受取予定月（target_ym）が便の月なら『2027年1月便』、そうでなければ『Nヶ月後』
+        ★target_ym は 2026-09-18 に追加した省略可能な引数。渡さなければ従来どおり『Nヶ月後』。 """
     try:
         offset = int(offset)
     except (ValueError, TypeError):
         offset = 0
-    return '今すぐ' if offset <= 0 else '%dヶ月後' % offset
+    if offset <= 0:
+        return '今すぐ'
+    if target_ym and is_bin_ym(target_ym):
+        return bin_label(target_ym)
+    return '%dヶ月後' % offset
 
 
 def fmt_qty(x):
@@ -375,6 +433,19 @@ def stock_amount(row):
     if str(a).strip() != '':
         return parse_num(a)
     return parse_num(g(row, '在庫数')) * parse_num(g(row, '薬価'))
+
+
+def _unit_price(row):
+    """ 薬価（1単位あたり・税込）。薬VANの『薬価』列を使い、空なら 薬価金額÷在庫数（全量）で補う。
+        どちらも取れなければ 0.0（自費薬など薬価0円の品はそのまま0）。 """
+    p = parse_num(g(row, '薬価'))
+    if p > 0:
+        return p
+    qty = parse_num(g(row, '在庫数'))
+    amt = parse_num(g(row, '薬価金額'))
+    if qty > 0 and amt > 0:
+        return amt / qty
+    return 0.0
 
 
 def is_shortage(row):
@@ -1222,6 +1293,10 @@ def compute_matching(stores, excluded=None, reserved=None, supply_qty=None):
                 # 出せる数の指定があるか（bool）。★文字列を見て判定しない＝真偽値で持つ。
                 '_数量指定': specified,
                 '在庫金額': round(over_amt, 2),
+                # 薬価（1単位あたり・税込）。引取依頼書の『単価（薬価・税込）』列に使う（2026-09-18・3法人対応）。
+                #   薬VANの『薬価』列をそのまま使う。空なら 薬価金額÷在庫数（全量）で補う。
+                #   ★Excel4シート・Gシート結果タブの列には出さない（増やさない）。画面②③④にも出さない。
+                '薬価': round(_unit_price(row), 4),
                 '過剰在庫区分': g(row, '過剰在庫区分'), '不動区分': g(row, '不動区分'),
                 '期限切迫区分': g(row, '期限切迫区分'), '有効期限': fmt_date(exp),
                 'ロットNO': g(row, 'ロットNO'), '最終出庫日': g(row, '最終出庫日'),
@@ -1722,40 +1797,96 @@ def write_excel(path, base_ym_disp, csv_base_disp,
 #     RED_FILL / YELLOW_FILL は意味づけには使いません。）
 # ============================================================================
 
-# 引取依頼書の明細列（この順・本間部長確定）。在庫金額は載せない（発注用の紙なので）。
+# 引取依頼書の明細列（この順）。
+#   ★2026-09-18 3法人対応（運用ルール確定版 4-4・6-2）：『単価（薬価・税込）』『金額（税込）』の2列を
+#     『区分』と『状態』のあいだに足して 11列にした。法人をまたぐ分譲ではこの紙が
+#     「譲渡・譲受記録（薬機法施行規則）」と「請求明細」の元になるため、単価・金額が要る。
+#     同一法人内の移動でも単価・金額は印字したまま（注記で「精算なし」と示す）。
+#   ★旧9列の並び（薬品名〜区分・状態）はそのまま。差し込んだ2列以外は位置も変えていない。
 PICKUP_REQUEST_COLS = ['薬品名', '単位', '数量', '有効期限', 'ロットNO', '医薬品CD',
-                       '受取予定月', '区分', '状態']
+                       '受取予定月', '区分', '単価（薬価・税込）', '金額（税込）', '状態']
 
 # 各列の幅（文字数）。★_auto_width の結果をそのまま使わず、A4横に収まる上限を決め打ちする。
-#   合計が A4横の印刷可能幅（余白を引いた実寸）に収まることを、生成後に数値で検算する
+#   合計が A4横の印刷可能幅（余白を引いた実寸）に収まることを、モジュール読み込み時に数値で検算する
 #   （過去に図の表で右端が枠外に切れた事故があり、列幅合計を枠内に収める検算で解決した）。
 PICKUP_REQUEST_WIDTHS = {
-    '薬品名': 28, '単位': 6, '数量': 8, '有効期限': 12, 'ロットNO': 14,
-    '医薬品CD': 14, '受取予定月': 16, '区分': 10, '状態': 22,
+    '薬品名': 24, '単位': 5, '数量': 6, '有効期限': 10, 'ロットNO': 11,
+    '医薬品CD': 13, '受取予定月': 12, '区分': 7, '単価（薬価・税込）': 9, '金額（税込）': 10, '状態': 16,
 }
 
-# Excelのシート名に使えない文字。将来の飛鳥22店追加に備えた保険（現行14店では発動しない）。
+# 改修前（9列）の列幅合計＝A4横1ページに収まることが実機で確認済みの上限。
+#   28+6+8+12+14+14+16+10+22 = 130。11列にしても、この合計を超えないことを検算で担保する。
+PICKUP_REQUEST_WIDTH_BUDGET = 130
+
+
+def pickup_request_width_check():
+    """ 引取依頼書の列幅の検算：(11列の合計, 上限130, 収まっているか) を返す。 """
+    total = sum(PICKUP_REQUEST_WIDTHS[c] for c in PICKUP_REQUEST_COLS)
+    return total, PICKUP_REQUEST_WIDTH_BUDGET, total <= PICKUP_REQUEST_WIDTH_BUDGET
+
+
+# ★モジュール読み込み時の検算。列や幅を足して上限を超えたら、ここで止まる（黙って紙からはみ出さない）。
+if not pickup_request_width_check()[2]:
+    raise RuntimeError('引取依頼書の列幅合計 %d が上限 %d を超えています（A4横1ページに収まりません）。'
+                       % pickup_request_width_check()[:2])
+
+# 引取依頼書の明細のうち、Excel の式で計算する列と、その式の材料になる列（列の位置から式を組む）。
+_PICKUP_COL_QTY = '数量'
+_PICKUP_COL_PRICE = '単価（薬価・税込）'
+_PICKUP_COL_AMOUNT = '金額（税込）'
+
+# Excelのシート名に使えない文字。将来の店舗追加に備えた保険（36店では発動しない）。
 _SHEET_NAME_BAD_CHARS = set('[]:*?/\\')
 
 
 def _safe_sheet_name(name):
     """ Excelのシート名として安全な名前にする：禁止文字 []:*?/\\ を除き、31文字以内に切る。
-        ★現行14店（東大泉／海浜幕張／…／下落合）はすべて禁止文字なし・31文字以内で、この関数は
-          実質何もしない。将来 飛鳥22店などを足したときに黙って壊れないための保険。 """
+        ★36店（東大泉／…／済生会通り店）はすべて禁止文字なし・31文字以内で、この関数は
+          実質何もしない。将来の店舗追加で黙って壊れないための保険。 """
     s = ''.join(ch for ch in str(name) if ch not in _SHEET_NAME_BAD_CHARS).strip()
     if not s:
         s = 'シート'
     return s[:31]
 
 
+# 記名欄で値が無いときに置く下線（手書きで補ってもらう）
+_BLANK_LINE = '＿' * 14
+
+
+def _store_line(info, company_fallback):
+    """ 記名欄の「法人名・薬局名」1行を作る。
+          info … _店舗情報 の1店ぶん {'法人名','薬局名（正式）','所在地','管理薬剤師名'}（無ければ空辞書）
+          company_fallback … stores_config.COMPANY_OF から引いた法人名（無ければ ''）
+        薬局名（正式）が無い店は下線にする（本間部長がシートに入れるまで手書きで補う）。 """
+    info = info or {}
+    corp = str(info.get('法人名', '') or '').strip() or str(company_fallback or '').strip()
+    name = str(info.get('薬局名（正式）', '') or '').strip()
+    if not name:
+        name = _BLANK_LINE
+    return ('%s　%s' % (corp, name)) if corp else name
+
+
+def _store_field(info, key):
+    """ 記名欄の所在地・管理薬剤師名。無ければ下線。 """
+    v = str((info or {}).get(key, '') or '').strip()
+    return v if v else _BLANK_LINE
+
+
 def write_pickup_request_excel(path_or_buf, data):
-    """ 引取依頼書Excelを書き出す（FAX・デスクネッツ用）。
+    """ 引取依頼書Excelを書き出す（FAX・デスクネッツ用／法人をまたぐ分譲では譲渡・譲受記録と請求明細の元）。
         data … app_logic.build_pickup_request の戻り：
           {'my_store': 自店名, 'ym': 'YYYYMM',
-           'sheets': [{'出し手店': 店名,
+           'sheets': [{'出し手店': 店名, '出し手法人': 法人名, '受け手法人': 法人名, '同一法人': bool,
+                       '出し手情報': {...}, '受け手情報': {...}, '便': '2027年1月便' 等,
                        'rows': [{'薬品名','単位','数量','有効期限','ロットNO','医薬品CD',
-                                 '受取予定月','区分','状態','_期限強調'(bool)}, ...]}, ...]}
+                                 '受取予定月','区分','単価（薬価・税込）','金額（税込）','状態',
+                                 '_期限強調'(bool)}, ...]}, ...]}
         ・シート＝出し手店ごと（さと和光シート／東立石シート…）。シート名は出し手店名そのまま。
+        ・上部＝記名欄8行（便／発送日／出す店3行／受け取る店3行）。_店舗情報 に無い店は下線。
+        ・『金額（税込）』は Excel の式（=単価×数量）。数量を手で減らしても金額が合う。
+        ・明細の下に合計欄（税込合計＝SUM／税抜＝ROUND(税込÷1.1,0)／消費税＝税込−税抜）を式で置く
+          ＝付録A（譲渡・譲受記録票）と同じ計算。
+        ・出し手と受け手が同一法人なら「同一法人内の移動（精算なし）」の注記を出し、単価・金額は印字したまま。
         ・PDFは作らない（Excel 1ファイル）。ファイル名は呼び出し側で付ける。 """
     from openpyxl.worksheet.page import PageMargins
     from openpyxl.worksheet.properties import PageSetupProperties
@@ -1770,9 +1901,17 @@ def write_pickup_request_excel(path_or_buf, data):
 
     ncol = len(PICKUP_REQUEST_COLS)
     last_col = get_column_letter(ncol)
+    col_idx = {h: i for i, h in enumerate(PICKUP_REQUEST_COLS, start=1)}
+    qty_letter = get_column_letter(col_idx[_PICKUP_COL_QTY])
+    price_letter = get_column_letter(col_idx[_PICKUP_COL_PRICE])
+    amount_letter = get_column_letter(col_idx[_PICKUP_COL_AMOUNT])
+    amount_ci = col_idx[_PICKUP_COL_AMOUNT]
+    # 記名欄のラベル列（A〜C を結合）と値列（D〜末尾を結合）
+    label_end_col = 3
     # FAXで潰れないよう本文は10pt（9pt以上の目安を満たす）。太字は期限強調用。
     body_font = Font(size=10)
     body_bold = Font(size=10, bold=True)
+    money_fmt = '#,##0.00'
 
     used_names = set()
     for sheet in data.get('sheets', []):
@@ -1780,29 +1919,65 @@ def write_pickup_request_excel(path_or_buf, data):
         title = _safe_sheet_name(sheet.get('出し手店', ''))
         base = title
         n = 2
-        while title in used_names:                 # 万一同名になったら連番（現行14店では起きない）
+        while title in used_names:                 # 万一同名になったら連番（36店では起きない）
             title = '%s%d' % (base[:28], n)
             n += 1
         used_names.add(title)
         ws = wb.create_sheet(title=title)
 
-        # --- 上部ヘッダー欄（罫線付き・横幅いっぱいに結合）---
+        supplier_info = sheet.get('出し手情報') or {}
+        receiver_info = sheet.get('受け手情報') or {}
+        same_corp = bool(sheet.get('同一法人'))
+
+        # --- 表題 ---
         r = 1
-        tcell = ws.cell(row=r, column=1, value='引取依頼書')
+        tcell = ws.cell(row=r, column=1, value='引取依頼書（医薬品 譲渡・譲受記録を兼ねる）')
         tcell.font = Font(size=14, bold=True)
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
         r += 1
-        for text in ['依頼元（引き取る店）：%s' % my_store,
-                     '出し手店（もらう先）：%s' % sheet.get('出し手店', ''),
-                     '作成日：%s' % today,
-                     '対象年月：%s' % ym_disp]:
-            cell = ws.cell(row=r, column=1, value=text)
-            cell.font = body_bold
-            cell.border = BORDER
-            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+        cell = ws.cell(row=r, column=1,
+                       value='作成日：%s　　対象年月：%s　　依頼元（引き取る店）：%s　　出し手店（もらう先）：%s'
+                       % (today, ym_disp, my_store, sheet.get('出し手店', '')))
+        cell.font = body_font
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncol)
+        r += 1
+
+        # --- 記名欄（8行：便／発送日／出す店3行／受け取る店3行）---
+        #   ★行の並びと項目名は付録A（医薬品 譲渡・譲受記録票）と同じにそろえてある。
+        name_rows = [
+            ('便', sheet.get('便', '') or _BLANK_LINE),
+            ('発送日', '　　　　年　　　月　　　日'),
+            ('出す店：法人名・薬局名', _store_line(supplier_info, sheet.get('出し手法人', ''))),
+            ('出す店：所在地', _store_field(supplier_info, '所在地')),
+            ('出す店：管理薬剤師名', _store_field(supplier_info, '管理薬剤師名')),
+            ('受け取る店：法人名・薬局名', _store_line(receiver_info, sheet.get('受け手法人', ''))),
+            ('受け取る店：所在地', _store_field(receiver_info, '所在地')),
+            ('受け取る店：管理薬剤師名', _store_field(receiver_info, '管理薬剤師名')),
+        ]
+        for label, value in name_rows:
+            lc = ws.cell(row=r, column=1, value=label)
+            lc.font = body_bold
+            lc.fill = HEADER_FILL
+            lc.border = BORDER
+            lc.alignment = Alignment(vertical='center')
+            ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=label_end_col)
+            vc = ws.cell(row=r, column=label_end_col + 1, value=value)
+            vc.font = body_font
+            vc.border = BORDER
+            vc.alignment = Alignment(vertical='center', wrap_text=True)
+            ws.merge_cells(start_row=r, start_column=label_end_col + 1, end_row=r, end_column=ncol)
             r += 1
-        for text in ['数量は在庫まるごとを初期値にしています。減らす場合はこの欄を手で書き換えてください。',
-                     '『区分』に表示のある薬（向精神薬・毒薬・劇薬）は、受け取る側でも譲受の記録が必要です。']:
+
+        # --- 注記（数量の直し方・区分の記録・法人の扱い）---
+        notes = ['数量は在庫まるごとを初期値にしています。減らす場合は「数量」のセルを書き換えてください'
+                 '（金額と合計は自動で計算し直されます）。',
+                 '『区分』に表示のある薬（向精神薬・毒薬・劇薬）は、受け取る側でも譲受の記録が必要です。']
+        if same_corp:
+            notes.append('同一法人内の移動（精算なし）。単価・金額は記録のために印字しています。')
+        else:
+            notes.append('法人が異なるため、薬価（税込）での分譲です。この依頼書が譲渡・譲受記録と請求明細の元になります'
+                         '（出す店・受け取る店の双方が印刷して3年保存）。')
+        for text in notes:
             cell = ws.cell(row=r, column=1, value=text)
             cell.font = body_font
             cell.fill = NOTE_FILL   # 薄い注記色（白黒FAXでもうっすら残る程度で、字は読める）
@@ -1825,20 +2000,55 @@ def write_pickup_request_excel(path_or_buf, data):
 
         # --- 明細 ---
         for d in sheet.get('rows', []):
+            listed = (d.get('状態') == '出し手が掲載中')
             for ci, colname in enumerate(PICKUP_REQUEST_COLS, start=1):
-                cell = ws.cell(row=r, column=ci, value=d.get(colname, ''))
+                if colname == _PICKUP_COL_AMOUNT:
+                    # 金額＝単価×数量 を Excel の式で置く（数量を手で直しても合う）。
+                    #   出し手の一覧から外れた品（数量・単価が空）は式を置かず空欄のまま。
+                    value = ('=%s%d*%s%d' % (price_letter, r, qty_letter, r)) if listed else ''
+                else:
+                    value = d.get(colname, '')
+                cell = ws.cell(row=r, column=ci, value=value)
                 cell.border = BORDER
                 # 期限が近い品は【塗らずに】有効期限の文字だけ太字（白黒FAX対策）
                 if colname == '有効期限' and d.get('_期限強調'):
                     cell.font = body_bold
                 else:
                     cell.font = body_font
-                if colname in ('薬品名', '状態'):
+                if colname in ('薬品名', '状態', '受取予定月'):
                     cell.alignment = Alignment(wrap_text=True, vertical='top')
                 else:
                     cell.alignment = Alignment(vertical='top')
+                if colname in (_PICKUP_COL_PRICE, _PICKUP_COL_AMOUNT):
+                    cell.number_format = money_fmt
             r += 1
         last_detail = max(r - 1, header_row)
+
+        # --- 合計欄（式）＝付録A と同じ計算：税込合計／税抜（÷1.1・円未満四捨五入）／消費税（差） ---
+        #   明細が0行でも SUM の範囲が壊れないよう、範囲は見出し行の次〜最終明細行にする。
+        sum_first = first_detail
+        sum_last = max(last_detail, first_detail)
+        total_row = r
+        rows_total = [
+            ('税込合計（金額列の合計）', '=SUM(%s%d:%s%d)' % (amount_letter, sum_first, amount_letter, sum_last)),
+            ('税抜（税込合計÷1.1・円未満四捨五入）', '=ROUND(%s%d/1.1,0)' % (amount_letter, total_row)),
+            ('消費税（税込合計−税抜）', '=%s%d-%s%d' % (amount_letter, total_row, amount_letter, total_row + 1)),
+        ]
+        # ラベルは『ロットNO』〜『単価』の列を結合して右寄せ（結合セルは左へはみ出さないので広めに取る）
+        label_from = col_idx['ロットNO']
+        for label, formula in rows_total:
+            lc = ws.cell(row=r, column=label_from, value=label)
+            lc.font = body_bold
+            lc.border = BORDER
+            lc.alignment = Alignment(horizontal='right', vertical='center')
+            ws.merge_cells(start_row=r, start_column=label_from,
+                           end_row=r, end_column=amount_ci - 1)
+            vc = ws.cell(row=r, column=amount_ci, value=formula)
+            vc.font = body_bold
+            vc.border = BORDER
+            vc.number_format = money_fmt
+            r += 1
+        last_row = r - 1
 
         # --- 列幅（A4横に収まる上限つき固定。_auto_width は使わない）---
         for ci, h in enumerate(PICKUP_REQUEST_COLS, start=1):
@@ -1855,7 +2065,7 @@ def write_pickup_request_excel(path_or_buf, data):
                                       header=0.2, footer=0.2)
         # 明細の列名行を全ページで繰り返す（2ページ目以降で列名の無い紙が出ないように）
         ws.print_title_rows = '%d:%d' % (header_row, header_row)
-        ws.print_area = 'A1:%s%d' % (last_col, last_detail)
+        ws.print_area = 'A1:%s%d' % (last_col, last_row)
         # フッター右にページ番号（FAXで枚数の取り違えを防ぐ）
         ws.oddFooter.right.text = '&P / &N'
         ws.freeze_panes = 'A%d' % first_detail
