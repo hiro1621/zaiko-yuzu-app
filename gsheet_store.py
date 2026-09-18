@@ -10,19 +10,23 @@
 
 融通は「他店の出庫実績」がそろって初めて計算できるため、各店のアップを貯める
 共有保管庫が必須です。だからアプリは、現状データから毎回すべてを再計算し、
-「現在 N/15店 アップ済み」を表示します。
+「現在 N/36店 アップ済み」を表示します（店数は stores_config.py の STORE_COUNT）。
 
 ■ このシートのタブ構成
-  _index                … 店名／対象年月(YYYYMM)／アップ日時／行数／様式OK・NG／ファイル名。○/15の判定元。
+  _index                … 店名／対象年月(YYYYMM)／アップ日時／行数／様式OK・NG／ファイル名。○/36の判定元。
   raw_<店名>            … その店のスリム在庫（約35列・前処理済）。同月再提出は上書き（最新採用）。
+                          ★2026-09-18：当月ぶんの読みは values.batchGet で全店まとめて1回（read_raw_many）。
   融通提案／不足品目一覧／品目×店舗マトリクス／店舗別サマリ … 結果（毎回再計算して書き戻し）。
   前月_YYYYMM           … 月替わり時に、直前の結果（融通提案）を退避したスナップショット。
+  _除外／_予約／_提供数量／_やり取り／_やり取り既読／_全店板／_全店板既読 … 店の操作の記録。
+  _店舗情報             … 店名／法人名／薬局名（正式）／所在地／管理薬剤師名（引取依頼書の記名欄用・
+                          本間部長が手で入力。2026-09-18・3法人対応で追加）。
 
 ■ 月替わりの考え方
   ・各rawと_indexに対象年月(YYYYMM)を持たせる。
   ・マッチングは「当月（＝_index内で最新のYYYYMM）」のデータだけで計算する。
   ・新しい年月が最初に来たら、直前の結果を 前月_<直前YYYYMM> へ退避してから当月を始める。
-  ・○/15は「当月データを持つ店数」で数える。
+  ・○/36は「当月データを持つ店数」で数える。
 
 ★重要：認証情報が無い環境でも import・構文が通るよう、gspread と google-auth は
   関数の中で遅延importしています（ここを import しただけでは何も接続しません）。
@@ -121,9 +125,22 @@ ALLBOARD_HEADERS = ['投稿日時', '投稿店', '本文', '投稿ID', '親ID', 
 
 # _全店板既読 の見出し（列順）
 #   1行＝(店名) が全店板をいつまで読んだか。相手ごとに分かれないので店名1つで1行。
-#   行数が少ない（最大14行）ので、除外・予約と同じく clear+update で丸ごと書き直す。
+#   行数が少ない（最大36行＝3法人36店・2026-09-18）ので、除外・予約と同じく clear+update で丸ごと書き直す。
 ALLBOARD_READ_TAB = '_全店板既読'
 ALLBOARD_READ_HEADERS = ['店名', '最終確認日時']
+
+# ============================================================================
+# _店舗情報 タブ（2026-09-18・3法人対応）＝引取依頼書の記名欄に印字する店の正式情報
+#   1行＝1店。列：店名／法人名／薬局名（正式）／所在地／管理薬剤師名。
+#   ★所在地・管理薬剤師名は公開リポジトリのコードには書かない＝本間部長がこのタブに直接入力する
+#     （飛鳥22店ぶんは加藤部長の回答③のあと）。アプリは読むだけ（書くのは見出し行の自動作成だけ）。
+#   ★読みは60秒のモジュールキャッシュ越し（帳票を作るたびに読み直さない＝API節約）。
+#   ★タブが無ければ見出し行だけ自動で作る（店名の行は入れない＝本間部長が貼る）。
+# ============================================================================
+STORE_INFO_TAB = '_店舗情報'
+STORE_INFO_HEADERS = ['店名', '法人名', '薬局名（正式）', '所在地', '管理薬剤師名']
+_STORE_INFO_CACHE = {}      # {ブックのID: (読んだ時刻, {店名: {...}})}
+_STORE_INFO_TTL = 60        # 秒
 
 
 # ============================================================================
@@ -735,6 +752,51 @@ def write_allboard_reads(sh, rows):
     _update(ws, body)
 
 
+def read_store_info(sh, force=False):
+    """ _店舗情報 タブを読んで {店名: {'法人名','薬局名（正式）','所在地','管理薬剤師名'}} を返す。
+        ・60秒のキャッシュ越し（force=True で読み直す）。
+        ・タブが無ければ見出し行だけ作って空の辞書を返す（例外にしない）。
+        ・見出しは列名で引く（列の並びが変わっても壊れない）。店名が空の行は読み飛ばす。 """
+    key = _book_key(sh)
+    now = time.time()
+    cached = _STORE_INFO_CACHE.get(key)
+    if (not force) and cached and (now - cached[0] < _STORE_INFO_TTL):
+        return {k: dict(v) for k, v in cached[1].items()}
+    ws = _find_ws(sh, STORE_INFO_TAB)
+    if ws is None:
+        _ensure_store_info_tab(sh)
+        _STORE_INFO_CACHE[key] = (now, {})
+        return {}
+    values = _values(ws)
+    out = {}
+    if values and len(values) >= 2:
+        header = [str(h).strip() for h in values[0]]
+        idx = {h: i for i, h in enumerate(header)}
+        for row in values[1:]:
+
+            def cell(name):
+                i = idx.get(name)
+                return (row[i] if (i is not None and i < len(row)) else '').strip()
+
+            name = cell('店名')
+            if not name:
+                continue
+            out[name] = {h: cell(h) for h in STORE_INFO_HEADERS if h != '店名'}
+    _STORE_INFO_CACHE[key] = (now, out)
+    return {k: dict(v) for k, v in out.items()}
+
+
+def _ensure_store_info_tab(sh):
+    """ _店舗情報 タブが無ければ見出し行だけ作る（店名の行は入れない）。作成に失敗しても例外にしない
+        （読みは空の辞書で続行できる＝帳票の記名欄が下線になるだけ）。 """
+    try:
+        ws = _get_or_create_ws(sh, STORE_INFO_TAB, rows=100, cols=len(STORE_INFO_HEADERS) + 2)
+        if not [r for r in _values(ws) if not _row_is_blank(r)]:
+            _update(ws, [list(STORE_INFO_HEADERS)])
+    except Exception:
+        pass
+
+
 def latest_ym(index):
     """ _index の中で最新の対象年月(YYYYMM)を返す。1件も無ければ None。 """
     yms = [e.get('ym', '') for e in index.values() if e.get('ym', '')]
@@ -760,12 +822,8 @@ def write_raw(sh, store_name, slim_rows):
     _update(ws, body)
 
 
-def read_raw(sh, store_name):
-    """ raw_<店名> を読み、{列名:文字列} の辞書のリストで返す。タブが無ければ空リスト。 """
-    ws = _find_ws(sh, _raw_tab_name(store_name))
-    if ws is None:
-        return []
-    values = _values(ws)
+def _rows_from_values(values):
+    """ タブの2次元配列（1行目＝見出し）を {列名:文字列} の辞書のリストにする（read_raw と read_raw_many で共用）。 """
     if not values or len(values) < 2:
         return []
     header = values[0]
@@ -779,6 +837,41 @@ def read_raw(sh, store_name):
             d.setdefault(c, '')
         rows.append(d)
     return rows
+
+
+def read_raw(sh, store_name):
+    """ raw_<店名> を読み、{列名:文字列} の辞書のリストで返す。タブが無ければ空リスト。 """
+    ws = _find_ws(sh, _raw_tab_name(store_name))
+    if ws is None:
+        return []
+    return _rows_from_values(_values(ws))
+
+
+def read_raw_many(sh, store_names):
+    """ 複数店の raw_<店名> を【1回の API 呼び出し】でまとめて読む（2026-09-18・3法人対応）。
+          戻り値 … {店名: 辞書のリスト}。失敗したら None（呼び出し側が従来の1タブずつ読みへ落とす）。
+        ★背景：Googleシートは1分60回が上限（サービスアカウント1つを全店で共有）。
+          当月データの読み直し（アップロード直後など）は raw_ を店数ぶん読むため、14店で14回、
+          36店なら36回になり、ほかの操作と重なると上限に当たる。values.batchGet は複数タブを
+          1回で返す API なので、36回→1回に減らせる。
+        ★範囲はタブ名だけ（"'raw_東大泉'"）＝そのタブの使用範囲すべてが返る。
+        ★指定したタブが1つでも無いと API 全体が失敗するので、その場合は None を返して
+          呼び出し側で1タブずつに落とす（黙って一部だけ返さない）。 """
+    names = [str(n) for n in (store_names or []) if str(n or '').strip()]
+    if not names:
+        return {}
+    ranges = ["'%s'" % _raw_tab_name(n).replace("'", "''") for n in names]
+    try:
+        res = _call(sh.values_batch_get, ranges)
+    except Exception:
+        return None
+    vrs = (res or {}).get('valueRanges') or []
+    if len(vrs) != len(names):
+        return None
+    out = {}
+    for name, vr in zip(names, vrs):
+        out[name] = _rows_from_values((vr or {}).get('values') or [])
+    return out
 
 
 # ============================================================================
@@ -1000,15 +1093,23 @@ def load_current_month_stores(sh, index=None):
     stores = []
     if latest is None:
         return stores, latest, index
+    # 当月の店（様式NGを除く）を先に確定し、raw_ をまとめ読み（1回）→ 失敗したら1タブずつ（従来）。
+    names = []
     for name, e in index.items():
         if e.get('ym', '') != latest:
             continue
         if e.get('format', '').startswith('NG'):
             # 別様式でNG判定の店は、当月マッチングには入れない（画面には「様式NG」で出す）
             continue
-        rows = read_raw(sh, name)
-        y, m = int(latest[:4]), int(latest[4:6])
-        base_date = datetime.date(y, m, 1)
+        names.append(name)
+    many = read_raw_many(sh, names) if names else {}
+    y, m = int(latest[:4]), int(latest[4:6])
+    base_date = datetime.date(y, m, 1)
+    for name in names:
+        if many is not None and name in many:
+            rows = many[name]
+        else:
+            rows = read_raw(sh, name)   # まとめ読みに失敗したときの従来どおりの読み方（自動で落ちる）
         stores.append({'name': name, 'ym': latest, 'base_date': base_date, 'rows': rows})
     return stores, latest, index
 
