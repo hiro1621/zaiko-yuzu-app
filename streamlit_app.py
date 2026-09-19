@@ -24,7 +24,7 @@
   1. 合言葉を入れる（1回だけ）。★2026-09-18 3法人対応：合言葉は店ごと（Secrets の [store_passwords]）。
      店の合言葉で入ると、その店が自店として確定する（店の選び直しはできない・?store= も無視）。
      管理者の合言葉（Secrets の [admin_passwords]＝名前ごと・7人。2026-09-19）で入ったときだけ、
-     36店を自由に切り替えられる（従来どおりの動き。左バーに「本部モード：名前」と出る）。
+     36店を自由に切り替えられる（従来どおりの動き。上の帯に「本部モード：名前」と出る）。
      旧の admin_password（1つだけ）も後方互換で通る（名前は「本部」）。
      [store_passwords] が無く app_password だけの環境では、従来どおり共有パスワード1つで入り店を選ぶ。
   2. 自分の店をドロップダウンで選ぶ（本部用で入ったとき）。法人（ソユーズ／内観堂／飛鳥）で絞れる。
@@ -111,14 +111,18 @@ SENTINEL_STORE = '選択してください'
 # ============================================================================
 # 画面の基本設定
 # ============================================================================
-st.set_page_config(page_title='デッドストックリスト', page_icon='💊', layout='wide')
+# ★2026-09-19：左バーは使わない（initial_sidebar_state='collapsed'＋左バーに何も描かない＝左バー自体が出ない）
+st.set_page_config(page_title='デッドストックリスト', page_icon='💊', layout='wide',
+                   initial_sidebar_state='collapsed')
 
 
 # ============================================================================
-# 見た目（2026-08-14・案B）
+# 見た目（2026-09-19・上の帯＋幅いっぱいの本体）
 #   ★色・角の丸み・字の大きさは .streamlit/config.toml に書いてあります。
 #     ここでやるのは「config.toml で指定したフォント本体の読み込み」と、
-#     configでは届かない細かい調整（左バーの詰め方など）だけです。
+#     configでは届かない細かい調整（上の帯を貼り付ける・余白を詰める など）だけです。
+#   ※2026-08-14〜09-18 は案B（左バー＋広い表）。36店になって左バーでは窮屈になったため、
+#     2026-09-19 に「上の薄い帯」へ変更した（本間部長承認）。
 #
 #   ★フォントは <style> の @import で読み込みます。
 #     Streamlit は <link> タグを消してしまうため、@import 以外では入りません。
@@ -132,7 +136,7 @@ FONT_CSS_URL = ('https://fonts.googleapis.com/css2'
 
 
 def inject_style():
-    """ フォントの読み込みと、左バーまわりの細かい見た目の調整。 """
+    """ フォントの読み込みと、上の帯まわりの細かい見た目の調整（2026-09-19）。 """
     st.markdown("""
 <style>
 @import url('%s');
@@ -140,17 +144,35 @@ def inject_style():
 /* 数字が縦にそろうようにする（数量・在庫数・金額の列を読みやすく） */
 [data-testid="stDataFrame"], [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
 
-/* 左バー：上の余白を詰めて、店舗名と切替ボタンを画面の上のほうに置く */
-[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] { padding-top: 1.2rem; }
+/* 本体の余白を詰める（左バーをやめたぶん、表を幅いっぱいに使う）。
+   ★上の余白（padding-top）は Streamlit 自前のヘッダー（右上の ⋮ など・高さ 3.5rem＝56px）のぶんを残す。
+     これより小さくすると帯の1行目がヘッダーの下に潜って上端が欠ける（2026-09-19 実機で確認）。 */
+.block-container { padding-left: 1.5rem; padding-right: 1.5rem; padding-top: 3.75rem; }
 
-/* ★左バーの切替ボタン：文字を左そろえにして「一覧の項目」らしく見せる。
-   Streamlitの既定は中央そろえで、件数付きの項目が縦に並ぶと頭がそろわず読み取りにくい。
-   ボタンの中はさらに入れ子になっているので、中の段落まで指定しないと効かない。 */
-[data-testid="stSidebar"] [data-testid="stButton"] button { justify-content: flex-start !important; }
-[data-testid="stSidebar"] [data-testid="stButton"] button p { text-align: left !important; }
-
-/* 左バーの区切り線を細く（深緑の上では既定の線が目立ちすぎる） */
-[data-testid="stSidebar"] hr { margin: 0.7rem 0; border-color: #2E544D; }
+/* ★上の帯（main() の st.container(key='topbar')。Streamlit は key を st-key-<key> クラスにする）
+   下へスクロールしても画面の上に貼り付いたまま残す（position: sticky）。
+   top はヘッダー（3.5rem）のすぐ下＝ヘッダーに隠れない位置。
+   ★★sticky は「親の箱の中」でしか効かない。Streamlit 1.63 は要素ごとに同じ高さの包み箱
+     （stLayoutWrapper）で包むため、帯本体に付けても包み箱ごと流れてしまう（実機で確認）。
+     そこで帯を包んでいる箱の側（:has() で「中に帯を持つ包み箱」）に sticky を付ける。
+     包み箱が無い古い版でも効くように、帯本体にも同じ指定を残す。 */
+[data-testid="stLayoutWrapper"]:has(> .st-key-topbar),
+.st-key-topbar, [class*="st-key-topbar"] {
+  position: sticky; top: 3.5rem; z-index: 100;
+  background: #FFFFFF;
+}
+.st-key-topbar, [class*="st-key-topbar"] {
+  border-bottom: 1px solid #DFEAE7;
+  padding-bottom: 0.4rem; margin-bottom: 0.4rem;
+}
+/* 帯の中の縦の間隔を詰める（既定の1remだと3行で場所を取りすぎる） */
+.st-key-topbar [data-testid="stVerticalBlock"] { gap: 0.35rem; }
+/* 帯の中の「アップ済み N / 36 店」を小さめに（st.metric の既定は大きすぎて帯が高くなる） */
+.st-key-topbar [data-testid="stMetricValue"] { font-size: 1.35rem; line-height: 1.3; }
+.st-key-topbar [data-testid="stMetricLabel"] p { font-size: 0.8rem; }
+/* 帯の中のボタン（②③④⑤の切替）：文字は中央そろえ・折り返さない */
+.st-key-topbar [data-testid="stButton"] button { justify-content: center !important; white-space: nowrap; }
+.st-key-topbar [data-testid="stButton"] button p { text-align: center !important; }
 </style>
 """ % FONT_CSS_URL, unsafe_allow_html=True)
 
@@ -516,7 +538,7 @@ def get_backend():
 #     ・合言葉を1つ入れる → [store_passwords] のどれかと一致すれば、その店を自店として確定する
 #       （店の選び直しはできない。URL の ?store= も無視する）。
 #     ・[admin_passwords] のどれか（または旧 admin_password）と一致すれば本部モード＝36店を自由に切替できる。
-#       左バーに「本部モード：名前」と出す（誰が入っているか分かるように）。
+#       上の帯に「本部モード：名前」と出す（誰が入っているか分かるように・2026-09-19 左バー→上の帯）。
 #     ・同じ合言葉が2か所以上（管理者どうし・管理者と店・店どうし）に登録されていたら、その値では入れず
 #       「設定を確認してください」と出す（黙って片方に入れない＝別店のデータを上書きする事故を防ぐ）。
 #     ・[store_passwords] があるときは app_password は見ない（切替後に旧の共有パスワードが残っていても通さない）。
@@ -1198,10 +1220,14 @@ def _pickup_offset_selector(key, ym):
              % '{:,}'.format(anytime))
 
 
-def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
+def view_switcher(n_dead, n_expiry, n_receive, n_unread=0, host=None):
     """
-    ②③④⑤を切り替えるボタンを『左バー（サイドバー）』に縦に描き、
+    ②③④⑤を切り替えるボタンを『上の帯の3行目』に横一列（4等分）に描き、
     選ばれた画面の記号（VIEW_*）を返す。
+
+      ・host … ボタンを描く場所（main() が用意した帯の3行目の入れ物）。None なら呼んだ位置に描く。
+        帯は本体より先に画面へ出るが、件数は本体の計算（results_section）で決まるため、
+        先に空の入れ物だけ帯に置いておき、ここからその入れ物へ書き込む。
 
       ・件数をボタンに入れて、開く前に中身があるかどうか分かるようにする。
         ⑤は投稿数ではなく『新着（未読）件数』を出す（0件のときは「（新着…）」を付けない）。
@@ -1210,10 +1236,10 @@ def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
         件数入りの文字を「選択されている値」そのものにしてしまうと、除外を保存して件数が
         変わった瞬間に、いま選んでいる値が選択肢から消えて②に戻されてしまう（設計の肝）。
 
-      ・★2026-08-14（案B）：横並びの segmented_control から、左バーの縦ボタンに変更。
+      ・★2026-08-14（案B）：横並びの segmented_control から、ふつうのボタン＋session_state に変更。
         segmented_control は「選択中をもう一度押すと選択なしになる」「表の中身が変わると
-        選択が飛ぶ」といった癖があったが、ふつうのボタン＋session_state で自分で覚えれば
-        どちらも起きない。押した瞬間に切り替わるので分かりやすさも上がる。
+        選択が飛ぶ」といった癖があったが、ボタンで自分で覚えればどちらも起きない。
+      ・★2026-09-19：左バーの縦4つ → 上の帯の横4つに。ボタンの仕組み・key・覚え方は変えていない。
     """
     labels = {
         VIEW_DEAD:    '②  デッド品（%d件）' % n_dead,
@@ -1228,14 +1254,16 @@ def view_switcher(n_dead, n_expiry, n_receive, n_unread=0):
         chosen = VIEW_DEAD
         st.session_state['view_switch'] = chosen
 
-    with st.sidebar:
-        st.divider()
-        st.caption('見たい表を選んでください')
-        for key in VIEW_ORDER:
-            # 選ばれているものだけ塗りつぶし（type='primary'）にして、どれを見ているか分かるようにする
-            pressed = st.button(labels[key], key='nav_%s' % key,
-                                type=('primary' if key == chosen else 'secondary'),
-                                width='stretch')
+    if host is None:
+        host = st.container()
+    with host:
+        cols = st.columns(len(VIEW_ORDER))
+        for col, key in zip(cols, VIEW_ORDER):
+            with col:
+                # 選ばれているものだけ塗りつぶし（type='primary'）にして、どれを見ているか分かるようにする
+                pressed = st.button(labels[key], key='nav_%s' % key,
+                                    type=('primary' if key == chosen else 'secondary'),
+                                    width='stretch')
             if pressed and key != chosen:
                 st.session_state['view_switch'] = key
                 st.rerun()
@@ -1960,20 +1988,23 @@ def excluded_section(my_store, backend, exclusions):
             st.rerun()
 
 
-def show_upload_status(status, latest):
-    """ 左バーに『いま N/36店 アップ済み』『対象月』『未アップの店』を出す。
+def show_upload_status_bar(status, latest):
+    """ 上の帯の1行目（3列目）に『アップ済み N / 36 店』『対象月』『未アップ N店（押すと店名の一覧）』を出す。
 
-        ★2026-08-14（案B）：画面上部の横並びから、左バーの縦並びに変更。
-          下へスクロールしても消えないので、他店がそろっているかを見ながら作業できる。
-          幅が狭いので、店名の一覧は折りたたみの中に入れて場所を取らないようにする。 """
+        ★2026-08-14（案B）：画面上部の横並びから、左バーの縦並びに変更（下へスクロールしても消えない）。
+        ★2026-09-19：左バー → 上の帯（貼り付き）へ。消えない点は同じ。
+          未アップの店名一覧は、折りたたみ（expander）だと開いたときに帯が高くなるので、
+          小さな吹き出し（st.popover）に入れて帯の高さを変えないようにした。中身は同じ。
+          様式NG店の注意書きは帯には出さず、本体の先頭に出す（show_upload_status_notice）。 """
     n = status['n']
     ym_disp = ('%s年%s月' % (latest[:4], latest[4:6])) if latest else '（まだデータがありません）'
-    with st.sidebar:
-        st.divider()
+    c_num, c_pop = st.columns([1, 1], vertical_alignment='center')
+    with c_num:
         st.metric('アップ済み', '%d / %d 店' % (n, STORE_COUNT))
+    with c_pop:
         st.caption('対象月：%s' % ym_disp)
         if status['missing']:
-            with st.expander('未アップの店（%d店）' % len(status['missing'])):
+            with st.popover('未アップ %d店' % len(status['missing'])):
                 # ★2026-09-18 3法人対応：36店を1行に並べると読めないので、法人ごとに分けて出す。
                 missing = list(status['missing'])
                 for corp in COMPANY_ORDER:
@@ -1984,8 +2015,15 @@ def show_upload_status(status, latest):
                 if others:
                     st.markdown('**その他**：%s' % '、'.join(others))
                 st.caption('全店そろうと、他店の使用実績まで見えてマッチングの精度が上がります。')
-        if status['ng']:
-            st.warning('様式が他店と違うため計算に入れていない店：' + '、'.join(status['ng']))
+        else:
+            st.caption('全店アップ済み')
+
+
+def show_upload_status_notice(status):
+    """ 本体の先頭に、様式NG店（他店と列が違い計算に入れていない店）の注意書きを出す。
+        show_upload_status_bar と対＝帯に出すもの／本体に出すものを分けた（2026-09-19）。 """
+    if status['ng']:
+        st.warning('様式が他店と違うため計算に入れていない店：' + '、'.join(status['ng']))
 
 
 # ============================================================================
@@ -2091,32 +2129,35 @@ def _remember_store_in_url(store):
 #     見えていた。そこで、アップロード欄は当月ぶんが済んでいれば折りたたんでおき、
 #     「アップ済みです。このまま下の表を見られます」とはっきり出すようにした。
 # ============================================================================
-def upload_section(backend, index, latest):
-    """ 左バーの上段：店舗名の選択と、在庫ファイルのアップロード欄。
+def store_section(notice_host=None):
+    """ 上の帯の1行目（2列目）：自店の表示、または店舗名の選択。選んだ店名（未選択なら None）を返す。
+        アップロード欄は帯の2行目＝main() が別に _render_upload_form_area を呼ぶ。
 
-        ★2026-08-14（案B）：本体の一番上から左バーへ移動。
-          自分がどの店として見ているかが、下へスクロールしても消えないようにするため。 """
-    st.caption('① 自店を選ぶ')
-
+        ★2026-08-14（案B）：本体の一番上から左バーへ移動（自分がどの店として見ているかが、
+          下へスクロールしても消えないようにするため）。
+        ★2026-09-19：左バー → 上の帯（貼り付き）へ。消えない点は同じ。
+          notice_host … 「まず店舗名を選んでください」の赤字を出す場所（帯の下＝本体の先頭）。 """
     # ★2026-09-18 3法人対応：店の合言葉で入ったときは、その店に固定する（選び直し不可・?store= も無視）。
     #   本部用（admin）・共有パスワード（legacy）・開発モード（dev）のときだけ、法人で絞ってから店を選ぶ。
     auth_store = st.session_state.get('auth_store')
     if auth_store in STORE_NAMES:
         my_store = auth_store
         st.session_state['my_store'] = my_store
-        st.markdown('**%s**（%s）' % (my_store, COMPANY_OF.get(my_store, '')))
+        st.markdown('自店：**%s**（%s）' % (my_store, COMPANY_OF.get(my_store, '')))
         st.caption('合言葉で確定した店です（店の切り替えはできません）。')
         _remember_store_in_url(my_store)
     else:
-        my_store = _select_store_with_company()
-    _render_upload_form_area(backend, my_store, index, latest)
+        my_store = _select_store_with_company(notice_host=notice_host)
+    return my_store
 
 
-def _select_store_with_company():
+def _select_store_with_company(notice_host=None):
     """ 法人（すべて／ソユーズ／内観堂／飛鳥）で絞ってから店を選ぶ（本部用・共有パスワード・開発モード用）。
         選んだ店を session_state['my_store'] と URL（?store=）に覚えさせ、店名（未選択なら None）を返す。
-        ・36店を1つのドロップダウンに並べると探しにくいので、法人の絞り込みを上に置く。
-        ・?store= の完全一致は従来どおり（法人の絞り込みは、その店の法人に自動で合わせる）。 """
+        ・36店を1つのドロップダウンに並べると探しにくいので、法人の絞り込みを先に置く。
+        ・?store= の完全一致は従来どおり（法人の絞り込みは、その店の法人に自動で合わせる）。
+        ・★2026-09-19（上の帯）：「法人で絞る」と「店舗名」を横並び（1:2）にした。キー・覚え方は不変。
+          notice_host … 未選択のときの赤字「まず店舗名を選んでください」を出す場所（None なら呼んだ位置）。 """
     # 思い出す順番：1) このセッションで選んだ店 → 2) URLの ?store=
     prev = st.session_state.get('my_store')
     if prev not in STORE_NAMES:
@@ -2129,8 +2170,12 @@ def _select_store_with_company():
         corp_default = COMPANY_OF.get(prev, 'すべて')
     if corp_default not in corp_options:
         corp_default = 'すべて'
-    corp = st.selectbox('法人で絞る', corp_options, index=corp_options.index(corp_default),
-                        key='store_company_filter_box')
+    # 横並び：左「法人で絞る」（見出しあり）／右「店舗名」（見出しなし）。
+    #   右は見出しを消してあるので、下端をそろえて（vertical_alignment='bottom'）高さの差を吸収する。
+    c_corp, c_shop = st.columns([1, 2], vertical_alignment='bottom')
+    with c_corp:
+        corp = st.selectbox('法人で絞る', corp_options, index=corp_options.index(corp_default),
+                            key='store_company_filter_box')
     st.session_state['store_company_filter'] = corp
     names = list(STORE_NAMES) if corp == 'すべて' else list(STORES_BY_COMPANY.get(corp, []))
 
@@ -2138,16 +2183,18 @@ def _select_store_with_company():
     options = [SENTINEL_STORE] + names
     default_index = options.index(prev) if prev in names else 0
 
-    # 未選択のときだけ、選択欄の上に赤い注意書きを出す（選んだあとは邪魔なので出さない）。
-    #   ★左バーは幅が狭いので、選択済みのときにラベルを重ねて出すのはやめた（2026-08-14）。
-    label_ph = st.empty()
-    choice = st.selectbox(
-        '店舗名（必須）',
-        options,
-        index=default_index,
-        format_func=lambda n: n,
-        label_visibility='collapsed',
-        key='store_select_%s' % corp)   # 法人を変えたら選択欄を作り直す（前の法人の選択を引きずらない）
+    # 未選択のときだけ、赤い注意書きを出す（選んだあとは邪魔なので出さない）。
+    #   ★選択済みのときにラベルを重ねて出すのはやめた（2026-08-14）。
+    #   ★2026-09-19：赤字の置き場所は帯の中ではなく帯の下（本体の先頭）＝notice_host。帯の高さを変えないため。
+    label_ph = (notice_host if notice_host is not None else st).empty()
+    with c_shop:
+        choice = st.selectbox(
+            '店舗名（必須）',
+            options,
+            index=default_index,
+            format_func=lambda n: n,
+            label_visibility='collapsed',
+            key='store_select_%s' % corp)   # 法人を変えたら選択欄を作り直す（前の法人の選択を引きずらない）
 
     if choice in STORE_NAMES:
         my_store = choice
@@ -2162,7 +2209,8 @@ def _select_store_with_company():
 
 
 def _render_upload_form_area(backend, my_store, index, latest):
-    """ 選んだ店の「当月ぶんアップ済みか」を出し、アップロード欄（折りたたみ）を描く。upload_section の後半。 """
+    """ 上の帯の2行目：選んだ店の「当月ぶんアップ済みか」を折りたたみの見出しに出し、
+        その中にアップロード欄を描く（main() が store_section の次に呼ぶ）。 """
 
     # ------------------------------------------------------------------
     # 選んだ店の「当月ぶんアップ済みか」を出し、アップロード欄の開き方を決める
@@ -2174,36 +2222,43 @@ def _render_upload_form_area(backend, my_store, index, latest):
     done = bool(entry) and entry.get('ym') == latest \
         and not str(entry.get('format', '')).startswith('NG')
 
-    # ★左バーは幅が狭いので、長い一文は行数を食う。
-    #   「済み／未提出」がひと目で分かることを優先し、ファイル名などの細かい記録は
-    #   折りたたみ（アップロード欄）の中に回す。伝える内容は落としていない。
+    # ★2026-09-19（上の帯）：帯を薄く保つため、「済み／まだ」は折りたたみの見出しに入れ、
+    #   ファイル名などの細かい記録と注意書きは折りたたみの中に回す。伝える内容は落としていない。
+    #   （案Bの左バーでは、緑／黄色の箱を見出しの上に置いていた）
     if my_store and done:
-        st.success('%s分はアップ済み  \n'
-                   '毎回アップし直す必要はありません' % ym_disp)
-        st.caption('%s／%s行' % (entry.get('uploaded_at', '不明'), entry.get('rows', '?')))
-        exp_label = '新しいデータに差し替える'
+        exp_label = '在庫ファイルをアップロードする（%s分・アップ済み。差し替えるときだけ開く）' % ym_disp
         exp_open = False
+        note_kind, note = 'success', ('%s分はアップ済みです（%s／%s行）。毎回アップし直す必要はありません。'
+                                      '新しいデータに差し替えるときだけ、下から上げ直してください。'
+                                      % (ym_disp, entry.get('uploaded_at', '不明'), entry.get('rows', '?')))
     elif my_store:
-        st.warning('**%s**の在庫ファイルは、まだアップされていません%s。'
-                   % (my_store, ('' if latest is None else '（対象月は%s）' % ym_disp)))
-        exp_label = '在庫ファイルをアップロードする'
+        exp_label = ('在庫ファイルをアップロードする（%s）'
+                     % ('まだアップされていません' if latest is None else '%s分・まだアップされていません' % ym_disp))
         exp_open = True
+        note_kind, note = 'warning', ('**%s**の在庫ファイルは、まだアップされていません%s。'
+                                      % (my_store, ('' if latest is None else '（対象月は%s）' % ym_disp)))
     else:
         exp_label = '在庫ファイルをアップロードする'
         exp_open = True
+        note_kind, note = None, None
 
     with st.expander(exp_label, expanded=exp_open):
+        if note:
+            getattr(st, note_kind)(note)
         _upload_form(backend, my_store)
 
 
 def _upload_form(backend, my_store):
-    """ 在庫ファイルを選んでアップロードする欄。upload_section から折りたたみの中に置いて呼ぶ。 """
+    """ 在庫ファイルを選んでアップロードする欄。_render_upload_form_area が折りたたみの中に置いて呼ぶ。 """
     if my_store:
         st.caption('→ **%s** で提出します。' % my_store)
 
-    up = st.file_uploader(
-        '薬VANの在庫ファイル（.xls / .csv / .xlsx）',
-        type=['xls', 'csv', 'xlsx'], accept_multiple_files=False)
+    # ★2026-09-19（上の帯）：幅が広がったので、ファイル欄と対象年月を横並び（3:1）にする。
+    c_file, c_ym = st.columns([3, 1])
+    with c_file:
+        up = st.file_uploader(
+            '薬VANの在庫ファイル（.xls / .csv / .xlsx）',
+            type=['xls', 'csv', 'xlsx'], accept_multiple_files=False)
 
     # 対象年月：ファイル名に _YYYYMM があればそれを初期値に、無ければ当月
     default_ym = jst.today().strftime('%Y%m')   # 日本時間の今日（UTCずれ対策）
@@ -2211,8 +2266,9 @@ def _upload_form(backend, my_store):
         _, ym_from_name = yuzu_core.parse_filename(up.name)
         if ym_from_name:
             default_ym = ym_from_name
-    ym = st.text_input('対象年月（YYYYMM の6桁）', value=default_ym,
-                       help='薬VANを出力した月。ファイル名が「店名_202607」ならその6桁が入ります。')
+    with c_ym:
+        ym = st.text_input('対象年月（YYYYMM の6桁）', value=default_ym,
+                           help='薬VANを出力した月。ファイル名が「店名_202607」ならその6桁が入ります。')
 
     # ------------------------------------------------------------------
     # 誤アップロード防止：ファイル名の店名と、選んでいる店名を突き合わせる
@@ -2292,13 +2348,17 @@ def _upload_form(backend, my_store):
 #   ※2026-07-28：②③④を切替ボタン（view_switcher）で1つずつ表示するようにした。
 #     3つを縦に並べると④まで延々スクロールが要るため。Excelボタンは切替の外＝常に一番下にある。
 # ============================================================================
-def results_section(backend, stores, latest, index):
+def results_section(backend, stores, latest, index, status=None, nav_host=None):
     # ※保管庫の読み込み（load_current_month_stores）は main() で1回だけ行い、
     #   アップロード欄と結果表示で使い回す（Gシートへの往復を増やさないため）。
+    #   status   … app_logic.uploaded_status の結果。main() が帯を描くために先に作るので受け取る
+    #              （None なら自分で作る。純関数なので保管庫の読み直しは起きない）。
+    #   nav_host … ②③④⑤の切替ボタンを描く場所（上の帯の3行目）。None なら本体の中に描く。
     #   ★ためておいた通知（メール結果・出庫可能数の保存結果など）を画面の先頭で1回だけ出す。
     #     投稿・予約・取消は保存後に st.rerun するため、その回のメッセージは消える。ここで拾って見せる。
     _render_flash()
-    status = app_logic.uploaded_status(index, latest, STORE_NAMES)
+    if status is None:
+        status = app_logic.uploaded_status(index, latest, STORE_NAMES)
 
     # ---- 月次スケジュール（10日締切・11日予約開始）の判定 ----
     #   ★「今日」は日本時間（jst.today）で“ここで1回だけ”取り、純関数 schedule_state に渡す。
@@ -2311,10 +2371,9 @@ def results_section(backend, stores, latest, index):
                 'いまのうちに自店のデッド確認・除外・出庫可能数の調整をしてください。'
                 % (status['n'], STORE_COUNT, sched['open_day']))
 
-    # 現在の状況（N/36店・対象月・未アップの店）は左バーへ描く（2026-08-14・案B）。
-    #   ★サイドバーはスクリプトのどこから書いても左バーに出るので、
-    #     ここで呼んでも並び順は「店舗選択 → 状況 → ②③④⑤」になる。
-    show_upload_status(status, latest)
+    # 現在の状況（N/36店・対象月・未アップの店）は上の帯の1行目に描いてある（main()・2026-09-19）。
+    #   ここでは、様式NG店の注意書きだけを本体の先頭に出す。
+    show_upload_status_notice(status)
 
     if not stores:
         st.stop()
@@ -2407,8 +2466,8 @@ def results_section(backend, stores, latest, index):
 
     if not my_store:
         st.subheader('②（自店）のデッド品')
-        # ★案内の「上で」→「左の」に修正（2026-08-14）。店舗の選択欄が左バーへ移ったため。
-        st.info('**左の「① 自店を選ぶ」**で店舗名を選ぶと、自店のデッド品（②）・期限切迫品（③）と、'
+        # ★案内の「左の」→「上の帯の」に修正（2026-09-19）。店舗の選択欄が左バーから上の帯へ移ったため。
+        st.info('**上の帯の「店舗名」**で店舗名を選ぶと、自店のデッド品（②）・期限切迫品（③）と、'
                 'それぞれを欲しがっている店が表示されます。')
     else:
         my_uploaded = (my_store in status['uploaded'])
@@ -2463,7 +2522,7 @@ def results_section(backend, stores, latest, index):
             # ---- ②③④⑤の切替ボタン。選ばれた1つだけを下に描く ----
             #   ④のボタンには「引き取れる薬の件数」、⑤には「新着（未読）件数」を出す。
             chosen = view_switcher(len(view_a), len(view_expiry), len(view_receive),
-                                   n_unread=total_unread)
+                                   n_unread=total_unread, host=nav_host)
 
             # ⑤以外へ切り替えたら、いま開いている会話（msg_open）を閉じる。
             #   ＝⑤へ戻ってきたときは必ず一覧から始まり、前に開いていた相手が勝手に開かない
@@ -2556,18 +2615,22 @@ def main():
     if not password_gate():
         return
 
-    # ★2026-08-14（案B）：画面の骨組みを「左バー＋本体」に変更。
-    #   左バー … アプリ名・自店の選択・アップロード欄・アップ状況・②③④⑤の切替
-    #   本体　 … いま選んでいる表そのもの（幅いっぱいを表に使う）
-    #   左バーは下へスクロールしても消えないので、
-    #   「自分がどの店として見ているか」「他店がそろっているか」を見失わない。
-    with st.sidebar:
-        st.markdown('### 💊 デッドストック')
-        # 管理者の合言葉で入っているときは、誰で入っているかが分かるように1行出す（店の合言葉なら何も出さない）
-        #   例：「本部モード：本間（36店を自由に切り替えできます）」。旧 admin_password なら名前は「本部」。
-        if st.session_state.get('auth_mode') == 'admin':
-            who = st.session_state.get('auth_admin') or app_logic.LEGACY_ADMIN_NAME
-            st.caption('本部モード：%s（%d店を自由に切り替えできます）' % (who, STORE_COUNT))
+    # ★2026-09-19：画面の骨組みを「上の薄い帯＋幅いっぱいの本体」に変更（本間部長承認）。
+    #   帯（3行・下へスクロールしても上に貼り付いたまま残る＝CSS の sticky）
+    #     1行目 … アプリ名／自店（本部用なら法人・店舗名の横並び）／アップ済み N/36店＋未アップの店／本部モード
+    #     2行目 … 在庫ファイルのアップロード欄（折りたたみ。未アップの月は開いておく）
+    #     3行目 … ②③④⑤の切替ボタン（横一列）
+    #   本体 … いま選んでいる表そのもの（幅いっぱいを表に使う）
+    #   「自分がどの店として見ているか」「他店がそろっているか」を見失わない、という狙いは案Bと同じ。
+    #   （2026-08-14〜09-18 は案B＝左バー＋広い表。36店になって左バーでは窮屈になったため帯へ）
+    #   ★左バーには何も描かない（描かなければ Streamlit は左バーそのものを出さない）。
+    #   ★入れ物を先に作っておく理由：3行目の件数は本体の計算（results_section）で決まるため、
+    #     帯を先に画面へ出しておき、あとから3行目（row3）へ書き込む。
+    top = st.container(key='topbar')
+    row1 = top.container()
+    row2 = top.container()
+    row3 = top.container()
+    notice = st.container()   # 帯の直下＝本体の先頭。「まず店舗名を選んでください」の赤字はここに出す
 
     if not gsheet_configured():
         st.warning('（開発モード）Googleシート未接続のため、このブラウザのセッションにだけ保存します。'
@@ -2587,13 +2650,33 @@ def main():
         show_gsheet_error(e, '保管庫からデータを読めませんでした')
         return
 
-    # 店舗の選択とアップロード欄は左バーの上段へ。
-    #   ★ここで my_store が session_state に入る。results_section はそれを読むので、
-    #     必ず results_section より先に呼ぶこと（順番を入れ替えない）。
-    with st.sidebar:
-        upload_section(backend, index, latest)
+    # アップ状況（N/36店・未アップの店）は index/latest から作る純関数＝保管庫の読み直しは起きない。
+    status = app_logic.uploaded_status(index, latest, STORE_NAMES)
 
-    results_section(backend, stores, latest, index)
+    # ---- 帯の1行目：アプリ名／自店／アップ状況／本部モード ----
+    #   ★ここ（store_section）で my_store が session_state に入る。results_section はそれを読むので、
+    #     必ず results_section より先に呼ぶこと（順番を入れ替えない）。
+    with row1:
+        c_app, c_store, c_status, c_mode = st.columns([2, 4, 3, 3], vertical_alignment='center')
+        with c_app:
+            st.markdown('**💊 デッドストック**')
+        with c_store:
+            my_store = store_section(notice_host=notice)
+        with c_status:
+            show_upload_status_bar(status, latest)
+        with c_mode:
+            # 管理者の合言葉で入っているときは、誰で入っているかが分かるように1行出す（店の合言葉なら何も出さない）
+            #   例：「本部モード：本間（36店を自由に切り替えできます）」。旧 admin_password なら名前は「本部」。
+            if st.session_state.get('auth_mode') == 'admin':
+                who = st.session_state.get('auth_admin') or app_logic.LEGACY_ADMIN_NAME
+                st.caption('本部モード：%s（%d店を自由に切り替えできます）' % (who, STORE_COUNT))
+
+    # ---- 帯の2行目：アップロード欄（折りたたみ） ----
+    with row2:
+        _render_upload_form_area(backend, my_store, index, latest)
+
+    # ---- 本体（②③④⑤の切替ボタンは results_section が帯の3行目 row3 へ描く） ----
+    results_section(backend, stores, latest, index, status=status, nav_host=row3)
 
 
 if __name__ == '__main__':

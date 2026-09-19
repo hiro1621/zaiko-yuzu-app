@@ -15,7 +15,8 @@
   7. Googleシート（gsheet_store）… values_batch_get 1回／失敗時36回／_店舗情報 が無いブック
   8. 見本・生成スクリプト・画面（2026-09-19）… secrets.toml.sample が TOML として読め [admin_passwords] が7人／
      _検証用合言葉を作る.py の出力が TOML として読め 7＋36 で全値が別／AppTest（ダミー Secrets・ローカル保管庫）で
-     名前つき管理者で入ると左バーに名前が出て、法人で絞って36店を切り替えられる
+     名前つき管理者で入ると上の帯に名前が出て、法人で絞って36店を切り替えられる／左バーには何も無い
+     （2026-09-19 左バー→上の帯。AppTest は at.main（本体）で探し、at.sidebar は「空であること」だけ見る）
   ★合言葉の値・メールアドレス・所在地・人名はすべてダミー（実在の値は一切書かない。管理者の「名前」は役職名の固定7つ）。
 
 【実行方法（このフォルダで）】
@@ -512,22 +513,32 @@ try:
     at.text_input[0].input(_AP['森田']); at.button[0].click().run()
     check('AppTest: 名前つき管理者（森田）で入れる（auth_mode=admin・auth_admin=森田）',
           _ss(at, 'authed') and _ss(at, 'auth_mode') == 'admin' and _ss(at, 'auth_admin') == '森田', 'session_state を表示できません')
-    check('AppTest: 左バーに「本部モード：森田（36店を自由に切り替えできます）」',
-          any(c.value == '本部モード：森田（36店を自由に切り替えできます）' for c in at.sidebar.caption), [c.value for c in at.sidebar.caption])
-    _corp = [s for s in at.sidebar.selectbox if s.label == '法人で絞る']
-    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）']
+    # ★2026-09-19 左バー→上の帯：本部モードの行・法人／店舗名の選択欄は本体（at.main）で探す。左バーには何も無い。
+    check('AppTest: 上の帯（本体）に「本部モード：森田（36店を自由に切り替えできます）」',
+          any(c.value == '本部モード：森田（36店を自由に切り替えできます）' for c in at.main.caption), [c.value for c in at.main.caption])
+    check('AppTest: 左バーに要素が1つも無い（左バーをやめた・2026-09-19）',
+          len(at.sidebar.children) == 0 and len(at.sidebar.caption) == 0 and len(at.sidebar.selectbox) == 0, len(at.sidebar.children))
+    check('AppTest: 上の帯のアプリ名「💊 デッドストック」と「アップ済み」の数字が本体にある',
+          any('デッドストック' in m.value for m in at.main.markdown) and any(m.label == 'アップ済み' for m in at.main.metric),
+          ([m.value for m in at.main.markdown][:3], [m.label for m in at.main.metric]))
+    _corp = [s for s in at.main.selectbox if s.label == '法人で絞る']
+    _shop = [s for s in at.main.selectbox if s.label == '店舗名（必須）']
     check('AppTest: 「法人で絞る」（4択）と「店舗名」（36店＋先頭）が出る', len(_corp) == 1 and len(_corp[0].options) == 4 and len(_shop) == 1 and len(_shop[0].options) == 37,
-          [(s.label, len(s.options)) for s in at.sidebar.selectbox])
+          [(s.label, len(s.options)) for s in at.main.selectbox])
+    check('AppTest: 店が未選択のあいだは赤字「まず店舗名を選んでください」が本体に出る',
+          any('まず店舗名を選んでください' in m.value for m in at.main.markdown))
     _corp[0].select('飛鳥').run()
-    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）']
+    _shop = [s for s in at.main.selectbox if s.label == '店舗名（必須）']
     check('AppTest: 飛鳥で絞ると店舗名は22店＋先頭', len(_shop) == 1 and len(_shop[0].options) == 23 and '本店' in _shop[0].options and '東立石' not in _shop[0].options)
     _shop[0].select('本店').run()
     check('AppTest: 本店を選ぶと my_store=本店・URL ?store=本店', _ss(at, 'my_store') == '本店' and at.query_params.get('store') in ('本店', ['本店']), (_ss(at, 'my_store'), dict(at.query_params)))
-    _corp = [s for s in at.sidebar.selectbox if s.label == '法人で絞る'][0]
+    check('AppTest: 店を選んだら赤字は消える', not any('まず店舗名を選んでください' in m.value for m in at.main.markdown))
+    _corp = [s for s in at.main.selectbox if s.label == '法人で絞る'][0]
     _corp.select('内観堂').run()
-    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）'][0]
+    _shop = [s for s in at.main.selectbox if s.label == '店舗名（必須）'][0]
     _shop.select('氷川台').run()
     check('AppTest: 内観堂に切り替えて氷川台を選べる（管理者は店を自由に変えられる）', _ss(at, 'my_store') == '氷川台' and not at.exception, [str(e) for e in at.exception])
+    check('AppTest: 店を切り替えても左バーは空のまま', len(at.sidebar.children) == 0)
     # 店の合言葉で入ると固定される（比較のため1本だけ）
     at2 = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
     at2.secrets['admin_passwords'] = dict(_AP)
@@ -535,14 +546,16 @@ try:
     at2.run(); at2.text_input[0].input(_SP['東立石']); at2.button[0].click().run()
     check('AppTest: 店の合言葉で入ると東立石に固定・本部モードの行は出ない・法人の選択欄も出ない',
           _ss(at2, 'auth_store') == '東立石' and _ss(at2, 'auth_admin') is None
-          and not any('本部モード' in c.value for c in at2.sidebar.caption) and not any(s.label == '法人で絞る' for s in at2.sidebar.selectbox))
+          and not any('本部モード' in c.value for c in at2.main.caption) and not any(s.label == '法人で絞る' for s in at2.main.selectbox))
+    check('AppTest: 店の合言葉のときは上の帯に「自店：東立石（ソユーズ）」', any(m.value == '自店：**東立石**（ソユーズ）' for m in at2.main.markdown),
+          [m.value for m in at2.main.markdown][:5])
     # 旧 admin_password だけの環境（[admin_passwords] なし）でも「本部」で入れる
     at3 = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
     at3.secrets['admin_password'] = 'dummy-admin-old'
     at3.secrets['store_passwords'] = dict(_SP)
     at3.run(); at3.text_input[0].input('dummy-admin-old'); at3.button[0].click().run()
-    check('AppTest: 旧 admin_password だけでも入れて左バーは「本部モード：本部（…）」',
-          _ss(at3, 'auth_admin') == '本部' and any(c.value.startswith('本部モード：本部（') for c in at3.sidebar.caption), [c.value for c in at3.sidebar.caption])
+    check('AppTest: 旧 admin_password だけでも入れて上の帯は「本部モード：本部（…）」',
+          _ss(at3, 'auth_admin') == '本部' and any(c.value.startswith('本部モード：本部（') for c in at3.main.caption), [c.value for c in at3.main.caption])
 except ImportError:
     print('  [--] streamlit.testing が無いため AppTest は省略')
 
