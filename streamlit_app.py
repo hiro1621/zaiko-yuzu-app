@@ -726,8 +726,7 @@ def password_gate():
     st.markdown(
         '<div class="ds-hero">'
         '<div class="ds-hero-title">💊 デッドストックリスト</div>'
-        '<div class="ds-hero-sub">ソユーズ薬局・内観堂薬局・飛鳥薬局 %d店の在庫融通</div>'
-        '</div>' % STORE_COUNT, unsafe_allow_html=True)
+        '</div>', unsafe_allow_html=True)   # ★2026-09-19 本間部長指示で下の一言（法人名と店数）は消した
     sp = _store_passwords()
     ap = _admin_passwords()
     admin = _get_secret('admin_password')
