@@ -7,12 +7,16 @@
 3法人対応の追加ぶんを確かめる。確認する対象：
   1. 店舗マスタ（stores_config）… 36店・法人別の件数・重複なし・飛鳥22店が事務ポータルの店名と一致・シート名安全
   2. 合言葉の判定（app_logic.evaluate_password）… 一致・不一致・重複・本部用・後方互換
+     ＋2026-09-19 名前ごとの管理者7人（[admin_passwords]）… 7人それぞれ／旧 admin_password／両方／重複拒否／空 dict
   3. 受取時期（app_logic.pickup_options / pickup_cap / resolve_pickup / _pickup_display）… 便の月・丸め・旧予約の互換
   4. 3,000円ライン（app_logic.box_totals）… 確定版 表の例A（3,600円到達）・例B（2,000円未達）
   5. 引取依頼書（app_logic.build_pickup_request → yuzu_core.write_pickup_request_excel）… 11列・式・記名欄・合計・同一法人注記・幅
   6. メール（mailer）… smtplib を偽物に差し替え、接続1回・ログイン1回・35通・リンク・宛先未登録の要約・途中失敗・予算切れ
   7. Googleシート（gsheet_store）… values_batch_get 1回／失敗時36回／_店舗情報 が無いブック
-  ★合言葉の値・メールアドレス・所在地・人名はすべてダミー（実在の値は一切書かない）。
+  8. 見本・生成スクリプト・画面（2026-09-19）… secrets.toml.sample が TOML として読め [admin_passwords] が7人／
+     _検証用合言葉を作る.py の出力が TOML として読め 7＋36 で全値が別／AppTest（ダミー Secrets・ローカル保管庫）で
+     名前つき管理者で入ると左バーに名前が出て、法人で絞って36店を切り替えられる
+  ★合言葉の値・メールアドレス・所在地・人名はすべてダミー（実在の値は一切書かない。管理者の「名前」は役職名の固定7つ）。
 
 【実行方法（このフォルダで）】
     python test_3houjin_36stores_20260918.py
@@ -101,6 +105,53 @@ r = al.evaluate_password('shared', SP, '', 'shared', sc.STORE_NAMES)
 check('[store_passwords] があるとき app_password は無視される', not r['ok'], r)
 r = al.evaluate_password('', None, '', '', sc.STORE_NAMES)
 check('何も設定なし→dev（開発モード）', r['ok'] and r['mode'] == 'dev', r)
+
+# --- 2026-09-19 名前ごとの管理者7人（[admin_passwords]）。値はダミー ---
+print('\n■ 2b) 名前ごとの管理者（[admin_passwords]・7人）')
+check('ADMIN_NAMES は固定の7人・この順', sc.ADMIN_NAMES == ['本間', '森田', '小島', 'ソユーズ担当者', '内観堂担当者', '加藤', '飛鳥薬局担当者'], sc.ADMIN_NAMES)
+AP = {n: 'dummy-adm-%02d' % i for i, n in enumerate(sc.ADMIN_NAMES)}   # 7人に別々のダミー値
+for n in sc.ADMIN_NAMES:
+    r = al.evaluate_password(AP[n], SP, '', '', sc.STORE_NAMES, admin_passwords=AP)
+    check('管理者 %s の値→admin・admin_name 一致・店は未確定' % n,
+          r['ok'] and r['mode'] == 'admin' and r['admin_name'] == n and r['store'] is None, r)
+r = al.evaluate_password('dummy-admin', SP, 'dummy-admin', '', sc.STORE_NAMES)
+check('旧 admin_password だけ（admin_passwords 省略）→admin・admin_name=本部', r['ok'] and r['mode'] == 'admin' and r['admin_name'] == '本部', r)
+r = al.evaluate_password('dummy-admin', SP, 'dummy-admin', '', sc.STORE_NAMES, admin_passwords=None)
+check('旧 admin_password だけ（admin_passwords=None）→admin・本部', r['ok'] and r['mode'] == 'admin' and r['admin_name'] == '本部', r)
+r1 = al.evaluate_password(AP['小島'], SP, 'dummy-admin', '', sc.STORE_NAMES, admin_passwords=AP)
+r2 = al.evaluate_password('dummy-admin', SP, 'dummy-admin', '', sc.STORE_NAMES, admin_passwords=AP)
+check('[admin_passwords] と旧 admin_password の両方あり→両方通る（小島／本部）',
+      r1['ok'] and r1['admin_name'] == '小島' and r2['ok'] and r2['admin_name'] == '本部', (r1, r2))
+r = al.evaluate_password('dummy-03', SP, 'dummy-admin', '', sc.STORE_NAMES, admin_passwords=AP)
+check('店の合言葉は従来どおり店に固定・admin_name は None', r['ok'] and r['mode'] == 'store' and r['store'] == '東立石' and r['admin_name'] is None, r)
+AP_S = dict(AP); AP_S['森田'] = SP['柏']            # 管理者と店で同じ値
+r = al.evaluate_password(SP['柏'], SP, '', '', sc.STORE_NAMES, admin_passwords=AP_S)
+check('管理者と店で同じ値→拒否＋警告文', (not r['ok']) and r['error'] == '同じ合言葉が複数に登録されています。管理本部に連絡し、設定を確認してください。', r)
+AP_A = dict(AP); AP_A['加藤'] = AP_A['本間']         # 管理者どうし同じ値
+r = al.evaluate_password(AP_A['本間'], SP, '', '', sc.STORE_NAMES, admin_passwords=AP_A)
+check('管理者どうし同じ値→拒否＋警告文', (not r['ok']) and '複数に登録' in r['error'], r)
+r = al.evaluate_password(AP['本間'], SP, AP['本間'], '', sc.STORE_NAMES, admin_passwords=AP)
+check('名前つき管理者と旧 admin_password が同じ値→拒否', (not r['ok']) and '複数に登録' in r['error'], r)
+r = al.evaluate_password(SP2['東立石'], SP2, '', '', sc.STORE_NAMES, admin_passwords=AP)
+check('店どうし同じ値→拒否（文言は管理者と共通）', (not r['ok']) and '複数に登録' in r['error'], r)
+r = al.evaluate_password('dummy-admin', SP, 'dummy-admin', '', sc.STORE_NAMES, admin_passwords={})
+check('[admin_passwords] が空 dict→旧 admin_password にフォールバック（本部）', r['ok'] and r['mode'] == 'admin' and r['admin_name'] == '本部', r)
+r = al.evaluate_password('dummy-03', SP, '', '', sc.STORE_NAMES, admin_passwords={})
+check('[admin_passwords] が空 dict・旧も無し→店の合言葉は通る', r['ok'] and r['store'] == '東立石', r)
+r = al.evaluate_password('wrong', SP, '', '', sc.STORE_NAMES, admin_passwords=AP)
+check('管理者・店のどれとも違う→拒否', (not r['ok']) and '違います' in r['error'], r)
+r = al.evaluate_password('', SP, '', '', sc.STORE_NAMES, admin_passwords=AP)
+check('空欄→拒否（管理者の空値にも一致しない）', not r['ok'], r)
+AP_E = dict(AP); AP_E['加藤'] = ''                  # まだ配らない人は空
+r = al.evaluate_password('', None, '', '', sc.STORE_NAMES, admin_passwords={'加藤': ''})
+check('管理者の値が全部空・他も無し→dev（未設定と同じ）', r['ok'] and r['mode'] == 'dev', r)
+r = al.evaluate_password(AP['本間'], None, '', '', sc.STORE_NAMES, admin_passwords=AP_E)
+check('[admin_passwords] だけ（店ごと・共有なし）でも管理者は入れる', r['ok'] and r['admin_name'] == '本間', r)
+r = al.evaluate_password('wrong', None, '', '', sc.STORE_NAMES, admin_passwords=AP_E)
+check('[admin_passwords] だけ・不一致→拒否（dev に落ちない）', (not r['ok']) and '違います' in r['error'], r)
+check('戻り値のキーは常に ok/mode/store/admin_name/error',
+      all(set(al.evaluate_password(p, s, a, l, sc.STORE_NAMES, admin_passwords=x).keys()) == {'ok', 'mode', 'store', 'admin_name', 'error'}
+          for p, s, a, l, x in [('', None, '', '', None), ('x', SP, '', '', AP), ('shared', None, '', 'shared', None), ('dummy-admin', None, 'dummy-admin', '', None)]))
 
 # ============================================================================
 # 3) 受取時期（便の月）
@@ -402,6 +453,98 @@ check('60秒キャッシュ（読み直さない）', gs.read_store_info(book4)[
 check('force=True で読み直す', gs.read_store_info(book4, force=True)['東立石']['所在地'] == '変更後')
 lb = al.LocalBackend({})
 check('LocalBackend.load_store_info は空辞書', lb.load_store_info() == {})
+
+# ============================================================================
+# 8) 見本・生成スクリプト・画面（2026-09-19 名前ごとの管理者）
+# ============================================================================
+print('\n■ 8) Secrets の見本・_検証用合言葉を作る.py・AppTest（名前つき管理者）')
+import tomllib
+import subprocess
+_sample = os.path.join(HERE, '.streamlit', 'secrets.toml.sample')
+try:
+    _d = tomllib.loads(open(_sample, encoding='utf-8').read())
+    check('secrets.toml.sample が TOML として読める', True)
+    check('見本の [admin_passwords] は ADMIN_NAMES と同じ7人・同じ並び', list(_d.get('admin_passwords', {}).keys()) == sc.ADMIN_NAMES, list(_d.get('admin_passwords', {}).keys()))
+    check('見本の [store_passwords] は STORE_NAMES と同じ36店・同じ並び', list(_d.get('store_passwords', {}).keys()) == sc.STORE_NAMES)
+    _vals = list(_d['admin_passwords'].values()) + list(_d['store_passwords'].values())
+    check('見本の値（管理者7＋店36）はすべて別（同じ値だと入れなくなるため）', len(set(_vals)) == len(_vals) == 43)
+    check('見本の1行項目（spreadsheet_id・app_url）が表の中に紛れていない', 'spreadsheet_id' in _d and 'app_url' in _d and 'spreadsheet_id' not in _d['admin_passwords'])
+    check('見本に旧 admin_password は有効行として残していない（コメント）', 'admin_password' not in _d)
+except Exception as e:
+    check('secrets.toml.sample が TOML として読める', False, e)
+# 生成スクリプト（docs 側）… 引数なし・標準出力だけ・ファイルは作らない
+_gen = os.path.normpath(os.path.join(HERE, '..', 'docs', '3法人対応改修_202610', '_検証用合言葉を作る.py'))
+if os.path.exists(_gen):
+    _before = set(os.listdir(os.path.dirname(_gen)))
+    _p = subprocess.run([sys.executable, _gen], capture_output=True, text=True, cwd=os.path.dirname(_gen))
+    _after = set(os.listdir(os.path.dirname(_gen)))
+    try:
+        _g = tomllib.loads(_p.stdout)
+        check('_検証用合言葉を作る.py の出力が TOML として読める', _p.returncode == 0)
+        check('出力は [admin_passwords] 7人（ADMIN_NAMES の順）＋[store_passwords] 36店', list(_g.get('admin_passwords', {}).keys()) == sc.ADMIN_NAMES and list(_g.get('store_passwords', {}).keys()) == sc.STORE_NAMES)
+        _gv = list(_g['admin_passwords'].values()) + list(_g['store_passwords'].values())
+        check('出力の43個の値がすべて別・空なし', len(set(_gv)) == 43 and all(_gv))
+        check('旧 admin_password の1行は出さない', 'admin_password' not in _g)
+        check('ファイルを作らない（フォルダの中身が増えていない）', _before == _after, _after - _before)
+    except Exception as e:
+        check('_検証用合言葉を作る.py の出力が TOML として読める', False, (e, _p.stderr[-300:]))
+else:
+    print('  [--] _検証用合言葉を作る.py が見つからないため省略')
+# AppTest：ダミー Secrets を注入し、Googleシート未設定＝ローカル保管庫（LocalBackend）で画面を動かす
+try:
+    from streamlit.testing.v1 import AppTest
+
+    def _ss(app, key):
+        """ AppTest の session_state から安全に読む（.get が無く、無いキーは例外になるため）。 """
+        try:
+            return app.session_state[key]
+        except Exception:
+            return None
+    _AP = {n: 'dummy-adm-%02d' % i for i, n in enumerate(sc.ADMIN_NAMES)}
+    _SP = {n: 'dummy-%02d' % i for i, n in enumerate(sc.STORE_NAMES)}
+    at = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
+    at.secrets['admin_passwords'] = dict(_AP)
+    at.secrets['store_passwords'] = dict(_SP)
+    at.run()
+    check('AppTest: 起動時に例外なし・合言葉の入力欄と「入る」がある', (not at.exception) and len(at.text_input) == 1 and any(b.label == '入る' for b in at.button), [str(e) for e in at.exception])
+    at.text_input[0].input('wrong'); at.button[0].click().run()
+    check('AppTest: 違う合言葉→エラー表示・入れない', (not _ss(at, 'authed')) and any('違います' in e.value for e in at.error))
+    at.text_input[0].input(_AP['森田']); at.button[0].click().run()
+    check('AppTest: 名前つき管理者（森田）で入れる（auth_mode=admin・auth_admin=森田）',
+          _ss(at, 'authed') and _ss(at, 'auth_mode') == 'admin' and _ss(at, 'auth_admin') == '森田', 'session_state を表示できません')
+    check('AppTest: 左バーに「本部モード：森田（36店を自由に切り替えできます）」',
+          any(c.value == '本部モード：森田（36店を自由に切り替えできます）' for c in at.sidebar.caption), [c.value for c in at.sidebar.caption])
+    _corp = [s for s in at.sidebar.selectbox if s.label == '法人で絞る']
+    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）']
+    check('AppTest: 「法人で絞る」（4択）と「店舗名」（36店＋先頭）が出る', len(_corp) == 1 and len(_corp[0].options) == 4 and len(_shop) == 1 and len(_shop[0].options) == 37,
+          [(s.label, len(s.options)) for s in at.sidebar.selectbox])
+    _corp[0].select('飛鳥').run()
+    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）']
+    check('AppTest: 飛鳥で絞ると店舗名は22店＋先頭', len(_shop) == 1 and len(_shop[0].options) == 23 and '本店' in _shop[0].options and '東立石' not in _shop[0].options)
+    _shop[0].select('本店').run()
+    check('AppTest: 本店を選ぶと my_store=本店・URL ?store=本店', _ss(at, 'my_store') == '本店' and at.query_params.get('store') in ('本店', ['本店']), (_ss(at, 'my_store'), dict(at.query_params)))
+    _corp = [s for s in at.sidebar.selectbox if s.label == '法人で絞る'][0]
+    _corp.select('内観堂').run()
+    _shop = [s for s in at.sidebar.selectbox if s.label == '店舗名（必須）'][0]
+    _shop.select('氷川台').run()
+    check('AppTest: 内観堂に切り替えて氷川台を選べる（管理者は店を自由に変えられる）', _ss(at, 'my_store') == '氷川台' and not at.exception, [str(e) for e in at.exception])
+    # 店の合言葉で入ると固定される（比較のため1本だけ）
+    at2 = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
+    at2.secrets['admin_passwords'] = dict(_AP)
+    at2.secrets['store_passwords'] = dict(_SP)
+    at2.run(); at2.text_input[0].input(_SP['東立石']); at2.button[0].click().run()
+    check('AppTest: 店の合言葉で入ると東立石に固定・本部モードの行は出ない・法人の選択欄も出ない',
+          _ss(at2, 'auth_store') == '東立石' and _ss(at2, 'auth_admin') is None
+          and not any('本部モード' in c.value for c in at2.sidebar.caption) and not any(s.label == '法人で絞る' for s in at2.sidebar.selectbox))
+    # 旧 admin_password だけの環境（[admin_passwords] なし）でも「本部」で入れる
+    at3 = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
+    at3.secrets['admin_password'] = 'dummy-admin-old'
+    at3.secrets['store_passwords'] = dict(_SP)
+    at3.run(); at3.text_input[0].input('dummy-admin-old'); at3.button[0].click().run()
+    check('AppTest: 旧 admin_password だけでも入れて左バーは「本部モード：本部（…）」',
+          _ss(at3, 'auth_admin') == '本部' and any(c.value.startswith('本部モード：本部（') for c in at3.sidebar.caption), [c.value for c in at3.sidebar.caption])
+except ImportError:
+    print('  [--] streamlit.testing が無いため AppTest は省略')
 
 print('\n合計：OK %d件 / NG %d件' % (_passed, _failed))
 sys.exit(1 if _failed else 0)

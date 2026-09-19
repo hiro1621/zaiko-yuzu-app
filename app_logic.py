@@ -676,51 +676,77 @@ def build_view_reserved(result, store_name, reservations, ym):
 
 # ============================================================================
 # 合言葉の判定（2026-09-18 3法人対応：店ごとの合言葉＋本部用＋後方互換の共有パスワード）
+#   ★2026-09-19 本間部長指示：本部用を「名前ごとの合言葉」（Secrets の [admin_passwords]・7人）にした。
+#     旧の admin_password（1つだけ）は後方互換で残す（入れたときの名前は '本部'）。
 #   ★合言葉の値はここにもテストにも書かない。値は Streamlit Cloud の Secrets 画面にだけ入れる。
 # ============================================================================
-def evaluate_password(pw, store_passwords, admin_password, app_password, store_names):
+DUP_PASSWORD_ERROR = '同じ合言葉が複数に登録されています。管理本部に連絡し、設定を確認してください。'
+LEGACY_ADMIN_NAME = '本部'   # 旧 admin_password で入ったときの管理者名
+
+
+def _pw_result(ok, mode='', store=None, admin_name=None, error=''):
+    """ evaluate_password の戻り値を1か所で組む（キーの抜けを防ぐ）。 """
+    return {'ok': ok, 'mode': mode, 'store': store, 'admin_name': admin_name, 'error': error}
+
+
+def evaluate_password(pw, store_passwords, admin_password, app_password, store_names, admin_passwords=None):
     """ 入力された合言葉を判定する純関数（画面部品に依存しない＝テスト可能・2026-09-18 3法人対応）。
           store_passwords … {店名: 合言葉}（Secrets の [store_passwords]。無ければ None）
-          admin_password  … 本部用の合言葉（無ければ ''）
+          admin_password  … 旧・本部用の合言葉1つ（無ければ ''。後方互換。[admin_passwords] があればそちらを推奨）
           app_password    … 旧・共有パスワード（後方互換。[store_passwords] が無いときだけ見る）
           store_names     … 店舗マスタ（stores_config.STORE_NAMES）。合言葉に対応する店がここに無ければ拒否
+          admin_passwords … {管理者名: 合言葉}（Secrets の [admin_passwords]・7人。無ければ None。2026-09-19 追加）
         戻り値の辞書：
           {'ok': True/False,
            'mode': 'admin'（本部・自由切替）／'store'（店に固定）／'legacy'（共有パスワード）／'dev'（未設定）／'',
            'store': 確定した店名（mode='store' のときだけ）,
+           'admin_name': 一致した管理者の名前（mode='admin' のときだけ。旧 admin_password なら '本部'）,
            'error': 画面に出す文言（ok=False のとき）}
-        判定の順：本部用 → 店ごと → （[store_passwords] が無いときだけ）共有 → どれも未設定なら開発モード。 """
+        判定の順：[admin_passwords] → admin_password（旧） → 店ごと → （[store_passwords] が無いときだけ）共有
+                  → どれも未設定なら開発モード。
+        ★同じ値が2か所以上（管理者どうし・管理者と店・店どうし）に登録されていたら、その値では入れない
+          （黙って片方に入れない＝別の店・別の人として動く事故を防ぐ）。 """
     pw = str(pw or '')
+    # 管理者（名前ごと）：名前も値も空のものは無いものとして扱う
+    admins = {}
+    for k, v in dict(admin_passwords or {}).items():
+        k = str(k or '').strip()
+        v = str(v or '').strip()
+        if k and v:
+            admins[k] = v
     admin = str(admin_password or '').strip()
     sp = store_passwords or None
     legacy = str(app_password or '').strip()
 
-    if admin and pw == admin:
-        return {'ok': True, 'mode': 'admin', 'store': None, 'error': ''}
+    if pw:
+        # 入れた値に一致する登録を全部集める（管理者＝('admin', 名前)／店＝('store', 店名)）
+        hits = [('admin', name) for name, v in admins.items() if v == pw]
+        if admin and pw == admin:
+            hits.append(('admin', LEGACY_ADMIN_NAME))
+        if sp:
+            hits.extend(('store', s) for s, v in sp.items() if v and v == pw)
+        if len(hits) >= 2:
+            return _pw_result(False, error=DUP_PASSWORD_ERROR)
+        if len(hits) == 1:
+            kind, name = hits[0]
+            if kind == 'admin':
+                return _pw_result(True, mode='admin', admin_name=name)
+            if name not in (store_names or []):
+                return _pw_result(False, error='合言葉に対応する店（%s）が店舗マスタにありません。管理本部に連絡し、設定を確認してください。' % name)
+            return _pw_result(True, mode='store', store=name)
     if sp:
         if not pw:
-            return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉を入れてください。'}
-        matched = [s for s, v in sp.items() if v and v == pw]
-        if len(matched) >= 2:
-            return {'ok': False, 'mode': '', 'store': None,
-                    'error': '同じ合言葉が複数の店に登録されています。管理本部に連絡し、設定を確認してください。'}
-        if len(matched) == 1:
-            store = matched[0]
-            if store not in (store_names or []):
-                return {'ok': False, 'mode': '', 'store': None,
-                        'error': '合言葉に対応する店（%s）が店舗マスタにありません。管理本部に連絡し、設定を確認してください。' % store}
-            return {'ok': True, 'mode': 'store', 'store': store, 'error': ''}
-        return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉が違います。'}
+            return _pw_result(False, error='合言葉を入れてください。')
+        return _pw_result(False, error='合言葉が違います。')
     if legacy:
         if pw == legacy:
-            return {'ok': True, 'mode': 'legacy', 'store': None, 'error': ''}
-        return {'ok': False, 'mode': '', 'store': None, 'error': 'パスワードが違います。'}
-    if admin:
-        # 本部用だけが設定されている（店ごとも共有も無い）＝本部用以外では入れない
-        return {'ok': False, 'mode': '', 'store': None, 'error': '合言葉が違います。'}
+            return _pw_result(True, mode='legacy')
+        return _pw_result(False, error='パスワードが違います。')
+    if admins or admin:
+        # 管理者用だけが設定されている（店ごとも共有も無い）＝管理者用以外では入れない
+        return _pw_result(False, error='合言葉が違います。')
     # 何も設定されていない（ローカル検証・開発モード）
-    return {'ok': True, 'mode': 'dev', 'store': None, 'error': ''}
-
+    return _pw_result(True, mode='dev')
 
 
 # ============================================================================

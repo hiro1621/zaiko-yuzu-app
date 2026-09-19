@@ -23,7 +23,9 @@
 【使い方（店舗）】
   1. 合言葉を入れる（1回だけ）。★2026-09-18 3法人対応：合言葉は店ごと（Secrets の [store_passwords]）。
      店の合言葉で入ると、その店が自店として確定する（店の選び直しはできない・?store= も無視）。
-     本部用の合言葉（admin_password）で入ったときだけ、36店を自由に切り替えられる（従来どおりの動き）。
+     管理者の合言葉（Secrets の [admin_passwords]＝名前ごと・7人。2026-09-19）で入ったときだけ、
+     36店を自由に切り替えられる（従来どおりの動き。左バーに「本部モード：名前」と出る）。
+     旧の admin_password（1つだけ）も後方互換で通る（名前は「本部」）。
      [store_passwords] が無く app_password だけの環境では、従来どおり共有パスワード1つで入り店を選ぶ。
   2. 自分の店をドロップダウンで選ぶ（本部用で入ったとき）。法人（ソユーズ／内観堂／飛鳥）で絞れる。
      （URLに ?store=店名 が付くので、そのURLをブックマークすれば次回から選ばずに済む）
@@ -54,12 +56,15 @@
     ローカルで起動：  streamlit run streamlit_app.py
 
 【秘密（Streamlit Cloud の Secrets ＝ TOML に置く。リポジトリには入れない）】
-    admin_password = "本部用の合言葉（36店を自由に切替できる）"
+    spreadsheet_id = "GスプレッドシートのID"
+    app_password = "共有パスワード"   ← 後方互換。[store_passwords] が無いときだけ使われる
+    admin_password = "旧・本部用の合言葉1つ"  ← 後方互換。[admin_passwords] があればそちらを推奨
+    [admin_passwords]
+    "本間" = "その人の合言葉"        ← 管理者7人ぶん（名前＝合言葉。36店を自由に切替できる）
+    ...
     [store_passwords]
     "東大泉" = "その店の合言葉"      ← 36店ぶん（キーは stores_config.py の店名そのまま）
     ...
-    app_password = "共有パスワード"   ← 後方互換。[store_passwords] が無いときだけ使われる
-    spreadsheet_id = "GスプレッドシートのID"
     [gcp_service_account]
     ... サービスアカウント鍵(JSON)の中身をTOML表として貼る ...
     （メール通知の [smtp]／app_url／[store_emails] は mailer.py の説明を参照）
@@ -503,15 +508,17 @@ def get_backend():
 # ============================================================================
 # 合言葉ゲート（2026-09-18 3法人対応：店ごとの合言葉＋本部用）
 #   Secrets の型：
+#     [admin_passwords]  名前 = "合言葉"（管理者7人。2026-09-19 本間部長指示。どの名前でも36店を自由に切替できる）
 #     [store_passwords]  店名 = "合言葉"（36店。キーは stores_config.STORE_NAMES の店名そのまま）
-#     admin_password     本部用の合言葉（36店を自由に切替できる＝従来どおりの動き）
+#     admin_password     旧・本部用の合言葉1つ（後方互換。入ったときの名前は「本部」）
 #     app_password       後方互換。[store_passwords] が無いときだけ使う（共有パスワード1つで入り店を選ぶ）
 #   動き：
 #     ・合言葉を1つ入れる → [store_passwords] のどれかと一致すれば、その店を自店として確定する
 #       （店の選び直しはできない。URL の ?store= も無視する）。
-#     ・admin_password と一致すれば本部モード＝36店を自由に切替できる。
-#     ・同じ合言葉が2店以上に登録されていたら、その値では入れず「設定を確認してください」と出す
-#       （黙って片方の店に入れない＝別店のデータを上書きする事故を防ぐ）。
+#     ・[admin_passwords] のどれか（または旧 admin_password）と一致すれば本部モード＝36店を自由に切替できる。
+#       左バーに「本部モード：名前」と出す（誰が入っているか分かるように）。
+#     ・同じ合言葉が2か所以上（管理者どうし・管理者と店・店どうし）に登録されていたら、その値では入れず
+#       「設定を確認してください」と出す（黙って片方に入れない＝別店のデータを上書きする事故を防ぐ）。
 #     ・[store_passwords] があるときは app_password は見ない（切替後に旧の共有パスワードが残っていても通さない）。
 #   ★合言葉の値はコードにもテストにも書かない。値は Streamlit Cloud の Secrets 画面にだけ入れる。
 # ============================================================================
@@ -526,17 +533,30 @@ def _store_passwords():
         return None
 
 
+def _admin_passwords():
+    """ Secrets の [admin_passwords] を {管理者名: 合言葉(str)} で返す。無ければ None（2026-09-19）。 """
+    raw = _get_secret('admin_passwords')
+    if not raw:
+        return None
+    try:
+        return {str(k).strip(): str(v).strip() for k, v in dict(raw).items()}
+    except Exception:
+        return None
+
+
 def password_gate():
     """ 正しい合言葉を入れるまで先へ進ませない。入れたら session_state に
-        authed（入れた）／auth_mode（admin/store/legacy/dev）／auth_store（店に固定のときの店名）を置く。 """
+        authed（入れた）／auth_mode（admin/store/legacy/dev）／auth_store（店に固定のときの店名）／
+        auth_admin（管理者で入ったときの名前。旧 admin_password なら「本部」）を置く。 """
     if st.session_state.get('authed'):
         return True
 
     st.title('💊 デッドストックリスト')
     sp = _store_passwords()
+    ap = _admin_passwords()
     admin = _get_secret('admin_password')
     legacy = _get_secret('app_password')
-    configured = bool(sp) or bool(admin) or bool(legacy)
+    configured = bool(sp) or bool(ap) or bool(admin) or bool(legacy)
     if sp:
         st.caption('社内限定ツール。自店の合言葉を入力してください（合言葉で店が決まります）。')
     else:
@@ -546,11 +566,12 @@ def password_gate():
         pw = st.text_input('合言葉' if sp else '共有パスワード', type='password')
         ok = st.form_submit_button('入る')
     if ok:
-        res = app_logic.evaluate_password(pw, sp, admin, legacy, STORE_NAMES)
+        res = app_logic.evaluate_password(pw, sp, admin, legacy, STORE_NAMES, admin_passwords=ap)
         if res['ok']:
             st.session_state['authed'] = True
             st.session_state['auth_mode'] = res['mode']
             st.session_state['auth_store'] = res['store']
+            st.session_state['auth_admin'] = res.get('admin_name')
             if res['store']:
                 # 店に固定：前のセッションの選択・URLの ?store= より合言葉の店を優先する
                 st.session_state['my_store'] = res['store']
@@ -2542,9 +2563,11 @@ def main():
     #   「自分がどの店として見ているか」「他店がそろっているか」を見失わない。
     with st.sidebar:
         st.markdown('### 💊 デッドストック')
-        # 本部用の合言葉で入っているときは、それが分かるように1行出す（店の合言葉なら何も出さない）
+        # 管理者の合言葉で入っているときは、誰で入っているかが分かるように1行出す（店の合言葉なら何も出さない）
+        #   例：「本部モード：本間（36店を自由に切り替えできます）」。旧 admin_password なら名前は「本部」。
         if st.session_state.get('auth_mode') == 'admin':
-            st.caption('本部モード（36店を自由に切り替えできます）'.replace('36', str(STORE_COUNT)))
+            who = st.session_state.get('auth_admin') or app_logic.LEGACY_ADMIN_NAME
+            st.caption('本部モード：%s（%d店を自由に切り替えできます）' % (who, STORE_COUNT))
 
     if not gsheet_configured():
         st.warning('（開発モード）Googleシート未接続のため、このブラウザのセッションにだけ保存します。'
