@@ -2829,9 +2829,8 @@ def main():
     with row1:
         c_app, c_store, c_status, c_mode = st.columns([2, 4, 3, 3], vertical_alignment='center')
         with c_app:
-            # アプリ名（白・太字）＋その下に小さく一言（薄い緑白）
-            st.markdown('<div class="ds-brand"><div class="ds-brand-name">💊 デッドストック</div>'
-                        '<div class="ds-brand-sub">3法人%d店の在庫融通</div></div>' % STORE_COUNT,
+            # アプリ名（白・太字）。★2026-09-19 本間部長指示で下の一言「3法人36店の在庫融通」は消した
+            st.markdown('<div class="ds-brand"><div class="ds-brand-name">💊 デッドストック</div></div>',
                         unsafe_allow_html=True)
         with c_store:
             my_store = store_section(notice_host=notice)
