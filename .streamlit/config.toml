@@ -3,7 +3,8 @@
 # ------------------------------------------------------------
 # 薬VANの .xls は列が多く大きめなので、アップロード上限を広げておきます。
 #
-# ★2026-09-19 左バーをやめて「上の薄い帯＋幅いっぱいの本体」に（本間部長承認）
+# ★2026-09-19 左バーをやめて「上の帯＋幅いっぱいの本体」に（本間部長承認）。
+#   同日、上の帯を深緑（左バーで使っていた色）に塗り直し、表の見出し行にも薄い緑を付けた（磨き上げ）。
 #   色・フォント・角の丸みはここを書き換えるだけで変わります。
 #   元に戻したいときは git で1つ前に戻せば、そのまま元の見た目に戻ります。
 #   （2026-08-14〜09-18 は案B＝左バー＋広い表。[theme.sidebar] の深緑はそのとき使っていた設定）
@@ -28,8 +29,10 @@ base = "light"
 #   表は文字ではなく“絵”として描かれるため、CSSだけでは書体が変わりません。
 #   フォント本体の読み込みは streamlit_app.py の inject_style() が行います。
 #   読み込めない環境（社外へ出られないPC等）では游ゴシックに落ちるだけで、画面は壊れません。
-font = "IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
-headingFont = "IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
+#   ★2026-09-19：社内標準（事務ポータルと同じ）＝英数字・数字は DM Sans、日本語は IBM Plex Sans JP。
+#     先に書いた DM Sans に無い字（かな・漢字）だけが IBM Plex Sans JP で出ます。
+font = "DM Sans, IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
+headingFont = "DM Sans, IBM Plex Sans JP, Yu Gothic UI, Hiragino Sans, Meiryo, sans-serif"
 
 # 色。primaryColor は「予約する」など“押すボタン”に使われる色です。
 primaryColor = "#0E7C6B"
@@ -42,6 +45,11 @@ linkColor = "#0B6455"
 borderColor = "#DFEAE7"
 showWidgetBorder = true
 baseRadius = "medium"
+
+# 表（一覧）の見出し行と枠線の色（2026-09-19）。表は“絵”なので CSS では色が付かず、ここでしか変えられません。
+#   ※この2つは Streamlit 1.63 以降の設定。古い版では無視されるだけで画面は壊れません。
+dataframeHeaderBackgroundColor = "#DCEFE9"
+dataframeBorderColor = "#CFE3DE"
 
 # 字の大きさ（既定は14。1つ上げて読みやすくする）
 baseFontSize = 15

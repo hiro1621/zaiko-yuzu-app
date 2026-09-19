@@ -514,8 +514,15 @@ try:
     check('AppTest: 名前つき管理者（森田）で入れる（auth_mode=admin・auth_admin=森田）',
           _ss(at, 'authed') and _ss(at, 'auth_mode') == 'admin' and _ss(at, 'auth_admin') == '森田', 'session_state を表示できません')
     # ★2026-09-19 左バー→上の帯：本部モードの行・法人／店舗名の選択欄は本体（at.main）で探す。左バーには何も無い。
-    check('AppTest: 上の帯（本体）に「本部モード：森田（36店を自由に切り替えできます）」',
-          any(c.value == '本部モード：森田（36店を自由に切り替えできます）' for c in at.main.caption), [c.value for c in at.main.caption])
+    # ★2026-09-19 見た目の磨き上げ：本部モードは caption ではなく HTML のバッジ（st.markdown）になった。
+    #   文言「本部モード：森田」と「36店を自由に切り替えできます」が同じ markdown に入っていることを見る。
+    def _md_has(app, *words):
+        """ 本体の markdown のどれか1つに、指定の言葉がぜんぶ入っているか。
+            ★inject_style() の <style>（CSS のコメントに「本部モード」等の言葉が入っている）は除いて数える。 """
+        return any(all(w in (m.value or '') for w in words)
+                   for m in app.main.markdown if not (m.value or '').lstrip().startswith('<style>'))
+    check('AppTest: 上の帯（本体）に「本部モード：森田」のバッジ＋「36店を自由に切り替えできます」',
+          _md_has(at, '本部モード：森田', '36店を自由に切り替えできます'), [m.value[:80] for m in at.main.markdown if 'ds-mode' in (m.value or '')])
     check('AppTest: 左バーに要素が1つも無い（左バーをやめた・2026-09-19）',
           len(at.sidebar.children) == 0 and len(at.sidebar.caption) == 0 and len(at.sidebar.selectbox) == 0, len(at.sidebar.children))
     check('AppTest: 上の帯のアプリ名「💊 デッドストック」と「アップ済み」の数字が本体にある',
@@ -546,16 +553,20 @@ try:
     at2.run(); at2.text_input[0].input(_SP['東立石']); at2.button[0].click().run()
     check('AppTest: 店の合言葉で入ると東立石に固定・本部モードの行は出ない・法人の選択欄も出ない',
           _ss(at2, 'auth_store') == '東立石' and _ss(at2, 'auth_admin') is None
-          and not any('本部モード' in c.value for c in at2.main.caption) and not any(s.label == '法人で絞る' for s in at2.main.selectbox))
-    check('AppTest: 店の合言葉のときは上の帯に「自店：東立石（ソユーズ）」', any(m.value == '自店：**東立石**（ソユーズ）' for m in at2.main.markdown),
-          [m.value for m in at2.main.markdown][:5])
+          and not any('本部モード' in c.value for c in at2.main.caption) and not _md_has(at2, '本部モード')
+          and not any(s.label == '法人で絞る' for s in at2.main.selectbox))
+    # ★2026-09-19 見た目の磨き上げ：「自店：東立石」＋法人の色チップ（ソユーズ＝#1FA98C）の HTML になった
+    check('AppTest: 店の合言葉のときは上の帯に「自店：東立石」＋色チップ「ソユーズ」',
+          _md_has(at2, '自店：', '東立石', 'ds-chip', 'ソユーズ', '#1FA98C'),
+          [m.value[:120] for m in at2.main.markdown if 'ds-mine' in (m.value or '')])
     # 旧 admin_password だけの環境（[admin_passwords] なし）でも「本部」で入れる
     at3 = AppTest.from_file(os.path.join(HERE, 'streamlit_app.py'), default_timeout=120)
     at3.secrets['admin_password'] = 'dummy-admin-old'
     at3.secrets['store_passwords'] = dict(_SP)
     at3.run(); at3.text_input[0].input('dummy-admin-old'); at3.button[0].click().run()
-    check('AppTest: 旧 admin_password だけでも入れて上の帯は「本部モード：本部（…）」',
-          _ss(at3, 'auth_admin') == '本部' and any(c.value.startswith('本部モード：本部（') for c in at3.main.caption), [c.value for c in at3.main.caption])
+    check('AppTest: 旧 admin_password だけでも入れて上の帯は「本部モード：本部」のバッジ',
+          _ss(at3, 'auth_admin') == '本部' and _md_has(at3, '本部モード：本部<', '36店を自由に切り替えできます'),
+          [m.value[:80] for m in at3.main.markdown if 'ds-mode' in (m.value or '')])
 except ImportError:
     print('  [--] streamlit.testing が無いため AppTest は省略')
 

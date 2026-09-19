@@ -76,6 +76,7 @@
 
 import datetime
 import hashlib
+import html   # 画面に出す文字を HTML に安全に埋め込む（見た目の装飾用・2026-09-19）
 
 import streamlit as st
 import pandas as pd   # ※ streamlit に同梱されるので requirements への追記は不要
@@ -109,6 +110,40 @@ SENTINEL_STORE = '選択してください'
 
 
 # ============================================================================
+# 法人の色（2026-09-19・見た目の磨き上げ）
+#   上の帯の「自店：○○」の色チップ、⑤やり取りの法人見出し、「未アップ」吹き出しの法人見出しで
+#   同じ色を使う。法人→色の対応は★ここ1か所だけ★（変えるときはここだけ直す）。
+#   ★色は「法人を見分ける印」にだけ使い、文字そのものは濃い色のまま（読みやすさ優先）。
+# ============================================================================
+COMPANY_COLORS = {
+    'ソユーズ': '#1FA98C',   # 明るい緑
+    '内観堂':   '#4C8DFF',   # 青
+    '飛鳥':     '#F2A93B',   # 琥珀
+}
+COMPANY_COLOR_OTHER = '#9AA9A5'   # 未登録の法人・「その他」（灰緑）
+
+
+def company_color(corp):
+    """ 法人名 → 色（#RRGGBB）。未登録の法人は灰緑。 """
+    return COMPANY_COLORS.get(corp, COMPANY_COLOR_OTHER)
+
+
+def company_chip_html(corp):
+    """ 法人名の色チップ（角丸ピル・小さい文字）の HTML。上の帯の「自店：東立石」の横に出す。
+        チップの文字は濃い色（CSS の .ds-chip）＝明るい法人色の上でも読める。 """
+    return ('<span class="ds-chip" style="background:%s;">%s</span>'
+            % (company_color(corp), html.escape(str(corp))))
+
+
+def company_heading_html(corp, note=''):
+    """ 法人の見出し（左に法人色の縦棒）の HTML。⑤やり取りの相手店一覧と「未アップ」吹き出しで使う。
+        note … 見出しの右に小さく添える文字（例「（9店）」）。無ければ空。 """
+    extra = ('<small>%s</small>' % html.escape(str(note))) if note else ''
+    return ('<div class="ds-corp-head" style="border-left-color:%s;">%s%s</div>'
+            % (company_color(corp), html.escape(str(corp)), extra))
+
+
+# ============================================================================
 # 画面の基本設定
 # ============================================================================
 # ★2026-09-19：左バーは使わない（initial_sidebar_state='collapsed'＋左バーに何も描かない＝左バー自体が出ない）
@@ -117,62 +152,175 @@ st.set_page_config(page_title='デッドストックリスト', page_icon='💊'
 
 
 # ============================================================================
-# 見た目（2026-09-19・上の帯＋幅いっぱいの本体）
-#   ★色・角の丸み・字の大きさは .streamlit/config.toml に書いてあります。
+# 見た目（2026-09-19・深緑のアプリバー＋白い本体）
+#   ★色・角の丸み・字の大きさ・表（一覧）の見出し色は .streamlit/config.toml に書いてあります。
 #     ここでやるのは「config.toml で指定したフォント本体の読み込み」と、
-#     configでは届かない細かい調整（上の帯を貼り付ける・余白を詰める など）だけです。
-#   ※2026-08-14〜09-18 は案B（左バー＋広い表）。36店になって左バーでは窮屈になったため、
-#     2026-09-19 に「上の薄い帯」へ変更した（本間部長承認）。
+#     config では届かない細かい調整（上の帯を深緑に塗って貼り付ける・チップ・ピル型ボタン など）だけです。
+#   ※経緯：2026-08-14〜09-18 は案B（左バー＝深緑＋広い表）。36店になって左バーでは窮屈になったため
+#     2026-09-19 に「上の帯」へ変更したところ、画面が白一色で味気なくなった（本間部長評）。
+#     そこで同日、左バーで使っていた深緑を上の帯へ移し、法人の色チップ・ピル型の切替ボタン・
+#     見出しの縦線を足した（計算・保管庫・合言葉・メール・表の列は一切触っていない）。
 #
 #   ★フォントは <style> の @import で読み込みます。
 #     Streamlit は <link> タグを消してしまうため、@import 以外では入りません。
 #     @import は <style> の先頭に置く決まりです（途中に書くと丸ごと無視されます）。
+#     社内標準＝英数字は DM Sans・日本語は IBM Plex Sans JP（事務ポータルと同じ組み合わせ）。
 #
 #   ★読み込めない環境（社外へ出られないPCなど）では游ゴシックに落ちるだけで、
 #     画面が壊れることはありません（config.toml のフォント指定が控えを持っています）。
 # ============================================================================
 FONT_CSS_URL = ('https://fonts.googleapis.com/css2'
-                '?family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap')
+                '?family=DM+Sans:wght@400;500;600;700'
+                '&family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap')
 
 
 def inject_style():
-    """ フォントの読み込みと、上の帯まわりの細かい見た目の調整（2026-09-19）。 """
+    """ フォントの読み込みと、上の帯（深緑）・チップ・ピル型ボタン・見出しの細かい見た目（2026-09-19）。 """
     st.markdown("""
 <style>
 @import url('%s');
 
+/* ---- 色の定義（帯・チップ・見出しの色はここを変えればまとめて変わる） ---- */
+:root {
+  --ds-bar-start: #0F2E29;    /* 帯の深緑（左上） */
+  --ds-bar-end:   #145A4B;    /* 帯の深緑（右下） */
+  --ds-accent:    #0E7C6B;    /* 押すボタン・見出しの縦線（config.toml の primaryColor と同じ） */
+  --ds-on-bar:    #EAF4F1;    /* 帯の上の文字（白に近い緑白） */
+  --ds-on-bar-dim:#CFE3DE;    /* 帯の上の薄い文字（ラベル・補足。深緑の上でも 6:1 以上のコントラスト） */
+  --ds-ink:       #1B2A28;    /* 本体の文字（config.toml の textColor と同じ） */
+  --ds-line:      #DFEAE7;    /* 枠線（config.toml の borderColor と同じ） */
+  --ds-soft:      #EDF5F3;    /* 薄い緑（ホバー・入力欄の地。secondaryBackgroundColor と同じ） */
+  --ds-header-h:  56px;       /* Streamlit 自前ヘッダー（右上の ⋮）の高さ。帯はこの下から文字を置く */
+  --ds-bar-gradient: linear-gradient(135deg, var(--ds-bar-start) 0%%, var(--ds-bar-end) 100%%);
+}
+
 /* 数字が縦にそろうようにする（数量・在庫数・金額の列を読みやすく） */
 [data-testid="stDataFrame"], [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
 
-/* 本体の余白を詰める（左バーをやめたぶん、表を幅いっぱいに使う）。
-   ★上の余白（padding-top）は Streamlit 自前のヘッダー（右上の ⋮ など・高さ 3.5rem＝56px）のぶんを残す。
-     これより小さくすると帯の1行目がヘッダーの下に潜って上端が欠ける（2026-09-19 実機で確認）。 */
-.block-container { padding-left: 1.5rem; padding-right: 1.5rem; padding-top: 3.75rem; }
+/* ---- Streamlit 自前ヘッダー（右上の ⋮・Deploy・実行中の表示）----
+   背景を透明にして、その下にある深緑の帯を透かす＝画面の上端から途切れずに1枚の帯に見える。
+   文字とアイコンは深緑の上で読めるように白に近い色へ（アイコンは currentColor なので文字色に追従する）。 */
+header[data-testid="stHeader"] { background: transparent !important; }
+header[data-testid="stHeader"] :is(button, span, label, div, p, a) { color: var(--ds-on-bar) !important; }
+header[data-testid="stHeader"] svg { fill: var(--ds-on-bar) !important; }
+header[data-testid="stHeader"] button:hover { background: rgba(255,255,255,.14) !important; }
 
-/* ★上の帯（main() の st.container(key='topbar')。Streamlit は key を st-key-<key> クラスにする）
+/* ---- 本体の余白 ----
+   左右 1.5rem（左バーをやめたぶん、表を幅いっぱいに使う）。
+   上は 0＝帯が画面の上端（自前ヘッダーの裏）から始まる。ヘッダーぶんの余白は帯の側で取る。 */
+.block-container { padding-left: 1.5rem; padding-right: 1.5rem; padding-top: 0; }
+
+/* この <style> を入れている空の要素が 1rem の隙間（白い線）を作るので、その要素だけ隠す（<style> は隠しても効く） */
+.block-container [data-testid="stElementContainer"]:has(> .stMarkdown [data-testid="stMarkdownContainer"] > style) { display: none; }
+
+/* ---- 上の帯（main() の st.container(key='topbar')。Streamlit は key を st-key-<key> クラスにする）----
    下へスクロールしても画面の上に貼り付いたまま残す（position: sticky）。
-   top はヘッダー（3.5rem）のすぐ下＝ヘッダーに隠れない位置。
    ★★sticky は「親の箱の中」でしか効かない。Streamlit 1.63 は要素ごとに同じ高さの包み箱
      （stLayoutWrapper）で包むため、帯本体に付けても包み箱ごと流れてしまう（実機で確認）。
      そこで帯を包んでいる箱の側（:has() で「中に帯を持つ包み箱」）に sticky を付ける。
-     包み箱が無い古い版でも効くように、帯本体にも同じ指定を残す。 */
-[data-testid="stLayoutWrapper"]:has(> .st-key-topbar),
-.st-key-topbar, [class*="st-key-topbar"] {
-  position: sticky; top: 3.5rem; z-index: 100;
+     包み箱が無い古い版でも効くように、帯本体にも同じ指定を残す。
+   ★帯本体は左右の余白（1.5rem）ぶん外へはみ出させて、画面幅いっぱいに塗る。下に薄い影で本体と区切る。 */
+[data-testid="stLayoutWrapper"]:has(> .st-key-topbar) { position: sticky; top: 0; z-index: 100; }
+.st-key-topbar {
+  position: sticky; top: 0; z-index: 100;
   background: #FFFFFF;
-}
-.st-key-topbar, [class*="st-key-topbar"] {
-  border-bottom: 1px solid #DFEAE7;
-  padding-bottom: 0.4rem; margin-bottom: 0.4rem;
+  /* ★max-width も広げないと、Streamlit の max-width:100%% に頭を押さえられて右端が余る（実機で確認） */
+  margin-left: -1.5rem; margin-right: -1.5rem; width: calc(100%% + 3rem); max-width: calc(100%% + 3rem);
+  padding: 0 1.5rem 0.6rem;
+  box-shadow: 0 4px 12px rgba(15,46,41,.08);
 }
 /* 帯の中の縦の間隔を詰める（既定の1remだと3行で場所を取りすぎる） */
-.st-key-topbar [data-testid="stVerticalBlock"] { gap: 0.35rem; }
-/* 帯の中の「アップ済み N / 36 店」を小さめに（st.metric の既定は大きすぎて帯が高くなる） */
-.st-key-topbar [data-testid="stMetricValue"] { font-size: 1.35rem; line-height: 1.3; }
-.st-key-topbar [data-testid="stMetricLabel"] p { font-size: 0.8rem; }
-/* 帯の中のボタン（②③④⑤の切替）：文字は中央そろえ・折り返さない */
-.st-key-topbar [data-testid="stButton"] button { justify-content: center !important; white-space: nowrap; }
-.st-key-topbar [data-testid="stButton"] button p { text-align: center !important; }
+.st-key-topbar, .st-key-topbar [data-testid="stVerticalBlock"] { gap: 0.45rem; }
+
+/* ---- 帯の1行目＝アプリバー（main() の top.container(key='appbar')）：深緑のグラデーション ----
+   上端は自前ヘッダーの裏まで伸ばし（padding-top にヘッダーの高さを足す）、ヘッダーと1枚につなげる。 */
+.st-key-appbar {
+  margin-left: -1.5rem; margin-right: -1.5rem; width: calc(100%% + 3rem); max-width: calc(100%% + 3rem);
+  padding: calc(var(--ds-header-h) + 0.3rem) 1.5rem 0.7rem;
+  background: var(--ds-bar-gradient);
+  color: var(--ds-on-bar);
+}
+.st-key-appbar p { color: var(--ds-on-bar); }
+/* 「法人で絞る」「店舗名」のラベル・補足の文字は薄い緑白 */
+.st-key-appbar [data-testid="stWidgetLabel"] p,
+.st-key-appbar [data-testid="stCaptionContainer"] p { color: var(--ds-on-bar-dim) !important; }
+.st-key-appbar [data-testid="stWidgetLabel"] p { font-size: 0.8rem; font-weight: 500; }
+/* アプリ名（左端）：白・太字＋その下に小さく一言 */
+.ds-brand-name { font-size: 1.15rem; font-weight: 700; color: #FFFFFF; line-height: 1.25; letter-spacing: .01em; white-space: nowrap; }
+.ds-brand-sub  { font-size: 0.74rem; color: var(--ds-on-bar-dim); margin-top: 0.15rem; white-space: nowrap; }
+/* 店の合言葉で入ったときの「自店：東立石」＋法人の色チップ */
+.ds-mine       { line-height: 1.3; }
+.ds-mine-label { font-size: 0.8rem; color: var(--ds-on-bar-dim); margin-right: 0.15rem; }
+.ds-mine-name  { font-size: 1.1rem; font-weight: 700; color: #FFFFFF; }
+.ds-mine-sub   { font-size: 0.74rem; color: var(--ds-on-bar-dim); margin-top: 0.15rem; }
+.ds-chip {
+  display: inline-block; margin-left: 0.45rem; padding: 0.05rem 0.6rem;
+  border-radius: 999px; font-size: 0.74rem; font-weight: 700; line-height: 1.55;
+  color: #10201C;                 /* 明るい法人色の上でも読める濃い文字（3色とも 5:1 以上） */
+  vertical-align: 0.15rem;
+}
+/* 「アップ済み 4 / 36 店」：数字は白・大きめ（DM Sans）、ラベルは薄い緑白 */
+.st-key-appbar [data-testid="stMetricLabel"] p { font-size: 0.78rem; color: var(--ds-on-bar-dim) !important; }
+.st-key-appbar [data-testid="stMetricValue"],
+.st-key-appbar [data-testid="stMetricValue"] p {
+  font-family: "DM Sans", "IBM Plex Sans JP", "Yu Gothic UI", Meiryo, sans-serif;
+  font-size: 1.5rem; font-weight: 700; line-height: 1.2; color: #FFFFFF !important;
+}
+/* 「未アップ N店」（吹き出しを開くボタン）：透明地＋白い枠＋白文字。ホバーで少し明るく */
+.st-key-appbar [data-testid="stPopoverButton"] {
+  background: transparent !important; border: 1px solid rgba(255,255,255,.75) !important;
+  border-radius: 999px !important; min-height: 2.1rem; padding: 0 0.9rem; font-weight: 600;
+}
+.st-key-appbar [data-testid="stPopoverButton"] :is(p, span) { color: #FFFFFF !important; }
+.st-key-appbar [data-testid="stPopoverButton"]:hover { background: rgba(255,255,255,.14) !important; border-color: #FFFFFF !important; }
+/* 本部モードのバッジ（薄い緑の地＋白文字の角丸ピル）と、その下の一言 */
+.ds-mode     { line-height: 1.3; }
+.ds-badge {
+  display: inline-block; padding: 0.12rem 0.75rem; border-radius: 999px;
+  background: rgba(31,169,140,.35); border: 1px solid rgba(31,169,140,.9);   /* #1FA98C を薄く */
+  color: #FFFFFF; font-size: 0.8rem; font-weight: 700; white-space: nowrap;
+}
+.ds-mode-sub { font-size: 0.74rem; color: var(--ds-on-bar-dim); margin-top: 0.2rem; white-space: nowrap; }
+
+/* ---- 帯の3行目＝②③④⑤の切替（main() の top.container(key='navbar')）：ピル型 ----
+   選択中＝primary（config.toml の primaryColor・白文字）、未選択＝白地に緑の細枠＋緑文字、ホバーで薄い緑。 */
+.st-key-navbar [data-testid="stButton"] button {
+  border-radius: 999px !important; font-weight: 700; min-height: 2.5rem;
+  justify-content: center !important; white-space: nowrap;
+}
+.st-key-navbar [data-testid="stButton"] button p { text-align: center !important; white-space: nowrap; }
+.st-key-navbar [data-testid="stBaseButton-secondary"] {
+  background: #FFFFFF !important; border: 1.5px solid var(--ds-accent) !important; color: var(--ds-accent) !important;
+}
+.st-key-navbar [data-testid="stBaseButton-secondary"] p { color: var(--ds-accent) !important; }
+.st-key-navbar [data-testid="stBaseButton-secondary"]:hover { background: var(--ds-soft) !important; }
+.st-key-navbar [data-testid="stBaseButton-primary"] { box-shadow: 0 2px 8px rgba(14,124,107,.28); }
+
+/* ---- 本体の見出し（st.subheader＝h3）：左に緑の縦線 ---- */
+.stMain h3 {
+  border-left: 5px solid var(--ds-accent); padding: 0.05rem 0 0.05rem 0.6rem !important;
+  margin: 0.4rem 0 0.35rem; line-height: 1.3;
+}
+/* ⑤やり取り・未アップ吹き出しの法人見出し（左の縦棒の色は法人ごと＝COMPANY_COLORS） */
+.ds-corp-head {
+  margin-top: 0.55rem; margin-bottom: 0.1rem; padding-left: 0.5rem;
+  border-left: 4px solid var(--ds-accent); font-weight: 700; color: var(--ds-ink); line-height: 1.35;
+}
+.ds-corp-head small { font-weight: 500; font-size: 0.8rem; color: #5B6E6A; margin-left: 0.3rem; }
+
+/* ---- 入口（合言葉）の画面：上に深緑のヒーロー帯、その下の中央に白いカード ---- */
+.ds-hero {
+  margin: 0 -1.5rem 1.6rem; padding: calc(var(--ds-header-h) + 1.2rem) 2rem 1.9rem;
+  background: var(--ds-bar-gradient); color: #FFFFFF;
+}
+.ds-hero-title { font-size: 1.9rem; font-weight: 700; line-height: 1.2; letter-spacing: .01em; }
+.ds-hero-sub   { margin-top: 0.4rem; font-size: 0.92rem; color: var(--ds-on-bar-dim); }
+.st-key-gatecard {
+  border: 1px solid var(--ds-line) !important; border-radius: 14px !important; background: #FFFFFF;
+  padding: 1.4rem 1.5rem 1.2rem !important; box-shadow: 0 10px 28px rgba(15,46,41,.10);
+  max-width: 460px; margin-left: auto; margin-right: auto;   /* 広い画面でも間延びしないように幅を抑えて中央に */
+}
+.ds-card-title { font-size: 1.05rem; font-weight: 700; color: var(--ds-ink); margin-bottom: 0.1rem; }
 </style>
 """ % FONT_CSS_URL, unsafe_allow_html=True)
 
@@ -573,35 +721,47 @@ def password_gate():
     if st.session_state.get('authed'):
         return True
 
-    st.title('💊 デッドストックリスト')
+    # ★2026-09-19 見た目：上に深緑のヒーロー帯（画面幅いっぱい）、その下の中央に合言葉のカード。
+    #   form の key（'gate'）・入力欄・「入る」・判定（app_logic.evaluate_password）は変えていない。
+    st.markdown(
+        '<div class="ds-hero">'
+        '<div class="ds-hero-title">💊 デッドストックリスト</div>'
+        '<div class="ds-hero-sub">ソユーズ薬局・内観堂薬局・飛鳥薬局 %d店の在庫融通</div>'
+        '</div>' % STORE_COUNT, unsafe_allow_html=True)
     sp = _store_passwords()
     ap = _admin_passwords()
     admin = _get_secret('admin_password')
     legacy = _get_secret('app_password')
     configured = bool(sp) or bool(ap) or bool(admin) or bool(legacy)
-    if sp:
-        st.caption('社内限定ツール。自店の合言葉を入力してください（合言葉で店が決まります）。')
-    else:
-        st.caption('社内限定ツール。共有パスワードを入力してください。')
 
-    with st.form('gate'):
-        pw = st.text_input('合言葉' if sp else '共有パスワード', type='password')
-        ok = st.form_submit_button('入る')
-    if ok:
-        res = app_logic.evaluate_password(pw, sp, admin, legacy, STORE_NAMES, admin_passwords=ap)
-        if res['ok']:
-            st.session_state['authed'] = True
-            st.session_state['auth_mode'] = res['mode']
-            st.session_state['auth_store'] = res['store']
-            st.session_state['auth_admin'] = res.get('admin_name')
-            if res['store']:
-                # 店に固定：前のセッションの選択・URLの ?store= より合言葉の店を優先する
-                st.session_state['my_store'] = res['store']
-            st.rerun()
+    # 中央のカード（3列の真ん中に、枠つきの箱）。エラー文もカードの中に出す。
+    _left, c_card, _right = st.columns([1, 1.1, 1])
+    with c_card, st.container(border=True, key='gatecard'):
+        st.markdown('<div class="ds-card-title">%s</div>' % ('合言葉を入力' if sp else '共有パスワードを入力'),
+                    unsafe_allow_html=True)
+        if sp:
+            st.caption('社内限定ツール。自店の合言葉を入力してください（合言葉で店が決まります）。')
         else:
-            st.error(res['error'])
-    if not configured:
-        st.info('（開発モード：合言葉が未設定のため、空欄のまま「入る」で進めます）')
+            st.caption('社内限定ツール。共有パスワードを入力してください。')
+
+        with st.form('gate', border=False):
+            pw = st.text_input('合言葉' if sp else '共有パスワード', type='password')
+            ok = st.form_submit_button('入る', type='primary', width='stretch')
+        if ok:
+            res = app_logic.evaluate_password(pw, sp, admin, legacy, STORE_NAMES, admin_passwords=ap)
+            if res['ok']:
+                st.session_state['authed'] = True
+                st.session_state['auth_mode'] = res['mode']
+                st.session_state['auth_store'] = res['store']
+                st.session_state['auth_admin'] = res.get('admin_name')
+                if res['store']:
+                    # 店に固定：前のセッションの選択・URLの ?store= より合言葉の店を優先する
+                    st.session_state['my_store'] = res['store']
+                st.rerun()
+            else:
+                st.error(res['error'])
+        if not configured:
+            st.info('（開発モード：合言葉が未設定のため、空欄のまま「入る」で進めます）')
     return False
 
 
@@ -1851,8 +2011,8 @@ def message_section(my_store, backend, threads, msg_reads, allboard, allboard_re
         for t in threads:
             corp = COMPANY_OF.get(t['相手店名'], 'その他')
             if corp != last_corp:
-                st.markdown('<div style="margin-top:0.4rem;color:#0B6455;font-weight:600;">'
-                            '▍%s</div>' % corp, unsafe_allow_html=True)
+                # 左の縦棒の色は法人ごと（COMPANY_COLORS・帯のチップと同じ色。2026-09-19）
+                st.markdown(company_heading_html(corp), unsafe_allow_html=True)
                 last_corp = corp
             ur = app_logic.unread_count(my_store, t, msg_reads)
             r1, r2, r3, r4, r5 = st.columns([4, 2, 2, 2, 2])
@@ -2010,10 +2170,13 @@ def show_upload_status_bar(status, latest):
                 for corp in COMPANY_ORDER:
                     names = [n for n in missing if COMPANY_OF.get(n) == corp]
                     if names:
-                        st.markdown('**%s**（%d店）：%s' % (corp, len(names), '、'.join(names)))
+                        # 法人色の縦棒つき見出し（⑤やり取りと同じ見せ方・2026-09-19）
+                        st.markdown(company_heading_html(corp, '（%d店）' % len(names)), unsafe_allow_html=True)
+                        st.markdown('、'.join(names))
                 others = [n for n in missing if COMPANY_OF.get(n) not in COMPANY_ORDER]
                 if others:
-                    st.markdown('**その他**：%s' % '、'.join(others))
+                    st.markdown(company_heading_html('その他'), unsafe_allow_html=True)
+                    st.markdown('、'.join(others))
                 st.caption('全店そろうと、他店の使用実績まで見えてマッチングの精度が上がります。')
         else:
             st.caption('全店アップ済み')
@@ -2143,8 +2306,13 @@ def store_section(notice_host=None):
     if auth_store in STORE_NAMES:
         my_store = auth_store
         st.session_state['my_store'] = my_store
-        st.markdown('自店：**%s**（%s）' % (my_store, COMPANY_OF.get(my_store, '')))
-        st.caption('合言葉で確定した店です（店の切り替えはできません）。')
+        # ★2026-09-19 見た目：法人名は色チップ（COMPANY_COLORS）。文言は「自店：東立石」＋チップ「ソユーズ」。
+        st.markdown(
+            '<div class="ds-mine"><span class="ds-mine-label">自店：</span>'
+            '<span class="ds-mine-name">%s</span>%s'
+            '<div class="ds-mine-sub">合言葉で確定した店です（店の切り替えはできません）</div></div>'
+            % (html.escape(my_store), company_chip_html(COMPANY_OF.get(my_store, ''))),
+            unsafe_allow_html=True)
         _remember_store_in_url(my_store)
     else:
         my_store = _select_store_with_company(notice_host=notice_host)
@@ -2626,10 +2794,12 @@ def main():
     #   ★左バーには何も描かない（描かなければ Streamlit は左バーそのものを出さない）。
     #   ★入れ物を先に作っておく理由：3行目の件数は本体の計算（results_section）で決まるため、
     #     帯を先に画面へ出しておき、あとから3行目（row3）へ書き込む。
+    #   ★2026-09-19 見た目：1行目（appbar）は深緑のグラデーション、3行目（navbar）はピル型ボタン。
+    #     key を付けるのは CSS（inject_style の .st-key-appbar / .st-key-navbar）で狙うため。中身の順序・仕組みは同じ。
     top = st.container(key='topbar')
-    row1 = top.container()
+    row1 = top.container(key='appbar')
     row2 = top.container()
-    row3 = top.container()
+    row3 = top.container(key='navbar')
     notice = st.container()   # 帯の直下＝本体の先頭。「まず店舗名を選んでください」の赤字はここに出す
 
     if not gsheet_configured():
@@ -2659,7 +2829,10 @@ def main():
     with row1:
         c_app, c_store, c_status, c_mode = st.columns([2, 4, 3, 3], vertical_alignment='center')
         with c_app:
-            st.markdown('**💊 デッドストック**')
+            # アプリ名（白・太字）＋その下に小さく一言（薄い緑白）
+            st.markdown('<div class="ds-brand"><div class="ds-brand-name">💊 デッドストック</div>'
+                        '<div class="ds-brand-sub">3法人%d店の在庫融通</div></div>' % STORE_COUNT,
+                        unsafe_allow_html=True)
         with c_store:
             my_store = store_section(notice_host=notice)
         with c_status:
@@ -2669,7 +2842,10 @@ def main():
             #   例：「本部モード：本間（36店を自由に切り替えできます）」。旧 admin_password なら名前は「本部」。
             if st.session_state.get('auth_mode') == 'admin':
                 who = st.session_state.get('auth_admin') or app_logic.LEGACY_ADMIN_NAME
-                st.caption('本部モード：%s（%d店を自由に切り替えできます）' % (who, STORE_COUNT))
+                # ★2026-09-19 見た目：灰色の caption ではなくバッジ（角丸ピル）＋その下に小さく一言
+                st.markdown('<div class="ds-mode"><span class="ds-badge">本部モード：%s</span>'
+                            '<div class="ds-mode-sub">%d店を自由に切り替えできます</div></div>'
+                            % (html.escape(str(who)), STORE_COUNT), unsafe_allow_html=True)
 
     # ---- 帯の2行目：アップロード欄（折りたたみ） ----
     with row2:
